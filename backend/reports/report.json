@@ -1,0 +1,340 @@
+{
+  "pr": {
+    "owner": "Stirling-Tools",
+    "repo": "Stirling-PDF",
+    "number": 7235,
+    "title": "fix(frontend): preserve pdf link targets in desktop viewer",
+    "body": "Same PR as #6396, just with the conflicts resolved and some fixes on top. Original commit by @saul1310 is preserved as-is; everything else is a follow-up commit.\n\nRefs #6272\n\n## Conflicts\n\n#6396 was written before the frontend was restructured, so all four files it touched moved (`frontend/src/**` -> `frontend/editor/src/**`) and `LinkLayer.tsx` had drifted. Cherry-picked with rename detection and re-resolved against current `main`.\n\n## Fixes on top\n\n- **Reuse the existing platform seam instead of adding a second one.** `main` already has `@app/platform/*` seams with per-flavour implementations; #6396 added a parallel `@app/utils/openExternalUrl` core+desktop pair that re-implemented the Tauri shell call already in `desktop/platform/openExternal.ts`. Split into a pure sanitiser (`@app/utils/externalUrl`) and a platform seam (`@app/platform/openExternalTab`), with the desktop impl delegating to the existing `openExternal`.\n- **Kept PDF links off the `openExternal` seam.** That seam is for leave-and-return redirects (Stripe) and its saas impl is `window.location.assign` - routing PDF links through it would navigate the whole app away from the user's document. `openExternalTab` always opens alongside the app; desktop shadows it to escape the webview.\n- **Fixed the same defect in two sibling call sites** that #6396 didn't cover: `BookmarkSidebar` (bookmark URI / LaunchAppOrOpenFile actions) and `useAnnotationMenuHandlers` (annotation menu \"go to link\"). Both called `window.open` on an unsanitised PDF-supplied URI, so on desktop they trapped the link in the webview exactly like the viewer did.\n- **Dropped the unguarded fallback.** The old code fell back to `window.open(uri)` when `new URL()` threw, so an unparseable URI bypassed the allowlist entirely. It is now blocked.\n- Empty/whitespace URIs are blocked rather than silently resolving to the app's own page via the base URL.\n- Tests: sanitiser cases (casing, leading whitespace, `data:`, `vbscript:`, unparseable), a core seam test asserting new-tab-not-navigate, and a desktop seam regression test asserting the URL goes to the OS rather than `window.open`.\n- **`openExternalTab` now re-validates its own input.** Every caller sanitises first, so nothing reached it unvalidated - but it is the sink that hands a URL to `window.open` (executes `javascript:` in our origin) or to an OS handler on desktop, and its safety shouldn't depend on callers remembering. Both impls fail closed, with tests that call them directly with `javascript:`/`data:`/`file:`/`ftp:`.\n\n## Unrelated fix included (flagged deliberately)\n\nThe last commit fixes `frontend/editor/vitest.config.ts`: `testTimeout: 10000` was set on the root `test` block, but tests all run under `projects`, which do not inherit it - so the whole suite has silently been running at vitest's 5s default.\n\nThis is not cosmetic. It made `task check` fail intermittently on unrelated portal specs (`demoData`, `ConnectionModal`); the ConsignO test takes 2966ms with only the portal project running, i.e. 59% of a budget it was never meant to have, so any CPU contention tips it over. Proven with an identical 6.5s probe test: times out at 5000ms on the old config, passes at 6512ms on the fixed one.\n\nHappy to split this into its own PR if preferred - it is here because the gate could not be trusted without it.\n\n## Validation\n\nTypecheck passes for all 7 build flavours (core, proprietary, saas, desktop, cloud, prototypes, portal); ESLint, Prettier, dpdm and the full 1662-test vitest suite pass.\n\nDriven live against the dev server + backend with a PDF carrying five URI annotations (https, `javascript:`, mailto, `file:`, relative). 14/14 behavioural checks pass on this branch; 5 of them fail on `main`:\n\n| check | main | this PR |\n| --- | --- | --- |\n| safe https link exposes real href (copy-link) | `href=\"#\"` | `https://example.com/safe-link?a=1` |\n| link opens in new tab / tabnabbing-proof | no `target`/`rel` | `_blank` + `noopener noreferrer` |\n| mailto link exposes real href | `href=\"#\"` | `mailto:test@example.com` |\n| relative URI resolved against app origin | `href=\"#\"` | resolved |\n| `javascript:` / `file:` never reach href | blocked | blocked |\n| clicking blocked link doesn't execute or navigate | ok | ok |\n| clicking safe link opens new tab at source URL | - | ok, app not navigated away |\n\n---\n\n## Checklist\n\n### General\n\n- [x] I have read the [Contribution Guidelines](https://github.com/Stirling-Tools/Stirling-PDF/blob/main/CONTRIBUTING.md)\n- [x] I have read the [Stirling-PDF Developer Guide](https://github.com/Stirling-Tools/Stirling-PDF/blob/main/DeveloperGuide.md) (if applicable)\n- [x] I have performed a self-review of my own code\n- [x] My changes generate no new warnings\n\n### Testing (if applicable)\n\n- [x] I have run `task check` to verify linters, typechecks, and tests pass\n- [x] I have tested my changes locally\n",
+    "author": "Frooodle",
+    "url": "https://github.com/Stirling-Tools/Stirling-PDF/pull/7235",
+    "created_at": "2026-08-01T19:29:14Z",
+    "mergeable_state": "blocked",
+    "mergeable": true,
+    "state": "open",
+    "additions": 270,
+    "deletions": 19,
+    "changed_files_count": 10,
+    "labels": [
+      "Front End",
+      "size:L",
+      "Bugfix"
+    ],
+    "commit_messages": [
+      "fix(frontend): preserve pdf link targets in desktop viewer\n\n- give PDF URI annotations a real href so copy-link returns the source URL\\n- route external URL opens through @app utils with desktop Tauri shell override\\n- keep protocol allowlist (http/https/mailto) and block unsafe schemes\\n- add unit tests for URL sanitization and open behavior\\n\\nRefs #6272\n\n(cherry picked from commit a3da7531c8cf3cdc4ae56929af1a5084e054df44)",
+      "fix(frontend): sanitise pdf link URLs and route opens through a platform seam",
+      "fix(frontend): make the openExternalTab seam reject unsafe URLs itself",
+      "fix(frontend): apply the configured vitest timeouts to each test project",
+      "Merge branch 'main' into fix/6272-pdf-links-desktop-rebased",
+      "Merge branch 'main' into fix/6272-pdf-links-desktop-rebased"
+    ],
+    "files": [
+      {
+        "filename": "frontend/editor/src/core/components/viewer/BookmarkSidebar.tsx",
+        "status": "modified",
+        "additions": 15,
+        "deletions": 2,
+        "changes": 17,
+        "patch": "@@ -18,6 +18,8 @@ import { useFileContext } from \"@app/contexts/FileContext\";\n import { isStirlingFile, type FileId } from \"@app/types/fileContext\";\n import { createStirlingFilesAndStubs } from \"@app/services/fileStubHelpers\";\n import apiClient from \"@app/services/apiClient\";\n+import { openExternalTab } from \"@app/platform/openExternalTab\";\n+import { getExternalHref } from \"@app/utils/externalUrl\";\n import { PdfBookmarkObject, PdfActionType } from \"@embedpdf/models\";\n import { useTranslation } from \"react-i18next\";\n import BookmarksIcon from \"@mui/icons-material/BookmarksRounded\";\n@@ -77,6 +79,17 @@ const resolvePageNumber = (bookmark: PdfBookmarkObject): number | null => {\n   return null;\n };\n \n+// Bookmark targets are PDF-supplied, so sanitise before opening. Local paths\n+// from LaunchAppOrOpenFile fail the allowlist - a browser blocks them anyway.\n+const openBookmarkTarget = (rawUrl: string): void => {\n+  const href = getExternalHref(rawUrl);\n+  if (!href) {\n+    console.warn(\"[BookmarkSidebar] Blocked unsafe URL:\", rawUrl);\n+    return;\n+  }\n+  void openExternalTab(href);\n+};\n+\n export const BookmarkSidebar = ({\n   visible,\n   thumbnailVisible,\n@@ -518,12 +531,12 @@ export const BookmarkSidebar = ({\n       const action = target.action;\n       if (action.type === PdfActionType.URI && action.uri) {\n         event.preventDefault();\n-        window.open(action.uri, \"_blank\", \"noopener\");\n+        openBookmarkTarget(action.uri);\n         return;\n       }\n       if (action.type === PdfActionType.LaunchAppOrOpenFile && action.path) {\n         event.preventDefault();\n-        window.open(action.path, \"_blank\", \"noopener\");\n+        openBookmarkTarget(action.path);\n         return;\n       }\n     }"
+      },
+      {
+        "filename": "frontend/editor/src/core/components/viewer/LinkLayer.tsx",
+        "status": "modified",
+        "additions": 16,
+        "deletions": 14,
+        "changes": 30,
+        "patch": "@@ -19,6 +19,9 @@ import {\n import { Z_INDEX_VIEWER_FLOATING_MENU } from \"@app/styles/zIndex\";\n import { Button } from \"@app/ui/Button\";\n import { ActionIcon } from \"@app/ui/ActionIcon\";\n+import { openExternalTab } from \"@app/platform/openExternalTab\";\n+import { getExternalHref } from \"@app/utils/externalUrl\";\n+\n // ---------------------------------------------------------------------------\n // Inline SVG icons (thin-stroke, modern)\n // ---------------------------------------------------------------------------\n@@ -401,19 +404,11 @@ export const LinkLayer: React.FC<LinkLayerProps> = ({\n             behavior: \"smooth\",\n           });\n         } else if (action.type === PdfActionType.URI) {\n-          const uri = action.uri;\n-          try {\n-            const url = new URL(uri, window.location.href);\n-            if ([\"http:\", \"https:\", \"mailto:\"].includes(url.protocol)) {\n-              window.open(uri, \"_blank\", \"noopener,noreferrer\");\n-            } else {\n-              console.warn(\n-                \"[LinkLayer] Blocked unsafe URL protocol:\",\n-                url.protocol,\n-              );\n-            }\n-          } catch {\n-            window.open(uri, \"_blank\", \"noopener,noreferrer\");\n+          const href = getExternalHref(action.uri);\n+          if (href) {\n+            void openExternalTab(href);\n+          } else {\n+            console.warn(\"[LinkLayer] Blocked unsafe URL:\", action.uri);\n           }\n         }\n       }\n@@ -513,6 +508,11 @@ export const LinkLayer: React.FC<LinkLayerProps> = ({\n           const top = annotationLink.rect.origin.y * scale;\n           const width = annotationLink.rect.size.width * scale;\n           const height = annotationLink.rect.size.height * scale;\n+          const externalHref =\n+            annotationLink.target?.type === \"action\" &&\n+            annotationLink.target.action.type === PdfActionType.URI\n+              ? getExternalHref(annotationLink.target.action.uri)\n+              : null;\n \n           return (\n             <a\n@@ -524,7 +524,9 @@ export const LinkLayer: React.FC<LinkLayerProps> = ({\n                   linkElementRefs.current.delete(annotationLink.id);\n                 }\n               }}\n-              href=\"#\"\n+              href={externalHref ?? \"#\"}\n+              target={externalHref ? \"_blank\" : undefined}\n+              rel={externalHref ? \"noopener noreferrer\" : undefined}\n               onClick={(e) => {\n                 e.preventDefault();\n                 e.stopPropagation();"
+      },
+      {
+        "filename": "frontend/editor/src/core/components/viewer/useAnnotationMenuHandlers.ts",
+        "status": "modified",
+        "additions": 11,
+        "deletions": 1,
+        "changes": 12,
+        "patch": "@@ -14,6 +14,8 @@ import type {\n   AnnotationPatch,\n } from \"@app/components/viewer/viewerTypes\";\n import type { ScrollActions } from \"@app/contexts/viewer/viewerActions\";\n+import { openExternalTab } from \"@app/platform/openExternalTab\";\n+import { getExternalHref } from \"@app/utils/externalUrl\";\n \n export type AnnotationType =\n   | \"textMarkup\"\n@@ -370,7 +372,15 @@ export function useAnnotationMenuHandlers({\n   const onGoToLink = useCallback(() => {\n     if (!firstLinkTarget) return;\n     if (firstLinkTarget.type === \"uri\") {\n-      window.open(firstLinkTarget.uri, \"_blank\", \"noopener,noreferrer\");\n+      const href = getExternalHref(firstLinkTarget.uri);\n+      if (href) {\n+        void openExternalTab(href);\n+      } else {\n+        console.warn(\n+          \"[useAnnotationMenuHandlers] Blocked unsafe URL:\",\n+          firstLinkTarget.uri,\n+        );\n+      }\n     } else {\n       scrollActions.scrollToPage(firstLinkTarget.pageIndex + 1);\n     }"
+      },
+      {
+        "filename": "frontend/editor/src/core/platform/openExternalTab.test.ts",
+        "status": "added",
+        "additions": 45,
+        "deletions": 0,
+        "changes": 45,
+        "patch": "@@ -0,0 +1,45 @@\n+import { afterEach, describe, expect, test, vi } from \"vitest\";\n+import { openExternalTab } from \"@app/platform/openExternalTab\";\n+import { expectConsole } from \"@app/tests/failOnConsole\";\n+\n+describe(\"openExternalTab (core/web)\", () => {\n+  afterEach(() => {\n+    vi.restoreAllMocks();\n+  });\n+\n+  // Opening in a new tab is the point of this seam: @app/platform/openExternal\n+  // navigates the current tab on saas, which would tear the user out of the PDF.\n+  test(\"opens alongside the app rather than navigating it away\", async () => {\n+    const openSpy = vi\n+      .spyOn(window, \"open\")\n+      .mockImplementation(() => null as Window | null);\n+    const originalHref = window.location.href;\n+\n+    await openExternalTab(\"https://example.com/\");\n+\n+    expect(openSpy).toHaveBeenCalledWith(\n+      \"https://example.com/\",\n+      \"_blank\",\n+      \"noopener,noreferrer\",\n+    );\n+    expect(window.location.href).toBe(originalHref);\n+  });\n+\n+  // The seam is the sink, so it must not depend on callers having sanitised:\n+  // window.open on a javascript: URL would execute it in our own origin.\n+  test.each([\n+    \"javascript:alert(1)\",\n+    \"  javascript:alert(1)\",\n+    \"data:text/html,<script>alert(1)</script>\",\n+    \"file:///etc/passwd\",\n+  ])(\"refuses to open %s even if a caller skips sanitising\", async (url) => {\n+    const openSpy = vi\n+      .spyOn(window, \"open\")\n+      .mockImplementation(() => null as Window | null);\n+    expectConsole.warn(/Refused to open unsafe URL/);\n+\n+    await openExternalTab(url);\n+\n+    expect(openSpy).not.toHaveBeenCalled();\n+  });\n+});"
+      },
+      {
+        "filename": "frontend/editor/src/core/platform/openExternalTab.ts",
+        "status": "added",
+        "additions": 27,
+        "deletions": 0,
+        "changes": 27,
+        "patch": "@@ -0,0 +1,27 @@\n+/**\n+ * core/web implementation of the @app/platform/openExternalTab seam.\n+ *\n+ * Distinct from @app/platform/openExternal: that seam is for \"leave and return\"\n+ * redirects (Stripe checkout), so its saas impl navigates the CURRENT tab. A PDF\n+ * link must never do that \u2014 it would tear the user out of their document \u2014 so\n+ * this seam always opens alongside the app. Desktop shadows it to escape the\n+ * Tauri webview; saas/proprietary fall through to this window.open.\n+ *\n+ * Callers are expected to sanitise, but this is the sink that actually hands the\n+ * URL to the browser, so it re-checks rather than trusting them: window.open on\n+ * a `javascript:` URL executes it in our own origin.\n+ */\n+import { getExternalHref } from \"@app/utils/externalUrl\";\n+\n+export type OpenExternalTab = (url: string) => Promise<void>;\n+\n+export const openExternalTab: OpenExternalTab = async (\n+  url: string,\n+): Promise<void> => {\n+  const safeHref = getExternalHref(url);\n+  if (!safeHref) {\n+    console.warn(\"[openExternalTab] Refused to open unsafe URL:\", url);\n+    return;\n+  }\n+  window.open(safeHref, \"_blank\", \"noopener,noreferrer\");\n+};"
+      },
+      {
+        "filename": "frontend/editor/src/core/utils/externalUrl.test.ts",
+        "status": "added",
+        "additions": 45,
+        "deletions": 0,
+        "changes": 45,
+        "patch": "@@ -0,0 +1,45 @@\n+import { describe, expect, test } from \"vitest\";\n+import { getExternalHref, toSafeExternalUrl } from \"@app/utils/externalUrl\";\n+\n+describe(\"externalUrl\", () => {\n+  test(\"accepts http/https/mailto URLs\", () => {\n+    expect(toSafeExternalUrl(\"https://example.com/test\")?.href).toBe(\n+      \"https://example.com/test\",\n+    );\n+    expect(toSafeExternalUrl(\"http://example.com/test\")?.href).toBe(\n+      \"http://example.com/test\",\n+    );\n+    expect(toSafeExternalUrl(\"mailto:test@example.com\")?.href).toBe(\n+      \"mailto:test@example.com\",\n+    );\n+  });\n+\n+  test(\"rejects unsafe protocols\", () => {\n+    expect(toSafeExternalUrl(\"javascript:alert(1)\")).toBeNull();\n+    expect(toSafeExternalUrl(\"file:///etc/passwd\")).toBeNull();\n+    expect(toSafeExternalUrl(\"ftp://example.com\")).toBeNull();\n+    expect(\n+      toSafeExternalUrl(\"data:text/html,<script>alert(1)</script>\"),\n+    ).toBeNull();\n+    expect(toSafeExternalUrl(\"vbscript:msgbox(1)\")).toBeNull();\n+  });\n+\n+  test(\"rejects unparseable input instead of opening it blind\", () => {\n+    expect(toSafeExternalUrl(\"\")).toBeNull();\n+    expect(toSafeExternalUrl(\"http://[\")).toBeNull();\n+  });\n+\n+  test(\"is not fooled by casing or leading whitespace\", () => {\n+    expect(toSafeExternalUrl(\"JavaScript:alert(1)\")).toBeNull();\n+    expect(toSafeExternalUrl(\"  javascript:alert(1)\")).toBeNull();\n+    expect(toSafeExternalUrl(\"HTTPS://example.com\")?.protocol).toBe(\"https:\");\n+  });\n+\n+  test(\"normalizes relative URLs against current origin\", () => {\n+    expect(getExternalHref(\"/docs/help\")?.endsWith(\"/docs/help\")).toBe(true);\n+  });\n+\n+  test(\"getExternalHref returns null for blocked URLs\", () => {\n+    expect(getExternalHref(\"javascript:alert(1)\")).toBeNull();\n+  });\n+});"
+      },
+      {
+        "filename": "frontend/editor/src/core/utils/externalUrl.ts",
+        "status": "added",
+        "additions": 32,
+        "deletions": 0,
+        "changes": 32,
+        "patch": "@@ -0,0 +1,32 @@\n+/**\n+ * Sanitisation for URLs that come out of a PDF (link annotations, bookmark\n+ * actions). PDF-supplied URIs are untrusted input, so everything that opens one\n+ * funnels through here first and drops anything outside the allowlist.\n+ *\n+ * Pure helpers only \u2014 opening the URL is a platform concern and lives behind\n+ * the @app/platform/openExternalTab seam.\n+ */\n+const ALLOWED_EXTERNAL_PROTOCOLS = new Set([\"http:\", \"https:\", \"mailto:\"]);\n+\n+function getExternalUrlBase(): string | undefined {\n+  // Relative URIs resolve against the app's own location, matching how the\n+  // viewer has always treated them. No DOM => absolute URLs only.\n+  return typeof window !== \"undefined\" ? window.location?.href : undefined;\n+}\n+\n+/** Parses `rawUrl` and returns it only if its protocol is on the allowlist. */\n+export function toSafeExternalUrl(rawUrl: string): URL | null {\n+  // An empty URI would otherwise resolve to the app's own page via the base.\n+  if (!rawUrl?.trim()) return null;\n+  try {\n+    const parsed = new URL(rawUrl, getExternalUrlBase());\n+    return ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol) ? parsed : null;\n+  } catch {\n+    return null;\n+  }\n+}\n+\n+/** Normalised href for a safe external URL, or null if it is not safe to open. */\n+export function getExternalHref(rawUrl: string): string | null {\n+  return toSafeExternalUrl(rawUrl)?.href ?? null;\n+}"
+      },
+      {
+        "filename": "frontend/editor/src/desktop/platform/openExternalTab.test.ts",
+        "status": "added",
+        "additions": 43,
+        "deletions": 0,
+        "changes": 43,
+        "patch": "@@ -0,0 +1,43 @@\n+import { afterEach, describe, expect, test, vi } from \"vitest\";\n+\n+const shellOpenMock = vi.fn();\n+\n+vi.mock(\"@tauri-apps/plugin-shell\", () => ({\n+  open: (url: string) => shellOpenMock(url),\n+}));\n+\n+import { openExternalTab } from \"@app/platform/openExternalTab\";\n+import { expectConsole } from \"@app/tests/failOnConsole\";\n+\n+describe(\"openExternalTab (desktop/Tauri)\", () => {\n+  afterEach(() => {\n+    vi.restoreAllMocks();\n+    shellOpenMock.mockReset();\n+  });\n+\n+  // Regression for #6272: window.open traps the link inside the Tauri webview,\n+  // so a PDF link opened a blank in-app window instead of the user's browser.\n+  test(\"hands the URL to the OS instead of the webview\", async () => {\n+    const openSpy = vi\n+      .spyOn(window, \"open\")\n+      .mockImplementation(() => null as Window | null);\n+\n+    await openExternalTab(\"https://example.com/\");\n+\n+    expect(shellOpenMock).toHaveBeenCalledWith(\"https://example.com/\");\n+    expect(openSpy).not.toHaveBeenCalled();\n+  });\n+\n+  // Worse than the web case: an unvalidated scheme here reaches an OS handler\n+  // rather than staying inside a browser.\n+  test.each([\"javascript:alert(1)\", \"file:///etc/passwd\", \"ftp://example.com\"])(\n+    \"refuses to hand %s to the OS\",\n+    async (url) => {\n+      expectConsole.warn(/Refused to open unsafe URL/);\n+\n+      await openExternalTab(url);\n+\n+      expect(shellOpenMock).not.toHaveBeenCalled();\n+    },\n+  );\n+});"
+      },
+      {
+        "filename": "frontend/editor/src/desktop/platform/openExternalTab.ts",
+        "status": "added",
+        "additions": 24,
+        "deletions": 0,
+        "changes": 24,
+        "patch": "@@ -0,0 +1,24 @@\n+/**\n+ * desktop (Tauri) implementation of the @app/platform/openExternalTab seam.\n+ *\n+ * window.open would trap the URL inside our own webview, so hand it to the OS.\n+ * Delegates to the openExternal seam rather than calling the Tauri shell plugin\n+ * again \u2014 on desktop \"new tab\" and \"system browser\" are the same action.\n+ *\n+ * Re-checks the URL for the same reason the core impl does, and more so: here it\n+ * reaches an OS handler, so an unvalidated scheme is not confined to a browser.\n+ */\n+import { openExternal } from \"@app/platform/openExternal\";\n+import type { OpenExternalTab } from \"@core/platform/openExternalTab\";\n+import { getExternalHref } from \"@core/utils/externalUrl\";\n+\n+export const openExternalTab: OpenExternalTab = async (\n+  url: string,\n+): Promise<void> => {\n+  const safeHref = getExternalHref(url);\n+  if (!safeHref) {\n+    console.warn(\"[openExternalTab] Refused to open unsafe URL:\", url);\n+    return;\n+  }\n+  await openExternal(safeHref);\n+};"
+      },
+      {
+        "filename": "frontend/editor/vitest.config.ts",
+        "status": "modified",
+        "additions": 12,
+        "deletions": 2,
+        "changes": 14,
+        "patch": "@@ -1,6 +1,11 @@\n import { defineConfig } from \"vitest/config\";\n import react from \"@vitejs/plugin-react-swc\";\n import tsconfigPaths from \"vite-tsconfig-paths\";\n+\n+// Projects do NOT inherit the root test.testTimeout, so every project silently\n+// ran at vitest's 5s default. Spread this into each one instead.\n+const TIMEOUTS = { testTimeout: 10000, hookTimeout: 10000 };\n+\n export default defineConfig({\n   test: {\n     globals: true,\n@@ -12,8 +17,7 @@ export default defineConfig({\n       \"src/**/*.spec.ts\", // Exclude Playwright E2E tests\n       \"src/tests/test-fixtures/**\",\n     ],\n-    testTimeout: 10000,\n-    hookTimeout: 10000,\n+    ...TIMEOUTS,\n     coverage: {\n       reporter: [\"text\", \"json\", \"html\"],\n       exclude: [\n@@ -30,6 +34,7 @@ export default defineConfig({\n       {\n         test: {\n           name: \"core\",\n+          ...TIMEOUTS,\n           include: [\"src/core/**/*.test.{ts,tsx}\"],\n           environment: \"jsdom\",\n           globals: true,\n@@ -48,6 +53,7 @@ export default defineConfig({\n       {\n         test: {\n           name: \"portal\",\n+          ...TIMEOUTS,\n           include: [\"src/portal/**/*.test.{ts,tsx}\"],\n           environment: \"jsdom\",\n           globals: true,\n@@ -68,6 +74,7 @@ export default defineConfig({\n       {\n         test: {\n           name: \"proprietary\",\n+          ...TIMEOUTS,\n           include: [\"src/proprietary/**/*.test.{ts,tsx}\"],\n           environment: \"jsdom\",\n           globals: true,\n@@ -86,6 +93,7 @@ export default defineConfig({\n       {\n         test: {\n           name: \"desktop\",\n+          ...TIMEOUTS,\n           include: [\"src/desktop/**/*.test.{ts,tsx}\"],\n           environment: \"jsdom\",\n           globals: true,\n@@ -104,6 +112,7 @@ export default defineConfig({\n       {\n         test: {\n           name: \"saas\",\n+          ...TIMEOUTS,\n           // src/saas = editor-saas layer; src/portal-saas = the portal's saas\n           // overrides (sibling to src/portal). Both build under the saas flavor,\n           // so both resolve @portal via the saas cascade (tsconfig.saas.vite.json).\n@@ -128,6 +137,7 @@ export default defineConfig({\n       {\n         test: {\n           name: \"prototypes\",\n+          ...TIMEOUTS,\n           include: [\"src/prototypes/**/*.test.{ts,tsx}\"],\n           environment: \"jsdom\",\n           globals: true,"
+      }
+    ],
+    "repository": {
+      "owner": "Stirling-Tools",
+      "name": "Stirling-PDF",
+      "full_name": "Stirling-Tools/Stirling-PDF",
+      "description": "#1 PDF Application on GitHub that lets you edit PDFs on any device anywhere",
+      "primary_language": "Java",
+      "stars": 88909,
+      "topics": [
+        "docker",
+        "hacktoberfest",
+        "java",
+        "pdf",
+        "pdf-converter",
+        "pdf-editor",
+        "pdf-manipulation",
+        "pdf-merger",
+        "pdf-ocr",
+        "pdf-tools",
+        "pdf-web-apps",
+        "pdfmerger",
+        "self-hosted"
+      ],
+      "default_branch": "main",
+      "framework": null
+    }
+  },
+  "heuristics": {
+    "score": 0,
+    "factors": [
+      {
+        "key": "auth",
+        "label": "Authentication logic touched",
+        "triggered": false,
+        "weight": 40,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "payment",
+        "label": "Payment / billing logic touched",
+        "triggered": false,
+        "weight": 45,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "config",
+        "label": "Configuration files changed",
+        "triggered": false,
+        "weight": 30,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "infra",
+        "label": "Infrastructure / deployment files changed",
+        "triggered": false,
+        "weight": 30,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "migration",
+        "label": "Database migration detected",
+        "triggered": false,
+        "weight": 35,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "api_contract",
+        "label": "Public API contract changed",
+        "triggered": false,
+        "weight": 25,
+        "reason": "No matching files in this diff."
+      }
+    ],
+    "tests_touched": true,
+    "tests_deleted": false,
+    "migration_touched": false
+  },
+  "ai": {
+    "overall_risk": "LOW",
+    "confidence": 55,
+    "summary": "Heuristic-only analysis (Unexpected error running the agent pipeline: name 'start' is not defined): 0 risk signal(s) triggered across 10 changed file(s).",
+    "architectural_impact": "Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment.",
+    "operational_risks": [],
+    "rollout_strategy": "Standard merge",
+    "rollout_reason": "Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.",
+    "rollback_required": false,
+    "test_coverage_estimate_pct": null,
+    "suggested_test_areas": [
+      "Regression"
+    ],
+    "risk_factors": [
+      {
+        "key": "auth",
+        "label": "Authentication logic touched",
+        "passed": true
+      },
+      {
+        "key": "payment",
+        "label": "Payment / billing logic touched",
+        "passed": true
+      },
+      {
+        "key": "config",
+        "label": "Configuration files changed",
+        "passed": true
+      },
+      {
+        "key": "infra",
+        "label": "Infrastructure / deployment files changed",
+        "passed": true
+      },
+      {
+        "key": "migration",
+        "label": "Database migration detected",
+        "passed": true
+      },
+      {
+        "key": "api_contract",
+        "label": "Public API contract changed",
+        "passed": true
+      }
+    ],
+    "file_risks": [
+      {
+        "filename": "frontend/editor/src/core/platform/openExternalTab.test.ts",
+        "risk": "MEDIUM",
+        "reason": "45 additions / 0 deletions in this file."
+      },
+      {
+        "filename": "frontend/editor/src/core/utils/externalUrl.test.ts",
+        "risk": "MEDIUM",
+        "reason": "45 additions / 0 deletions in this file."
+      },
+      {
+        "filename": "frontend/editor/src/desktop/platform/openExternalTab.test.ts",
+        "risk": "MEDIUM",
+        "reason": "43 additions / 0 deletions in this file."
+      },
+      {
+        "filename": "frontend/editor/src/core/utils/externalUrl.ts",
+        "risk": "MEDIUM",
+        "reason": "32 additions / 0 deletions in this file."
+      },
+      {
+        "filename": "frontend/editor/src/core/components/viewer/LinkLayer.tsx",
+        "risk": "MEDIUM",
+        "reason": "16 additions / 14 deletions in this file."
+      }
+    ],
+    "agent_findings": [],
+    "citations": []
+  },
+  "report": {
+    "decision": "ALLOW",
+    "risk_score": 0,
+    "confidence": 55,
+    "deployment_strategy": "Standard merge",
+    "risk_breakdown": {
+      "General": 0
+    },
+    "findings": [
+      "frontend/editor/src/core/platform/openExternalTab.test.ts",
+      "frontend/editor/src/core/utils/externalUrl.test.ts",
+      "frontend/editor/src/desktop/platform/openExternalTab.test.ts",
+      "frontend/editor/src/core/utils/externalUrl.ts",
+      "frontend/editor/src/core/components/viewer/LinkLayer.tsx"
+    ],
+    "evidence": [
+      "frontend/editor/src/core/platform/openExternalTab.test.ts: 45 additions / 0 deletions in this file.",
+      "frontend/editor/src/core/utils/externalUrl.test.ts: 45 additions / 0 deletions in this file.",
+      "frontend/editor/src/desktop/platform/openExternalTab.test.ts: 43 additions / 0 deletions in this file."
+    ],
+    "timeline": [
+      {
+        "stage": "Repository Loaded",
+        "duration_ms": 2402
+      },
+      {
+        "stage": "Repository Context Retrieved",
+        "duration_ms": 1301
+      }
+    ],
+    "agent_statuses": [],
+    "repository_metadata": {
+      "default_branch": "main",
+      "technologies": [
+        "TypeScript"
+      ],
+      "files_changed_count": 10
+    }
+  },
+  "ai_enabled": false,
+  "ai_error": "Unexpected error running the agent pipeline: name 'start' is not defined",
+  "rag": {
+    "scanned": true,
+    "default_branch": "main",
+    "indexed_files": 0,
+    "chunks_indexed": 5,
+    "skip_reason": null,
+    "retrieved": [
+      {
+        "path": "frontend/README.md",
+        "snippet": "# Frontend\n\nAll frontend commands are run from the repository root using [Task](https://taskfile.dev/):\n\n- `task frontend:dev` \u2014 start Vite dev server (localhost:5173)\n- `task frontend:build` \u2014 production build\n- `task frontend:test` \u2014 run tests\n- `task frontend:test:watch` \u2014 run tests in watch mode\n- `task frontend:lint` \u2014 run ESLint + cycle detection\n- `task frontend:typecheck` \u2014 run TypeScript type checking\n- `task frontend:check` \u2014 run typecheck + lint + test\n- `task frontend:install` \u2014 inst",
+        "score": -228.38280358441864
+      },
+      {
+        "path": "docs/type3_fallback_plan.md",
+        "snippet": "iting preserves glyphs even when original fonts had no ToUnicode map.\n\n## Current State\n- **Extraction**: `PdfJsonTextElement` now stores raw Type3 char codes; `encodeTextWithFont` can use them so token-level rewrites keep original glyphs.\n- **Regeneration**: Page regeneration now uses those char codes when writing new content streams, so existing text should remain visible even when tokens must be rebuilt.\n- **Scripts**: `scripts/index_type3_catalogue.py` scans PDFs in `app/core/src/main/resour",
+        "score": -238.1923102273284
+      },
+      {
+        "path": "README.md",
+        "snippet": "ols** - Edit, merge, split, sign, redact, convert, OCR, compress, and more.\n- **Automation & workflows** - No-code pipelines direct in UI with APIs to process millions of PDFs.\n- **Enterprise\u2011grade** - SSO, auditing, and flexible on\u2011prem deployments.\n- **Developer platform** - REST APIs available for nearly all tools to integrate into your existing systems.\n- **Global UI** - Interface available in 40+ languages.\n\nFor a full feature list, see the docs: **https://docs.stirlingpdf.com**\n\n## Quick S",
+        "score": -254.40005586386698
+      },
+      {
+        "path": "frontend/README.md",
+        "snippet": "end/editor/`; new apps (the developer portal, etc.)\nwill sit alongside it as siblings. Shared tooling \u2014 `package.json`, `node_modules`,\n`.storybook/`, ESLint, Prettier \u2014 lives at `frontend/` so every app installs\nonce and lints with the same config.\n\n## Environment Variables\n\nThe editor's environment variables live in committed `.env` files at\n`frontend/editor/`:\n\n- `.env` \u2014 used by all builds (core, proprietary, and as the base for desktop/SaaS)\n- `.env.desktop` \u2014 additional vars loaded in desk",
+        "score": -263.2073188251236
+      },
+      {
+        "path": "docs/type3_fallback_plan.md",
+        "snippet": "es**: There are sample PDFs under `app/core/src/main/resources/type3/samples/` (Matplotlib slides, etc.) that we can mine for common Type3 fonts.\n- **Library matching**: `Type3FontLibrary` loads `type3/library/index.json`, and `Type3LibraryStrategy` injects the prebuilt TTF/OTF payloads straight into `PdfJsonFont` conversion candidates. At runtime this is now the *only* conversion path; if the library does not recognise a signature we fall back to the captured Type3 glyph codes instead of trying",
+        "score": -264.325003767224
+      }
+    ]
+  },
+  "judge": null,
+  "source": "live"
+}

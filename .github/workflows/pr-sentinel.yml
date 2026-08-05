@@ -1,0 +1,96 @@
+name: PR Sentinel risk analysis
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    env:
+      OLLAMA_BASE_URL: http://localhost:11434
+      OLLAMA_MODEL: llama3.1
+      OLLAMA_EMBED_MODEL: nomic-embed-text
+      CHROMA_PERSIST_DIR: ./backend/tmpchroma
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Start Ollama
+        run: |
+          docker pull ollama/ollama:latest
+          docker run -d --name pr-sentinel-ollama -p 11434:11434 ollama/ollama:latest
+          for i in $(seq 1 30); do
+            if curl -sSf http://localhost:11434/v1/models > /dev/null 2>&1; then
+              echo "Ollama ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama did not start in time"
+          exit 1
+
+      - name: Analyze pull request
+        id: analyze
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          python backend/cli.py analyze \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --output reports/report.json \
+            --comment reports/report.md \
+            --token "${{ secrets.GITHUB_TOKEN }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Read report markdown
+        id: report
+        if: always()
+        run: |
+          echo "report_body<<EOF" >> "$GITHUB_OUTPUT"
+          if [ -f reports/report.md ]; then
+            cat reports/report.md
+          else
+            echo "No report generated."
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-sentinel-report
+          path: reports
+
+      - name: Comment PR summary
+        if: always() && github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## PR Sentinel risk analysis
+            ${{ steps.report.outputs.report_body }}
+
+      - name: Fail if blocked
+        if: ${{ steps.analyze.outputs.exit_code == '1' }}
+        run: |
+          echo "PR Sentinel returned BLOCK; failing workflow."
+          exit 1
+
+      - name: Stop Ollama
+        if: always()
+        run: |
+          docker rm -f pr-sentinel-ollama || true
