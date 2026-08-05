@@ -222,34 +222,3 @@ No GitHub OAuth is required — only the GitHub REST endpoints that work unauthe
 against public repos. An optional `GITHUB_TOKEN` raises the rate limit from 60 to 5,000
 requests/hour (this pipeline makes more GitHub calls than before, since it also walks the
 repo tree for RAG — a token is worth setting).
-
-## What I'd build next
-
-Roughly in order of how much they'd actually improve the analysis, not how novel they'd
-look on a resume:
-
-- **Repository knowledge graph** — model service-to-service dependencies (e.g. "Payment
-  Service → Database → Kafka → Notification"), so touching one file surfaces *downstream*
-  blast radius, not just the file's own domain.
-- **Memory across PRs** — "this repo usually pairs auth changes with integration tests;
-  this PR deviates from that pattern" requires remembering the last N analyses per repo,
-  not just this one.
-- **Dynamic tool-calling** — instead of always running all 5 agents and always retrieving
-  RAG context upfront, let the coordinator decide what it needs (fetch linked issue,
-  compare with the last release, search architecture docs) and call for it.
-- **MCP GitHub server** instead of the bespoke `github_client.py` — legitimate once the
-  tool needs more GitHub surface area (issues, previous PRs, releases) than a couple of
-  REST endpoints.
-
-## Talking points for interviews
-
-This project touches: RAG (chunking, embeddings, vector retrieval, and *why* retrieval
-over stuffing the whole repo in-context), multi-agent orchestration with LangGraph
-(parallel fan-out/fan-in, and routing that actually skips irrelevant agents rather than
-running all of them regardless), LLM-as-judge for self-verification, combining
-deterministic rules with LLM reasoning so the model explains a score instead of inventing
-one, schema validation with Pydantic across a multi-step pipeline, running LLMs locally
-via Ollama versus a hosted API and the cost/latency/reliability tradeoffs that come with
-it, graceful degradation at every layer (RAG, individual agents, the coordinator) so a
-missing dependency degrades the report instead of crashing it, and containerized
-deployment with Docker Compose.
