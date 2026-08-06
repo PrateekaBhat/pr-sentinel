@@ -9,7 +9,10 @@ PATH_RULES: list[tuple[str, str, int, re.Pattern]] = [
     ("auth", "Authentication logic touched", 40, re.compile(r"(^|/)(auth|authn|authz|login|session)(/|\.)", re.I)),
     ("payment", "Payment / billing logic touched", 45, re.compile(r"(^|/)(payment|billing|checkout|stripe|invoice)(/|\.)", re.I)),
     ("config", "Configuration files changed", 30, re.compile(r"(^|/)(config|settings|\.env|helm|k8s|kubernetes)(/|\.)", re.I)),
-    ("infra", "Infrastructure / deployment files changed", 30, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
+    # Reduced from 30 → 20: a CI/CD workflow change is lower risk than a genuine
+    # IaC or deployment change (Terraform, Kubernetes, Docker). The workflow
+    # heuristic fires frequently on routine PRs and was over-inflating scores.
+    ("infra", "Infrastructure / deployment files changed", 20, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
     ("migration", "Database migration detected", 35, re.compile(r"(^|/)(migrations?|schema)(/|\.).*\.(sql|py|ts|js)$|alembic", re.I)),
     ("api_contract", "Public API contract changed", 25, re.compile(r"(^|/)(routes?|controllers?|api|graphql|schema\.graphql|openapi)(/|\.)", re.I)),
 ]
@@ -49,13 +52,16 @@ def analyze(pr: PullRequestData) -> HeuristicResult:
 
     non_test_files = [f for f in pr.files if not TEST_PATH_RE.search(f.filename)]
     if non_test_files and not tests_touched:
-        score += 15
+        # Reduced from 15 → 10: missing tests is a signal worth noting, but a
+        # documentation-heavy or report-generation PR should not score 15 pts
+        # just because it touches no test files.
+        score += 10
         factors.append(
             HeuristicFactor(
                 key="no_tests",
                 label="No test files touched",
                 triggered=True,
-                weight=15,
+                weight=10,
                 reason="This PR changes code but doesn't add or modify any tests.",
             )
         )

@@ -94,7 +94,8 @@ class RAGChunk(BaseModel):
 
     path: str
     snippet: str
-    score: float = 0.0  # similarity score, higher = more relevant
+    score: float = 0.0  # cosine similarity score; positive = more relevant
+    retrieval_reason: str = ""  # human-readable explanation of why this chunk was retrieved
 
 
 class RAGContext(BaseModel):
@@ -200,6 +201,7 @@ class ConfidenceExplanation(BaseModel):
     """Explains *why* the model is as confident as it is, instead of a bare number."""
 
     score: int  # 0-100
+    level: str = "Medium"  # "High" | "Medium" | "Low" — human-readable tier derived from score
     repository_context_available: bool
     llm_heuristic_agreement: bool
     evidence_completeness: str  # "complete" | "partial"

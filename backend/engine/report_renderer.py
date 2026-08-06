@@ -78,7 +78,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
         f"| **Decision** | `{report.decision}` |",
         f"| **Overall Risk** | `{_risk_label(ai.overall_risk)}` |",
         f"| **Risk Score** | {report.risk_score} / 100 |",
-        f"| **Confidence** | {report.confidence}% ({report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
+        f"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% — {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
         f"| **Recommended Deployment** | {report.deployment_strategy} |",
         "",
         "## Pull Request",
@@ -119,7 +119,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
             lines.append(cat.summary)
             lines.append("")
             for item in cat.evidence:
-                lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity, {item.confidence}% confidence")
+                conf_lbl = "High" if item.confidence >= 75 else ("Medium" if item.confidence >= 50 else "Low")
+                lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity ({conf_lbl} confidence)")
                 lines.append(f"  - _Why it matters:_ {item.explanation}")
                 if item.snippet:
                     lines.append("  - _Evidence:_")
@@ -141,7 +142,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append("| Agent | Decision | Confidence | Time |")
         lines.append("|---|---|---|---|")
         for d in report.agent_decisions:
-            lines.append(f"| {d.label} | {d.decision} | {d.confidence}% | {_format_duration(d.execution_time_ms)} |")
+            conf_lbl = "High" if d.confidence >= 75 else ("Medium" if d.confidence >= 50 else "Low")
+            lines.append(f"| {d.label} | {d.decision} | {conf_lbl} | {_format_duration(d.execution_time_ms)} |")
         lines.append("")
         for d in report.agent_decisions:
             lines.append(f"<details><summary><strong>{d.label}</strong> reasoning</summary>")
@@ -166,11 +168,16 @@ def render_markdown(response: AnalyzeResponse) -> str:
                 lines.append(f"- `{path}`")
             lines.append("")
         if rag.retrieved:
-            lines.append("**Top context snippets that influenced this analysis:**")
-            for chunk in rag.retrieved[:5]:
-                lines.append(f"- `{chunk.path}` (relevance {chunk.score:.2f})")
-                lines.append(f"  > {chunk.snippet[:220]}{'...' if len(chunk.snippet) > 220 else ''}")
+            lines.append("**Top repository context retrieved:**")
             lines.append("")
+            for chunk in rag.retrieved[:5]:
+                lines.append(f"#### `{chunk.path}`")
+                if chunk.retrieval_reason:
+                    lines.append(f"**Why retrieved:** {chunk.retrieval_reason}")
+                lines.append(f"```")
+                lines.append(f"{chunk.snippet[:300]}{'...' if len(chunk.snippet) > 300 else ''}")
+                lines.append(f"```")
+                lines.append("")
         else:
             lines.append("No chunk was similar enough to the diff to be surfaced as supporting context.")
             lines.append("")
@@ -198,7 +205,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
     conf = report.confidence_explanation
     if conf:
         lines.extend(["## Confidence", ""])
-        lines.append(f"**{conf.score}%** — {conf.evidence_completeness} evidence")
+        lines.append(f"**{conf.level}** ({conf.score}% score) — {conf.evidence_completeness} evidence")
         lines.append("")
         lines.append(conf.narrative)
         lines.append("")
