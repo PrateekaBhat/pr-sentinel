@@ -164,6 +164,7 @@ def _build_report(
     repo_context_ms: int,
     ai_enabled: bool,
     judge: JudgeVerdict | None,
+    total_duration_ms: int,
 ) -> RiskReport:
     decision = "BLOCK" if ai.overall_risk == RiskLevel.HIGH else "ALLOW"
     category_breakdown = build_category_breakdown(pr, heuristics, ai)
@@ -198,7 +199,7 @@ def _build_report(
         deployment_recommendation=deployment_recommendation,
         execution_metrics=ExecutionMetrics(
             generated_at=datetime.now(timezone.utc).isoformat(),
-            total_duration_ms=repo_context_ms + sum(t.duration_ms for t in _build_timeline(repo_loaded_ms, repo_context_ms, state)),
+            total_duration_ms=total_duration_ms,
             ai_enabled=ai_enabled,
             rag_cache_hit=rag.cache_hit,
         ),
@@ -238,8 +239,14 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
     state: dict[str, Any] = {}
     try:
         state = await run_pipeline(pr, heuristic_result, rag_context)
-        ai_result = state["coordinator_result"]
+        ai_result = state.get("coordinator_result")
         judge_result = state.get("judge_result")
+        if ai_result is None:
+            # Coordinator failed gracefully (see coordinator_node) — specialist agent
+            # findings/timing in `state` are still real and get reflected in the report.
+            ai_enabled = False
+            ai_error = state.get("coordinator_error") or "Coordinator did not produce a result."
+            ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
     except OllamaError as exc:
         ai_enabled = False
         ai_error = str(exc)
@@ -249,9 +256,11 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         ai_error = f"Unexpected error running the agent pipeline: {exc}"
         ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
 
+    total_duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
     report = _build_report(
         pr, heuristic_result, ai_result, rag_context, state,
         repo_loaded_ms, repo_context_ms, ai_enabled, judge_result,
+        total_duration_ms,
     )
     response = AnalyzeResponse(
         pr=pr,

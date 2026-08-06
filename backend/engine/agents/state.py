@@ -24,5 +24,6 @@ class AgentState(TypedDict, total=False):
 
     coordinator_result: AIAnalysis
     coordinator_duration_ms: int
+    coordinator_error: str
     judge_result: JudgeVerdict
     judge_duration_ms: int

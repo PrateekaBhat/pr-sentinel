@@ -166,7 +166,15 @@ async def coordinator_node(state: AgentState) -> dict:
     rag = state.get("rag")
 
     start = time.perf_counter_ns()
-    data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)
+    try:
+        data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)
+    except OllamaError as exc:
+        # Don't let a coordinator failure blow away the whole graph run: the specialist
+        # agents above may have already succeeded, and we want their findings/timing to
+        # survive so the fallback report is accurate rather than looking instantaneous.
+        duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+        logger.warning("Coordinator failed: %s", exc)
+        return {"coordinator_error": str(exc), "coordinator_duration_ms": duration_ms}
 
     risk_value = str(data.get("overall_risk", "MEDIUM")).upper()
     overall_risk = RiskLevel(risk_value) if risk_value in RiskLevel.__members__ else RiskLevel.MEDIUM
