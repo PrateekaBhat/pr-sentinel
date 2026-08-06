@@ -73,18 +73,6 @@ jobs:
             --token "${{ secrets.GITHUB_TOKEN }}"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Read report markdown
-        id: report
-        if: always()
-        run: |
-          echo "report_body<<EOF" >> "$GITHUB_OUTPUT"
-          if [ -f reports/report.md ]; then
-            cat reports/report.md
-          else
-            echo "No report generated."
-          fi
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
       - name: Upload report artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -93,15 +81,13 @@ jobs:
           path: reports
 
       - name: Comment PR summary
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && hashFiles('reports/report.md') != ''
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            ## PR Sentinel risk analysis
-            ${{ steps.report.outputs.report_body }}
+          body-path: reports/report.md
 
       - name: Fail if blocked
         if: ${{ steps.analyze.outputs.exit_code == '1' }}
