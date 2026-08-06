@@ -79,7 +79,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
         f"| **Overall Risk** | `{_risk_label(ai.overall_risk)}` |",
         f"| **Risk Score** | {report.risk_score} / 100 |",
         f"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% — {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
-        f"| **Recommended Deployment** | {report.deployment_strategy} |",
+        f"| **Estimated Review Effort** | ⏱️ `{report.review_effort_label}` |",
+        f"| **Recommended Deployment** | `{report.deployment_strategy}` |",
         "",
         "## Pull Request",
         "",
@@ -101,6 +102,19 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append("")
     lines.append(impact.narrative or "No clearly affected subsystems were detected.")
     lines.append("")
+
+    # --- Score Calculation Math ------------------------------------------------
+    if report.score_math:
+        lines.extend(["## Score Calculation Math", ""])
+        lines.append("The overall risk score is calculated deterministically from triggered rule weights:")
+        lines.append("")
+        lines.append("| Factor | Points | Rule / Evidence |")
+        lines.append("|---|---|---|")
+        for item in report.score_math:
+            pts = f"+{item.points}" if item.points > 0 else f"{item.points}"
+            lines.append(f"| {item.factor} | `{pts}` | {item.reason} |")
+        lines.append(f"| **Total Calculated Score** | **`{report.risk_score}`** | |")
+        lines.append("")
 
     # --- Score breakdown by category -------------------------------------------
     if report.risk_categories:
@@ -185,21 +199,27 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append(f"Repository context was not retrieved for this run ({rag.skip_reason or 'not available'}).")
         lines.append("")
 
-    # --- Deployment recommendation ------------------------------------------------
+    # --- Deployment Recommendation ------------------------------------------------
     rec = report.deployment_recommendation
     lines.extend(["## Deployment Recommendation", ""])
     if rec:
-        lines.append(f"**Chosen strategy: {rec.strategy}**")
+        lines.append(f"**Chosen strategy: `{rec.strategy}`**")
         lines.append("")
         lines.append(rec.reason or ai.rollout_reason)
         lines.append("")
+        if rec.monitoring_focus:
+            lines.append(f"- **Monitoring focus:** {rec.monitoring_focus}")
+        if rec.rollback_trigger:
+            lines.append(f"- **Rollback trigger:** {rec.rollback_trigger}")
+        if rec.approval_level:
+            lines.append(f"- **Required approval:** `{rec.approval_level}`")
+        lines.append(f"- **Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
+        lines.append("")
         if rec.alternatives_considered:
-            lines.append("**Alternatives considered and why they weren't chosen:**")
+            lines.append("**Alternatives considered:**")
             for alt in rec.alternatives_considered:
                 lines.append(f"- {alt}")
             lines.append("")
-        lines.append(f"**Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
-        lines.append("")
 
     # --- Confidence explanation ------------------------------------------------
     conf = report.confidence_explanation

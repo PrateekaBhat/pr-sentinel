@@ -1,20 +1,21 @@
 # PR Sentinel — Release Risk Assessment
 
-**Generated:** 2026-08-06 12:29:37 UTC  ·  **Repository:** [PrateekaBhat/pr-sentinel](https://github.com/PrateekaBhat/pr-sentinel/pull/2)  ·  **PR:** #2
+**Generated:** 2026-08-06 13:21:00 UTC  ·  **Repository:** [PrateekaBhat/pr-sentinel](https://github.com/PrateekaBhat/pr-sentinel/pull/2)  ·  **PR:** #2
 
-### ✅ ALLOW — MEDIUM risk (score 50/100)
+### ✅ ALLOW — MEDIUM risk (score 40/100)
 
 ## Executive Summary
 
-Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 3 risk signal(s) triggered across 23 changed file(s). This is a deterministic, rule-based assessment only — no LLM synthesis, specialist agent review, or repository context was available for this run.
+Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 2 risk signal(s) triggered across 27 changed file(s). This is a deterministic, rule-based assessment only — no LLM synthesis, specialist agent review, or repository context was available for this run.
 
 | | |
 |---|---|
 | **Decision** | `ALLOW` |
 | **Overall Risk** | `MEDIUM` |
-| **Risk Score** | 50 / 100 |
+| **Risk Score** | 40 / 100 |
 | **Confidence** | Medium (55% — partial evidence) |
-| **Recommended Deployment** | Canary |
+| **Estimated Review Effort** | ⏱️ `2 hours` |
+| **Recommended Deployment** | `Canary` |
 
 ## Pull Request
 
@@ -22,7 +23,7 @@ Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull ll
 - **Author:** @PrateekaBhat
 - **Branch:** `feature-refactor` → `main`
 - **Language / Framework:** Python / Unknown
-- **Files Changed:** 23 (+1225/-605)
+- **Files Changed:** 27 (+2809/-412)
 - **Merge Status:** clean
 
 ## Architectural Impact
@@ -30,6 +31,17 @@ Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull ll
 **Affected subsystems:** `CI/CD`, `Dependencies`, `Tests`, `Application/Core Logic`, `Documentation`
 
 Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment.
+
+## Score Calculation Math
+
+The overall risk score is calculated deterministically from triggered rule weights:
+
+| Factor | Points | Rule / Evidence |
+|---|---|---|
+| Base Risk | `0` | Clean starting baseline |
+| Infrastructure / deployment files changed | `+20` | Matched in .github/workflows/pr-sentinel.yml |
+| Large diff (800+ line changes) | `+20` | 3221 lines changed across 27 files. |
+| **Total Calculated Score** | **`40`** | |
 
 ## Risk Score Breakdown
 
@@ -43,8 +55,8 @@ Start Ollama and pull a model (see backend/.env.example) for a full AI-generated
 | Dependencies | `LOW` | 10/100 | 1 item(s) |
 | Secrets | `LOW` | 0/100 | 0 item(s) |
 | Tests | `MEDIUM` | 20/100 | 1 item(s) |
-| Application/Core Logic | `HIGH` | 100/100 | 10 item(s) |
-| Documentation | `LOW` | 5/100 | 1 item(s) |
+| Application/Core Logic | `HIGH` | 100/100 | 13 item(s) |
+| Documentation | `HIGH` | 30/100 | 1 item(s) |
 
 <details><summary><strong>CI/CD</strong> — LOW (12/100)</summary>
 
@@ -85,18 +97,37 @@ Start Ollama and pull a model (see backend/.env.example) for a full AI-generated
 
 <details><summary><strong>Tests</strong> — MEDIUM (20/100)</summary>
 
-No test files were touched by this PR.
+1 file(s) touched in this category.
 
-- **`(no test files touched)`** — MEDIUM severity (High confidence)
-  - _Why it matters:_ This PR modifies implementation files but does not add or update any test files. Confirm whether the changed logic paths are covered by existing tests, or whether new tests are warranted.
+- **`backend/engine/tests/test_category_classifier.py`** — MEDIUM severity (High confidence)
+  - _Why it matters:_ 170 additions / 0 deletions in this file.
+  - _Evidence:_
+    ```diff
+    +﻿from __future__ import annotations
+    +
+    +import pytest
+    +from engine.categories import (
+    +    _confidence_label,
+    +    _is_persistence_layer_file,
+    ```
   - _Recommended action:_ Add or restore coverage for the touched code paths before this ships.
 
 </details>
 
 <details><summary><strong>Application/Core Logic</strong> — HIGH (100/100)</summary>
 
-10 file(s) touched in this category.
+13 file(s) touched in this category.
 
+- **`backend/engine/agent_routing.py`** — LOW severity (Medium confidence)
+  - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +19/−1 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.
+  - _Evidence:_
+    ```diff
+    -    "database": re.compile(r"(^|/)(migrations?|schema|models?|entity|repository)(/|\.)|\.sql$", re.I),
+    +    # Database agent: only files with clear persistence-layer signals.
+    +    # A plain models.py in engine/, app/, or backend/ is a Pydantic/domain model,
+    +    # NOT a database model — it must not route to this agent
+    ```
+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
 - **`backend/engine/agents/nodes.py`** — LOW severity (Medium confidence)
   - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +29/−2 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.
   - _Evidence:_
@@ -110,7 +141,7 @@ No test files were touched by this PR.
     ```
   - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
 - **`backend/engine/agents/prompts.py`** — LOW severity (Medium confidence)
-  - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +15/−7 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.
+  - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +38/−11 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.
   - _Evidence:_
     ```diff
     -  "risk_note": "<one sentence: does this domain add risk to this PR, and why>"
@@ -137,10 +168,10 @@ No test files were touched by this PR.
     ```
   - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
 - **`backend/engine/categories.py`** — HIGH severity (High confidence)
-  - _Why it matters:_ 276 additions / 0 deletions in this file.
+  - _Why it matters:_ 549 additions / 0 deletions in this file.
   - _Evidence:_
     ```diff
-    +from __future__ import annotations
+    +﻿from __future__ import annotations
     +
     +import re
     +from typing import Any
@@ -148,8 +179,8 @@ No test files were touched by this PR.
     +from .models import (
     ```
   - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
-- **`backend/engine/demo_data.py`** — MEDIUM severity (High confidence)
-  - _Why it matters:_ 136 additions / 30 deletions in this file.
+- **`backend/engine/demo_data.py`** — LOW severity (Medium confidence)
+  - _Why it matters:_ This is a core implementation file (modified, +136/−30 lines). Review the changed logic in `demo_data.py` for correctness and test coverage.
   - _Evidence:_
     ```diff
     +from .categories import build_agent_decisions
@@ -160,20 +191,40 @@ No test files were touched by this PR.
     +            decision="ALLOW",
     ```
   - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
-- **`backend/engine/models.py`** — LOW severity (Medium confidence)
-  - _Why it matters:_ This file defines internal domain or data-transfer models (modified, +64/−5 lines). No ORM base classes, Alembic migrations, or persistence-layer signals were detected in this path—this is a Pydantic/dataclass domain model, not a database schema.
+- **`backend/engine/heuristics.py`** — LOW severity (Medium confidence)
+  - _Why it matters:_ This is a core implementation file (modified, +9/−3 lines). Review the changed logic in `heuristics.py` for correctness and test coverage.
   - _Evidence:_
     ```diff
-    +    confidence: int = 60  # 0-100, how confident this agent is in its own findings
-    +
-    +
-    +class AgentDecision(BaseModel):
-    +    """Surfaces one node's execution inside the LangGraph pipeline: what it decided,
-    +    why, how confident it was, and how long it took. This is what makes the multi-agent
+    -    ("infra", "Infrastructure / deployment files changed", 30, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
+    +    # Reduced from 30 → 20: a CI/CD workflow change is lower risk than a genuine
+    +    # IaC or deployment change (Terraform, Kubernetes, Docker). The workflow
+    +    # h
+    ```
+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
+- **`backend/engine/models.py`** — LOW severity (Medium confidence)
+  - _Why it matters:_ This file defines internal domain or data-transfer models (modified, +67/−6 lines). No ORM base classes, Alembic migrations, or persistence-layer signals were detected in this path—this is a Pydantic/dataclass domain model, not a database schema.
+  - _Evidence:_
+    ```diff
+    -    score: float = 0.0  # similarity score, higher = more relevant
+    +    score: float = 0.0  # cosine similarity score; positive = more relevant
+    +    retrieval_reason: str = ""  # human-readable explanation of why this chunk was retrieved
+    +    confidence: int = 60  # 0-100, how confident this agent is in its own findin
+    ```
+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
+- **`backend/engine/rag/retriever.py`** — LOW severity (Medium confidence)
+  - _Why it matters:_ This is a core implementation file (modified, +37/−2 lines). Review the changed logic in `retriever.py` for correctness and test coverage.
+  - _Evidence:_
+    ```diff
+    +def _infer_retrieval_reason(path: str, snippet: str) -> str:
+    +    """Generate a human-readable explanation of why a document chunk was retrieved,
+    +    based on its source path and a brief look at the snippet content."""
+    +    path_lower = path.lower()
+    +    if "readme" in path_lower:
+    +        return "Describes the proje
     ```
   - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.
 - **`backend/engine/report_renderer.py`** — HIGH severity (High confidence)
-  - _Why it matters:_ 159 additions / 88 deletions in this file.
+  - _Why it matters:_ 166 additions / 88 deletions in this file.
   - _Evidence:_
     ```diff
     +def _format_timestamp(raw: str) -> str:
@@ -211,20 +262,20 @@ No test files were touched by this PR.
 
 </details>
 
-<details><summary><strong>Documentation</strong> — LOW (5/100)</summary>
+<details><summary><strong>Documentation</strong> — HIGH (30/100)</summary>
 
 1 file(s) touched in this category.
 
-- **`backend/reports/report.md`** — LOW severity (Medium confidence)
-  - _Why it matters:_ This documentation file was removed (removed, +0/−23 lines). No runtime or production code was changed by this file.
+- **`backend/reports/report.md`** — HIGH severity (High confidence)
+  - _Why it matters:_ 372 additions / 14 deletions in this file.
   - _Evidence:_
     ```diff
     -## PR Sentinel Report
-    -
+    +# PR Sentinel — Release Risk Assessment
     -Overall Risk: RiskLevel.LOW
-    -
+    +**Generated:** 2026-08-06 12:29:37 UTC  ·  **Repository:** [PrateekaBhat/pr-sentinel](https://github.com/PrateekaBhat/pr-sentinel/pull/2)  ·  **PR:** #2
     -Decision: ALLOW
-    -
+    +### ✅ ALLOW — MEDIUM risk (score 50/100)
     ```
   - _Recommended action:_ No action required beyond a standard doc review.
 
@@ -240,7 +291,7 @@ synthesizes their output (below) into the executive summary and risk breakdown a
 | Security | Skipped — no files in this agent’s domain were touched | High | 0ms |
 | Database | Skipped — no files in this agent’s domain were touched | High | 0ms |
 | API Compatibility | Skipped — no files in this agent’s domain were touched | High | 0ms |
-| Test Coverage | Skipped — no files in this agent’s domain were touched | High | 0ms |
+| Test Coverage | No concerns raised | Low | 285ms |
 | Performance | Skipped — no files in this agent’s domain were touched | High | 0ms |
 
 <details><summary><strong>Security</strong> reasoning</summary>
@@ -263,7 +314,7 @@ No files in this domain were touched by this PR.
 
 <details><summary><strong>Test Coverage</strong> reasoning</summary>
 
-No files in this domain were touched by this PR.
+Agent call failed (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`); files were not analyzed by AI for this domain.
 
 </details>
 
@@ -275,9 +326,18 @@ No files in this domain were touched by this PR.
 
 ## Repository Context (RAG)
 
-Indexed **1** repository document(s) into **6** chunk(s) from branch `main` (freshly indexed).
+Indexed **0** repository document(s) into **5** chunk(s) from branch `main` (freshly indexed).
 
 **Top repository context retrieved:**
+
+#### `README.md`
+**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.
+```
+base agent never sees route handlers. If a PR touches no files
+in an agent's domain, that agent **skips the LLM call entirely** and reports
+`applicable: false`. This is what makes the multi-agent split real rather than
+decorative: five agents on a docs-only PR cost one API call's worth of latency, n...
+```
 
 #### `README.md`
 **Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.
@@ -289,15 +349,6 @@ Indexed **1** repository document(s) into **6** chunk(s) from branch `main` (fre
 Paste a public GitHub PR URL. PR Sentinel fetches the diff, scores it with deterministic
 heuristics, retrieves relevant context from the repo's own docs (RAG), routes the changed
 files to five specialist agents, and has a ...
-```
-
-#### `README.md`
-**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.
-```
-base agent never sees route handlers. If a PR touches no files
-in an agent's domain, that agent **skips the LLM call entirely** and reports
-`applicable: false`. This is what makes the multi-agent split real rather than
-decorative: five agents on a docs-only PR cost one API call's worth of latency, n...
 ```
 
 #### `README.md`
@@ -338,15 +389,18 @@ s deleted, migration
 
 ## Deployment Recommendation
 
-**Chosen strategy: Canary**
+**Chosen strategy: `Canary`**
 
 Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.
 
-**Alternatives considered and why they weren't chosen:**
+- **Monitoring focus:** Monitor CI pipeline step completion, runner resource usage, and error rate during early deployment.
+- **Rollback trigger:** Immediate rollback on any pipeline failure or unexpected workflow runner exit code.
+- **Required approval:** `Platform / DevOps Lead`
+- **Rollback plan required:** No
+
+**Alternatives considered:**
 - Standard (skipped — this touches a live code path)
 - Blue/Green (more than this change warrants)
-
-**Rollback plan required:** No
 
 ## Confidence
 
@@ -359,15 +413,15 @@ Repository documentation was retrieved and used as context; the heuristic score 
 
 ## Execution Metrics
 
-- **Total duration:** 11.9s
-- Repository Loaded: 1.7s
-- Repository Context Retrieved: 9.8s
+- **Total duration:** 3.3s
+- Repository Loaded: 1.5s
+- Repository Context Retrieved: 1.2s
 - Security: 0ms
 - Database: 0ms
 - API Compatibility: 0ms
-- Test Coverage: 0ms
+- Test Coverage: 285ms
 - Performance: 0ms
-- Final Decision: 346ms
+- Final Decision: 275ms
 
 ## Groundedness Check
 

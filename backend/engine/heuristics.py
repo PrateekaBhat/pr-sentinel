@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from .models import HeuristicFactor, HeuristicResult, PullRequestData
+from .models import HeuristicFactor, HeuristicResult, PullRequestData, ScoreMathFactor
 
 # Each rule: (key, label, weight, path/content pattern)
 PATH_RULES: list[tuple[str, str, int, re.Pattern]] = [
@@ -91,12 +91,55 @@ def analyze(pr: PullRequestData) -> HeuristicResult:
             )
         )
 
+    score_math: list[ScoreMathFactor] = [
+        ScoreMathFactor(factor="Base Risk", points=0, reason="Clean starting baseline")
+    ]
+    for factor in factors:
+        if factor.triggered:
+            score_math.append(
+                ScoreMathFactor(factor=factor.label, points=factor.weight, reason=factor.reason)
+            )
+
     score = min(score, 100)
 
     return HeuristicResult(
         score=score,
         factors=factors,
+        score_math=score_math,
         tests_touched=tests_touched,
         tests_deleted=tests_deleted,
         migration_touched="migration" in matched_keys,
     )
+
+
+def calculate_review_effort(pr: PullRequestData, heuristics: HeuristicResult) -> tuple[int, str]:
+    """Deterministically estimates the time required for a thorough human code review."""
+    total_changes = pr.additions + pr.deletions
+    subsystems_count = pr.changed_files_count
+
+    # Base estimate from change size
+    if total_changes < 50 and subsystems_count <= 2:
+        minutes = 5
+    elif total_changes < 200:
+        minutes = 15
+    elif total_changes < 600:
+        minutes = 30
+    elif total_changes < 1200:
+        minutes = 60
+    else:
+        minutes = 120
+
+    # Risk adjustments
+    if heuristics.score >= 70:
+        minutes = max(minutes, 60)
+    elif heuristics.score >= 40:
+        minutes = max(minutes, 30)
+
+    if minutes < 60:
+        label = f"{minutes} minutes"
+    elif minutes == 60:
+        label = "1 hour"
+    else:
+        label = f"{minutes // 60} hours {minutes % 60} minutes" if minutes % 60 else f"{minutes // 60} hours"
+
+    return minutes, label

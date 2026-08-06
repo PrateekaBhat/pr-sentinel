@@ -69,9 +69,16 @@ class HeuristicFactor(BaseModel):
     reason: str
 
 
+class ScoreMathFactor(BaseModel):
+    factor: str
+    points: int
+    reason: str
+
+
 class HeuristicResult(BaseModel):
     score: int  # 0-100
     factors: list[HeuristicFactor]
+    score_math: list[ScoreMathFactor] = Field(default_factory=list)
     tests_touched: bool
     tests_deleted: bool
     migration_touched: bool
@@ -209,10 +216,13 @@ class ConfidenceExplanation(BaseModel):
 
 
 class DeploymentRecommendation(BaseModel):
-    """The chosen rollout strategy plus the reasoning and alternatives considered."""
+    """The chosen rollout strategy plus reasoning, monitoring, rollback, and approval rules."""
 
     strategy: str  # "Standard" | "Canary" | "Blue/Green" | "Manual Approval"
     reason: str = ""
+    monitoring_focus: str = ""
+    rollback_trigger: str = ""
+    approval_level: str = ""
     alternatives_considered: list[str] = Field(default_factory=list)
     rollback_required: bool = False
 
@@ -238,7 +248,10 @@ class RiskReport(BaseModel):
     decision: str
     risk_score: int
     confidence: int
+    review_effort_minutes: int = 15
+    review_effort_label: str = "15 minutes"
     deployment_strategy: str
+    score_math: list[ScoreMathFactor] = Field(default_factory=list)
     risk_breakdown: dict[str, int] = Field(default_factory=dict)
     risk_categories: list[RiskCategory] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
