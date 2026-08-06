@@ -6,12 +6,16 @@ via /api/analyze. Each entry is a fully-formed AnalyzeResponse payload.
 """
 from __future__ import annotations
 
+from .categories import build_agent_decisions
 from .models import (
     AgentFinding,
     AIAnalysis,
     AnalyzeResponse,
+    ArchitecturalImpact,
     ChangedFile,
+    ConfidenceExplanation,
     DemoSummary,
+    DeploymentRecommendation,
     FileRisk,
     HeuristicFactor,
     HeuristicResult,
@@ -315,6 +319,83 @@ DEMOS: dict[str, AnalyzeResponse] = {
                 FileRisk(filename="migrations/0042_add_refund_reason.sql", risk=RiskLevel.LOW, reason="Additive, nullable column; low risk on its own."),
             ],
         ),
+        report=RiskReport(
+            decision="ALLOW",
+            risk_score=35,
+            confidence=84,
+            deployment_strategy="Blue/Green",
+            risk_breakdown={"Database": 35, "Tests": 15},
+            findings=["Database migration detected", "No test files touched"],
+            evidence=[
+                "Database migration detected: Matched in migrations/0042_add_refund_reason.sql",
+                "migrations/backfill_refund_reason.py: Untested backfill logic against production data volume.",
+            ],
+            timeline=[
+                TimelineStage(stage="Repository Loaded", duration_ms=90),
+                TimelineStage(stage="Repository Context Retrieved", duration_ms=60),
+                TimelineStage(stage="Database", duration_ms=210),
+                TimelineStage(stage="Final Decision", duration_ms=140),
+            ],
+            agent_statuses=[
+                AgentStatus(agent="security", label="Security", status="Skipped", files_reviewed=0, duration_ms=0),
+                AgentStatus(agent="database", label="Database", status="Completed", files_reviewed=3, duration_ms=210),
+                AgentStatus(agent="api", label="API Compatibility", status="Skipped", files_reviewed=0, duration_ms=0),
+                AgentStatus(agent="tests", label="Test Coverage", status="Completed", files_reviewed=0, duration_ms=90),
+                AgentStatus(agent="performance", label="Performance", status="Skipped", files_reviewed=0, duration_ms=0),
+            ],
+            agent_decisions=build_agent_decisions({
+                "database_status": {"agent": "database", "label": "Database", "status": "Completed", "files_reviewed": 3, "duration_ms": 210},
+                "database_finding": AgentFinding(
+                    agent="database", label="Database", applicable=True,
+                    files_reviewed=["migrations/0042_add_refund_reason.sql", "migrations/backfill_refund_reason.py", "schema.sql"],
+                    findings=["Migration is additive and reversible", "Backfill script has no explicit idempotency guard"],
+                    risk_note="Schema change is safe on its own; the backfill script is the main residual risk.",
+                    confidence=78,
+                ),
+                "tests_status": {"agent": "tests", "label": "Test Coverage", "status": "Completed", "files_reviewed": 0, "duration_ms": 90},
+                "tests_finding": AgentFinding(
+                    agent="tests", label="Test Coverage", applicable=True, files_reviewed=[],
+                    findings=["No test verifies backfill idempotency if re-run"],
+                    risk_note="No test files were touched despite new migration logic.",
+                    confidence=70,
+                ),
+            }),
+            repository_metadata=RepositoryMetadata(
+                default_branch="main",
+                technologies=["Python"],
+                files_changed_count=3,
+            ),
+            summary="A low-risk, additive schema change: a nullable column plus a backfill script.",
+            executive_summary="This PR adds a nullable refund_reason column and a backfill script for "
+            "historical invoice rows. The schema change itself is backward compatible and low risk, but the "
+            "backfill script lacks an idempotency guard and could contend for row locks on large tables if "
+            "re-run. Recommend a Blue/Green rollout so the migration can be validated independently before "
+            "any application code depends on the new column.",
+            architectural_impact=ArchitecturalImpact(
+                affected_subsystems=["Database", "Tests"],
+                narrative="Backward-compatible schema addition to the billing-platform invoices table; safe "
+                "to deploy ahead of the application code that will eventually read refund_reason.",
+            ),
+            confidence_explanation=ConfidenceExplanation(
+                score=84,
+                repository_context_available=False,
+                llm_heuristic_agreement=True,
+                evidence_completeness="complete",
+                narrative="This assessment is based on complete evidence: the database specialist agent "
+                "reviewed all three changed files, and the heuristic score and LLM risk assessment agree "
+                "this is a medium-risk, well-scoped migration.",
+            ),
+            deployment_recommendation=DeploymentRecommendation(
+                strategy="Blue/Green",
+                reason="Ship the migration ahead of any code that depends on it, and monitor backfill job "
+                "duration and lock contention on the invoices table before cutting application traffic over.",
+                alternatives_considered=[
+                    "Standard (too risky — no visibility into backfill lock contention before it runs)",
+                    "Canary (insufficient isolation for a schema-level change)",
+                ],
+                rollback_required=False,
+            ),
+        ),
     ),
     "docs-refactor": AnalyzeResponse(
         source="demo",
@@ -381,37 +462,62 @@ DEMOS: dict[str, AnalyzeResponse] = {
             file_risks=[
                 FileRisk(filename="docs/README.md", risk=RiskLevel.LOW, reason="Navigation links updated; verify none are stale."),
             ],
-            report=RiskReport(
-                decision="ALLOW",
-                risk_score=0,
-                confidence=97,
-                deployment_strategy="Standard merge",
-                risk_breakdown={
-                    "General": 0,
-                },
-                findings=[
-                    "Documentation-only change",
+        ),
+        report=RiskReport(
+            decision="ALLOW",
+            risk_score=0,
+            confidence=97,
+            deployment_strategy="Standard",
+            risk_breakdown={
+                "General": 0,
+            },
+            findings=[
+                "Documentation-only change",
+            ],
+            evidence=[
+                "No source, config, or infrastructure files were touched.",
+            ],
+            timeline=[
+                TimelineStage(stage="Repository Loaded", duration_ms=20),
+                TimelineStage(stage="Repository Context Retrieved", duration_ms=45),
+                TimelineStage(stage="Final Decision", duration_ms=70),
+            ],
+            agent_statuses=[
+                AgentStatus(agent="security", label="Security", status="Skipped", files_reviewed=0, duration_ms=0),
+                AgentStatus(agent="database", label="Database", status="Skipped", files_reviewed=0, duration_ms=0),
+                AgentStatus(agent="api", label="API Compatibility", status="Skipped", files_reviewed=0, duration_ms=0),
+                AgentStatus(agent="tests", label="Test Coverage", status="Skipped", files_reviewed=0, duration_ms=0),
+                AgentStatus(agent="performance", label="Performance", status="Skipped", files_reviewed=0, duration_ms=0),
+            ],
+            repository_metadata=RepositoryMetadata(
+                default_branch="main",
+                technologies=["Markdown"],
+                files_changed_count=4,
+            ),
+            summary="Documentation-only change with no impact on application behavior.",
+            executive_summary="This PR is a pure documentation restructuring with no source, config, or "
+            "infrastructure changes. It carries no production risk and is safe to merge without a staged rollout.",
+            architectural_impact=ArchitecturalImpact(
+                affected_subsystems=["Documentation"],
+                narrative="None — no source, config, or infrastructure files were touched.",
+            ),
+            confidence_explanation=ConfidenceExplanation(
+                score=97,
+                repository_context_available=False,
+                llm_heuristic_agreement=True,
+                evidence_completeness="complete",
+                narrative="This assessment is based on complete evidence: the change touches only "
+                "documentation files, and the heuristic score and LLM risk assessment agree there is no "
+                "production risk.",
+            ),
+            deployment_recommendation=DeploymentRecommendation(
+                strategy="Standard",
+                reason="No runtime code paths are affected; a normal merge is sufficient.",
+                alternatives_considered=[
+                    "Canary (unnecessary — no code path is affected)",
+                    "Manual Approval (unnecessary overhead for a docs-only change)",
                 ],
-                evidence=[
-                    "No source, config, or infrastructure files were touched.",
-                ],
-                timeline=[
-                    TimelineStage(stage="Repository Loaded", duration_ms=20),
-                    TimelineStage(stage="Repository Context Retrieved", duration_ms=45),
-                    TimelineStage(stage="Final Decision", duration_ms=70),
-                ],
-                agent_statuses=[
-                    AgentStatus(agent="security", label="Security", status="Skipped", files_reviewed=0, duration_ms=0),
-                    AgentStatus(agent="database", label="Database", status="Skipped", files_reviewed=0, duration_ms=0),
-                    AgentStatus(agent="api", label="API Compatibility", status="Skipped", files_reviewed=0, duration_ms=0),
-                    AgentStatus(agent="tests", label="Test Coverage", status="Skipped", files_reviewed=0, duration_ms=0),
-                    AgentStatus(agent="performance", label="Performance", status="Skipped", files_reviewed=0, duration_ms=0),
-                ],
-                repository_metadata=RepositoryMetadata(
-                    default_branch="main",
-                    technologies=["Markdown"],
-                    files_changed_count=4,
-                ),
+                rollback_required=False,
             ),
         ),
     ),

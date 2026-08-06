@@ -32,10 +32,12 @@ AGENT_RESPONSE_INSTRUCTIONS = """
 Respond with ONLY a JSON object, no prose, no markdown fences:
 {
   "findings": ["<short, specific finding>", ...],
-  "risk_note": "<one sentence: does this domain add risk to this PR, and why>"
+  "risk_note": "<one sentence: does this domain add risk to this PR, and why>",
+  "confidence": <integer 0-100, how confident you are in this assessment given what you were shown>
 }
 List at most 4 findings. If you see nothing concerning, return an empty findings list and
-say so plainly in risk_note — do not invent a problem to seem thorough.
+say so plainly in risk_note — do not invent a problem to seem thorough. Lower your confidence
+if the diff was truncated or you were only shown a partial patch.
 """
 
 COORDINATOR_SYSTEM_PROMPT = """You are the coordinating Staff Engineer for a pull request risk
@@ -55,11 +57,13 @@ Respond with ONLY a single JSON object (no markdown fences, no prose before or a
 {
   "overall_risk": "LOW" | "MEDIUM" | "HIGH",
   "confidence": <integer 0-100>,
-  "summary": "<2-3 sentence plain-English synthesis>",
-  "architectural_impact": "<1-2 sentences>",
+  "executive_summary": "<3-4 sentence executive summary written for an engineering leader deciding whether to ship: what changed, what the real risk is, and what you'd want them to know before approving>",
+  "summary": "<2-3 sentence plain-English synthesis, same content as executive_summary but shorter>",
+  "architectural_impact": "<1-2 sentences on which subsystems/services this PR affects and how they relate>",
+  "affected_subsystems": ["<short subsystem name, e.g. 'Auth service', 'Checkout API', 'CI pipeline'>", ...],
   "operational_risks": ["<short phrase>", ...],
-  "rollout_strategy": "<short label, e.g. 'Canary' | 'Standard merge' | 'Feature-flagged rollout' | 'Staged rollout'>",
-  "rollout_reason": "<1-2 sentences justifying the strategy, referencing which agent(s) or heuristic drove it>",
+  "rollout_strategy": "Standard" | "Canary" | "Blue/Green" | "Manual Approval",
+  "rollout_reason": "<2-3 sentences justifying the strategy — explain what would happen under each of the other strategies and why this one is the right trade-off, referencing which agent(s) or heuristic drove it>",
   "rollback_required": <true|false>,
   "test_coverage_estimate_pct": <integer 0-100 or null>,
   "suggested_test_areas": ["<short phrase>", ...],
@@ -67,7 +71,11 @@ Respond with ONLY a single JSON object (no markdown fences, no prose before or a
   "file_risks": [ {"filename": "<path>", "risk": "LOW"|"MEDIUM"|"HIGH", "reason": "<short reason, cite which agent/heuristic>"}, ... ]
 }
 Limit file_risks to the 5 files most likely to cause production issues, drawn from what the
-agents actually reviewed. Limit risk_factors to at most 6 categories."""
+agents actually reviewed. Limit risk_factors to at most 6 categories. Choose rollout_strategy
+from exactly the four listed options: 'Standard' for low-risk, well-tested changes; 'Canary'
+for medium-risk changes to a live code path; 'Blue/Green' for infrastructure or schema changes
+where instant rollback matters; 'Manual Approval' for high-risk changes (auth, payments,
+secrets, or destructive migrations) that a human must explicitly sign off on."""
 
 JUDGE_SYSTEM_PROMPT = """You are a verification pass (LLM-as-judge) over another model's
 pull-request risk report. You are given the report plus the evidence it was supposed to be

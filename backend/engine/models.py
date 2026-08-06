@@ -119,6 +119,20 @@ class AgentFinding(BaseModel):
     files_reviewed: list[str] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     risk_note: str = ""
+    confidence: int = 60  # 0-100, how confident this agent is in its own findings
+
+
+class AgentDecision(BaseModel):
+    """Surfaces one node's execution inside the LangGraph pipeline: what it decided,
+    why, how confident it was, and how long it took. This is what makes the multi-agent
+    graph auditable rather than a black box."""
+
+    agent: str
+    label: str
+    decision: str  # e.g. "Skipped — no files in domain" | "No concerns raised" | "Concerns raised"
+    reasoning: str
+    confidence: int  # 0-100
+    execution_time_ms: int
 
 
 class JudgeVerdict(BaseModel):
@@ -149,18 +163,56 @@ class RepositoryMetadata(BaseModel):
     files_changed_count: int
 
 
+class EvidenceItem(BaseModel):
+    """A single, structured piece of evidence backing a finding: exactly what file,
+    what changed, why it matters, how confident we are, how severe it is, and what to
+    do about it. This is the atomic unit auditors trace claims back to."""
+
+    file_path: str
+    snippet: Optional[str] = None  # code / diff excerpt or retrieved RAG context
+    explanation: str
+    confidence: int  # 0-100
+    severity: RiskLevel
+    recommended_action: str
+
+
 class RiskCategory(BaseModel):
+    """One row of the risk score breakdown, e.g. 'Authentication' or 'CI/CD'."""
+
     category: str
-    score: int
+    score: int  # 0-100
     status: RiskLevel
+    summary: str = ""
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    # legacy fields kept for renderer / frontend backward compatibility
     reasons: list[str] = Field(default_factory=list)
     evidence_files: list[str] = Field(default_factory=list)
 
 
-class EvidenceItem(BaseModel):
-    category: str
-    files: list[str] = Field(default_factory=list)
-    reason: str
+class ArchitecturalImpact(BaseModel):
+    """Which subsystems this PR touches and how they relate, in plain English."""
+
+    affected_subsystems: list[str] = Field(default_factory=list)
+    narrative: str = ""
+
+
+class ConfidenceExplanation(BaseModel):
+    """Explains *why* the model is as confident as it is, instead of a bare number."""
+
+    score: int  # 0-100
+    repository_context_available: bool
+    llm_heuristic_agreement: bool
+    evidence_completeness: str  # "complete" | "partial"
+    narrative: str = ""
+
+
+class DeploymentRecommendation(BaseModel):
+    """The chosen rollout strategy plus the reasoning and alternatives considered."""
+
+    strategy: str  # "Standard" | "Canary" | "Blue/Green" | "Manual Approval"
+    reason: str = ""
+    alternatives_considered: list[str] = Field(default_factory=list)
+    rollback_required: bool = False
 
 
 class RepositoryIntelligence(BaseModel):
@@ -192,18 +244,25 @@ class RiskReport(BaseModel):
     evidence_items: list[EvidenceItem] = Field(default_factory=list)
     timeline: list[TimelineStage] = Field(default_factory=list)
     agent_statuses: list[AgentStatus] = Field(default_factory=list)
+    agent_decisions: list[AgentDecision] = Field(default_factory=list)
     repository_metadata: RepositoryMetadata
     repository_intelligence: RepositoryIntelligence = Field(default_factory=RepositoryIntelligence)
     execution_metrics: Optional[ExecutionMetrics] = None
     summary: str = ""
+    executive_summary: str = ""
     high_risk_files: list[str] = Field(default_factory=list)
+    architectural_impact: ArchitecturalImpact = Field(default_factory=ArchitecturalImpact)
+    confidence_explanation: Optional[ConfidenceExplanation] = None
+    deployment_recommendation: Optional[DeploymentRecommendation] = None
 
 
 class AIAnalysis(BaseModel):
     overall_risk: RiskLevel
     confidence: int  # 0-100
     summary: str
+    executive_summary: str = ""
     architectural_impact: str
+    affected_subsystems: list[str] = Field(default_factory=list)
     operational_risks: list[str] = Field(default_factory=list)
     rollout_strategy: str
     rollout_reason: str

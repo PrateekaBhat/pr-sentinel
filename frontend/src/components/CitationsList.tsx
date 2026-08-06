@@ -18,29 +18,53 @@ export default function CitationsList({ rag }: { rag: RAGContext }) {
   if (!rag.scanned) {
     return (
       <p className="text-sm text-fog">
-        Repository documentation wasn't indexed{rag.skip_reason ? ` — ${rag.skip_reason}` : "."}
-      </p>
-    );
-  }
-
-  if (rag.retrieved.length === 0) {
-    return (
-      <p className="text-sm text-fog">
-        Indexed {rag.indexed_files} doc file(s) from this repo, but nothing closely matched
-        this PR's files.
+        Repository documentation wasn't indexed{rag.skip_reason ? ` — ${rag.skip_reason}` : ""}.
       </p>
     );
   }
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-3">
       <p className="text-xs text-fog">
-        Retrieved from {rag.indexed_files} indexed doc file(s) ({rag.chunks_indexed} chunks) on{" "}
+        Indexed {rag.indexed_files} doc file(s) into {rag.chunks_indexed} chunk(s) from{" "}
         <span className="font-mono text-paper">{rag.default_branch}</span>
+        {rag.cache_hit ? " (cache hit)" : " (freshly indexed)"}.
       </p>
-      {rag.retrieved.map((chunk, i) => (
-        <CitationRow key={i} chunk={chunk} />
-      ))}
+
+      {rag.indexed_doc_paths.length > 0 && (
+        <div>
+          <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wider text-fog">
+            Retrieved documents
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {rag.indexed_doc_paths.map((p) => (
+              <code
+                key={p}
+                className="rounded border border-steel bg-raised px-2 py-1 font-mono text-[11px] text-paper"
+              >
+                {p}
+              </code>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {rag.retrieved.length > 0 ? (
+        <div>
+          <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wider text-fog">
+            Top context snippets used in this analysis
+          </p>
+          <div className="flex flex-col gap-2">
+            {rag.retrieved.map((chunk, i) => (
+              <CitationRow key={i} chunk={chunk} />
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-fog">
+          Nothing closely matched this PR's files, so no snippet was used as supporting context.
+        </p>
+      )}
     </div>
   );
 }

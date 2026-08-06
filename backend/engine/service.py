@@ -6,14 +6,25 @@ from typing import Any
 from . import github_client, heuristics
 from .agents.graph import run_pipeline
 from .ai_analyzer import analyze_with_heuristics_only
+from .categories import (
+    build_agent_decisions,
+    build_architectural_impact,
+    build_category_breakdown,
+    build_confidence_explanation,
+)
 from .config import get_settings
 from .github_client import GitHubError
+from datetime import datetime, timezone
+
 from .models import (
     AIAnalysis,
     AnalyzeResponse,
     AnalyzeRequest,
     AgentStatus,
+    DeploymentRecommendation,
+    ExecutionMetrics,
     HeuristicResult,
+    JudgeVerdict,
     PullRequestData,
     RAGContext,
     RepositoryMetadata,
@@ -24,6 +35,7 @@ from .models import (
 )
 from .ollama_client import OllamaError
 from .rag.retriever import get_rag_context
+from .report_renderer import render_markdown
 
 
 def _infer_technologies(files: list[Any]) -> list[str]:
@@ -113,7 +125,9 @@ def _build_timeline(
         status = state.get(f"{domain}_status")
         if status is None:
             continue
-        timeline.append(TimelineStage(stage=status.label, duration_ms=status.duration_ms))
+        label = status["label"] if isinstance(status, dict) else status.label
+        duration = status["duration_ms"] if isinstance(status, dict) else status.duration_ms
+        timeline.append(TimelineStage(stage=label, duration_ms=duration))
     final_ms = 0
     if state.get("coordinator_duration_ms") is not None:
         final_ms += state["coordinator_duration_ms"]
@@ -132,6 +146,14 @@ def _infer_repository_metadata(pr: PullRequestData, rag: RAGContext) -> Reposito
     )
 
 
+_DEPLOYMENT_ALTERNATIVES = {
+    "Standard": ["Canary (unnecessary — low measured risk)", "Manual Approval (unnecessary overhead for this change)"],
+    "Canary": ["Standard (skipped — this touches a live code path)", "Blue/Green (more than this change warrants)"],
+    "Blue/Green": ["Canary (insufficient isolation for an infra/schema change)", "Standard (too risky to ship all-at-once)"],
+    "Manual Approval": ["Canary (not sufficient given the sensitivity of what changed)", "Standard (too risky without human sign-off)"],
+}
+
+
 def _build_report(
     pr: PullRequestData,
     heuristics: HeuristicResult,
@@ -140,37 +162,52 @@ def _build_report(
     state: dict[str, Any],
     repo_loaded_ms: int,
     repo_context_ms: int,
+    ai_enabled: bool,
+    judge: JudgeVerdict | None,
 ) -> RiskReport:
     decision = "BLOCK" if ai.overall_risk == RiskLevel.HIGH else "ALLOW"
+    category_breakdown = build_category_breakdown(pr, heuristics, ai)
+    architectural_impact = build_architectural_impact(pr, category_breakdown, ai)
+    confidence_explanation = build_confidence_explanation(
+        heuristics, ai, rag, ai_enabled, judge.grounded if judge else None
+    )
+    deployment_recommendation = DeploymentRecommendation(
+        strategy=ai.rollout_strategy,
+        reason=ai.rollout_reason,
+        alternatives_considered=_DEPLOYMENT_ALTERNATIVES.get(ai.rollout_strategy, []),
+        rollback_required=ai.rollback_required,
+    )
+
     return RiskReport(
         decision=decision,
         risk_score=heuristics.score,
-        confidence=ai.confidence,
+        confidence=confidence_explanation.score,
         deployment_strategy=ai.rollout_strategy,
         risk_breakdown=_build_risk_breakdown(heuristics),
+        risk_categories=category_breakdown,
         findings=_build_findings(heuristics, ai),
         evidence=_build_evidence(heuristics, ai),
         timeline=_build_timeline(repo_loaded_ms, repo_context_ms, state),
         agent_statuses=_build_agent_statuses(state),
+        agent_decisions=build_agent_decisions(state),
         repository_metadata=_infer_repository_metadata(pr, rag),
+        summary=ai.summary,
+        executive_summary=ai.executive_summary or ai.summary,
+        architectural_impact=architectural_impact,
+        confidence_explanation=confidence_explanation,
+        deployment_recommendation=deployment_recommendation,
+        execution_metrics=ExecutionMetrics(
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            total_duration_ms=repo_context_ms + sum(t.duration_ms for t in _build_timeline(repo_loaded_ms, repo_context_ms, state)),
+            ai_enabled=ai_enabled,
+            rag_cache_hit=rag.cache_hit,
+        ),
     )
 
 
 def render_comment(response: AnalyzeResponse) -> str:
-    findings = response.report.findings or [response.ai.summary]
-    details = "\n".join(f"• {item}" for item in findings[:5])
-    return (
-        "## PR Sentinel Report\n\n"
-        f"Overall Risk: {response.ai.overall_risk}\n\n"
-        f"Decision: {response.report.decision}\n\n"
-        f"Risk Score: {response.report.risk_score} / 100\n\n"
-        f"Confidence: {response.ai.confidence}%\n\n"
-        "Top Findings\n\n"
-        f"{details}\n\n"
-        "Recommended Deployment\n\n"
-        f"{response.ai.rollout_strategy}\n\n"
-        "View Full Report\n"
-    )
+    """Polished Markdown suitable for posting as a GitHub PR comment."""
+    return render_markdown(response)
 
 
 async def analyze_pr_url(pr_url: str, token: str = "") -> AnalyzeResponse:
@@ -212,7 +249,10 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         ai_error = f"Unexpected error running the agent pipeline: {exc}"
         ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
 
-    report = _build_report(pr, heuristic_result, ai_result, rag_context, state, repo_loaded_ms, repo_context_ms)
+    report = _build_report(
+        pr, heuristic_result, ai_result, rag_context, state,
+        repo_loaded_ms, repo_context_ms, ai_enabled, judge_result,
+    )
     response = AnalyzeResponse(
         pr=pr,
         heuristics=heuristic_result,

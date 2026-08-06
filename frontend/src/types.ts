@@ -66,6 +66,8 @@ export interface RAGContext {
   chunks_indexed: number;
   skip_reason?: string | null;
   retrieved: RAGChunk[];
+  cache_hit: boolean;
+  indexed_doc_paths: string[];
 }
 
 export type AgentDomain = "security" | "performance" | "database" | "api" | "tests";
@@ -77,6 +79,17 @@ export interface AgentFinding {
   files_reviewed: string[];
   findings: string[];
   risk_note: string;
+  confidence: number;
+}
+
+/** Surfaces one node's execution inside the LangGraph pipeline. */
+export interface AgentDecision {
+  agent: string;
+  label: string;
+  decision: string;
+  reasoning: string;
+  confidence: number;
+  execution_time_ms: number;
 }
 
 export interface JudgeVerdict {
@@ -104,24 +117,84 @@ export interface RepositoryMetadata {
   files_changed_count: number;
 }
 
+/** One structured piece of evidence: exactly what changed, why it matters, how
+ * confident we are, how severe it is, and what to do about it. */
+export interface EvidenceItem {
+  file_path: string;
+  snippet?: string | null;
+  explanation: string;
+  confidence: number;
+  severity: RiskLevel;
+  recommended_action: string;
+}
+
+/** One row of the fixed risk-category taxonomy (Authentication, API, Database, ...). */
+export interface RiskCategory {
+  category: string;
+  score: number;
+  status: RiskLevel;
+  summary: string;
+  evidence: EvidenceItem[];
+  reasons: string[];
+  evidence_files: string[];
+}
+
+export interface ArchitecturalImpact {
+  affected_subsystems: string[];
+  narrative: string;
+}
+
+export interface ConfidenceExplanation {
+  score: number;
+  repository_context_available: boolean;
+  llm_heuristic_agreement: boolean;
+  evidence_completeness: "complete" | "partial";
+  narrative: string;
+}
+
+export interface DeploymentRecommendation {
+  strategy: "Standard" | "Canary" | "Blue/Green" | "Manual Approval" | string;
+  reason: string;
+  alternatives_considered: string[];
+  rollback_required: boolean;
+}
+
+export interface ExecutionMetrics {
+  generated_at: string;
+  total_duration_ms: number;
+  ai_enabled: boolean;
+  rag_cache_hit: boolean;
+}
+
 export interface RiskReport {
   decision: string;
   risk_score: number;
   confidence: number;
   deployment_strategy: string;
   risk_breakdown: Record<string, number>;
+  risk_categories: RiskCategory[];
   findings: string[];
   evidence: string[];
   timeline: TimelineStage[];
   agent_statuses: AgentStatus[];
+  agent_decisions: AgentDecision[];
   repository_metadata: RepositoryMetadata;
+  execution_metrics?: ExecutionMetrics | null;
+  summary: string;
+  executive_summary: string;
+  high_risk_files: string[];
+  architectural_impact: ArchitecturalImpact;
+  confidence_explanation?: ConfidenceExplanation | null;
+  deployment_recommendation?: DeploymentRecommendation | null;
 }
 
 export interface AIAnalysis {
   overall_risk: RiskLevel;
   confidence: number;
   summary: string;
+  executive_summary: string;
   architectural_impact: string;
+  affected_subsystems: string[];
   operational_risks: string[];
   rollout_strategy: string;
   rollout_reason: string;
