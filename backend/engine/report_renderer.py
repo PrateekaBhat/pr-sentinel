@@ -15,6 +15,39 @@ def _decision_emoji(decision: str) -> str:
     return "🚫" if decision == "BLOCK" else "✅"
 
 
+def _format_timestamp(raw: str) -> str:
+    """Render an ISO-8601 timestamp (often with microseconds, e.g.
+    '2026-08-06T10:04:37.276438+00:00') as a short, human-readable UTC
+    string, e.g. 'Aug 6, 2026, 10:04 UTC'. Falls back to the raw value
+    (trimmed to whole seconds) if parsing fails."""
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return f"{dt.strftime('%b %-d, %Y, %H:%M')} UTC"
+    except (ValueError, TypeError):
+        return raw[:19].replace("T", " ") + " UTC" if len(raw) >= 19 else raw
+
+
+def _format_duration(ms: int | float) -> str:
+    """Render a millisecond duration as a compact, human-readable string.
+    Sub-second durations stay in ms (e.g. '820ms'); anything at or above
+    one second is shown in seconds (e.g. '4.5s'), and a minute or more
+    is shown as 'Xm Ys'."""
+    ms = round(ms)
+    if ms < 1000:
+        return f"{ms}ms"
+    seconds = ms / 1000
+    if seconds < 60:
+        text = f"{seconds:.1f}"
+        if text.endswith(".0"):
+            text = text[:-2]
+        return f"{text}s"
+    minutes, rem_seconds = divmod(seconds, 60)
+    return f"{int(minutes)}m {rem_seconds:.0f}s"
+
+
 def render_markdown(response: AnalyzeResponse) -> str:
     """Generate a production engineering risk assessment, in Markdown, suitable for
     GitHub PR comments: explainable (every score traces to evidence), auditable
@@ -24,7 +57,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
     ai = response.ai
     rag = response.rag
     metrics = report.execution_metrics
-    generated = metrics.generated_at if metrics else datetime.now(timezone.utc).isoformat()
+    generated_raw = metrics.generated_at if metrics else datetime.now(timezone.utc).isoformat()
+    generated = _format_timestamp(generated_raw)
 
     decision_emoji = _decision_emoji(report.decision)
 
@@ -107,7 +141,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append("| Agent | Decision | Confidence | Time |")
         lines.append("|---|---|---|---|")
         for d in report.agent_decisions:
-            lines.append(f"| {d.label} | {d.decision} | {d.confidence}% | {d.execution_time_ms}ms |")
+            lines.append(f"| {d.label} | {d.decision} | {d.confidence}% | {_format_duration(d.execution_time_ms)} |")
         lines.append("")
         for d in report.agent_decisions:
             lines.append(f"<details><summary><strong>{d.label}</strong> reasoning</summary>")
@@ -181,9 +215,9 @@ def render_markdown(response: AnalyzeResponse) -> str:
     if report.timeline:
         lines.extend(["## Execution Metrics", ""])
         total = metrics.total_duration_ms if metrics else sum(t.duration_ms for t in report.timeline)
-        lines.append(f"- **Total duration:** {total:,}ms")
+        lines.append(f"- **Total duration:** {_format_duration(total)}")
         for stage in report.timeline:
-            lines.append(f"- {stage.stage}: {stage.duration_ms:,}ms")
+            lines.append(f"- {stage.stage}: {_format_duration(stage.duration_ms)}")
         lines.append("")
 
     if response.judge:
@@ -299,7 +333,7 @@ def render_console(response: AnalyzeResponse) -> str:
                 "Failed": _RED,
                 "Running": _YELLOW,
             }.get(status.status, _DIM)
-            dur = f" ({status.duration_ms}ms)" if status.duration_ms else ""
+            dur = f" ({_format_duration(status.duration_ms)})" if status.duration_ms else ""
             lines.append(
                 f"  {_color('●', status_color)} {status.label}: "
                 f"{_color(status.status, status_color)}{dur}"
@@ -324,8 +358,8 @@ def render_console(response: AnalyzeResponse) -> str:
     metrics = report.execution_metrics
     if metrics:
         lines.append(
-            f"  {_color('Duration:', _DIM)} {metrics.total_duration_ms:,}ms "
-            f"{_color('|', _DIM)} {_color('Generated:', _DIM)} {metrics.generated_at[:19]}"
+            f"  {_color('Duration:', _DIM)} {_format_duration(metrics.total_duration_ms)} "
+            f"{_color('|', _DIM)} {_color('Generated:', _DIM)} {_format_timestamp(metrics.generated_at)}"
         )
         lines.append("")
 

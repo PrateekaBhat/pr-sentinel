@@ -226,7 +226,7 @@ def build_confidence_explanation(
         reasons.append("the groundedness judge flagged claims that weren't fully traceable to evidence")
         completeness = "partial"
 
-    narrative = f"This assessment is based on {completeness} evidence: " + "; ".join(reasons) + "."
+    narrative = "; ".join(reasons).capitalize() + "."
 
     score = ai.confidence
     if completeness == "partial":

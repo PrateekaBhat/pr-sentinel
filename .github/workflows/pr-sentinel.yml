@@ -41,6 +41,11 @@ jobs:
           echo "Ollama did not start in time"
           exit 1
 
+      - name: Pull Ollama models
+        run: |
+          docker exec pr-sentinel-ollama ollama pull "${OLLAMA_MODEL}"
+          docker exec pr-sentinel-ollama ollama pull "${OLLAMA_EMBED_MODEL}"
+
       - name: Analyze pull request
         id: analyze
         continue-on-error: true
