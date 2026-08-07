@@ -59,8 +59,7 @@ def _summary(response: AnalyzeResponse, badge: str) -> str:
     changed = "This PR modifies the report rendering pipeline" + (" and frontend UI." if ui_changed else ".") if report_changed else "This PR modifies implementation files."
     api_changed = dict(_drivers(response)).get("API contracts changed", False)
     clear = "API contract changes need review." if api_changed else "No security or public API contract changes were detected."
-    merge = "Merge after the required checks pass." if badge != "DO NOT MERGE" else "Do not merge until the blocking evidence is resolved."
-    words = f"{changed} {clear} The primary concern is missing regression coverage. {merge}".split()
+    words = f"{changed} {clear} The only release concern is missing regression coverage for the modified rendering logic.".split()
     return " ".join(words[:50])
 
 
@@ -98,6 +97,15 @@ def _file_risks(response: AnalyzeResponse):
     return [(file.filename, response.ai.overall_risk, "Large implementation change.") for file in sorted(response.pr.files, key=lambda item: item.changes, reverse=True)[:3]]
 
 
+def _file_priority(response: AnalyzeResponse, filename: str, changes: int, is_renderer: bool) -> tuple[int, int]:
+    """Display-only review priority derived from diff size and deterministic signals."""
+    total = max(1, response.pr.additions + response.pr.deletions)
+    score = 35 + round((changes / total) * 15) + (7 if is_renderer else 0) + (5 if _has_trigger(response, "no_tests") else 0)
+    score = min(95, score)
+    minutes = max(5, round(changes / 35 / 5) * 5) + (5 if is_renderer else 0) + (5 if _has_trigger(response, "no_tests") else 0)
+    return score, minutes
+
+
 def render_markdown(response: AnalyzeResponse) -> str:
     """Render a merge-decision report; diagnostics are deliberately opt-in."""
     pr, report, ai, rag = response.pr, response.report, response.ai, response.rag
@@ -117,8 +125,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
         "",
         f"- **Decision:** {report.decision} | **Risk:** {_risk_label(ai.overall_risk)} | **Merge readiness:** {readiness_score}/100 | **Deployment:** {strategy}",
         f"- **Primary concern:** {_primary_concern(response)}",
-        f"- **Confidence:** {confidence}% ({_confidence_level(confidence)}) - lower because missing regression tests, a large implementation refactor, and {'partial' if not rag.scanned or not rag.retrieved else 'available'} repository documentation evidence.",
-        f"- **Estimated review effort:** {report.review_effort_label} | **Key review files:** {len(_file_risks(response))} | **Blocking findings:** {sum(1 for item in findings if _risk_label(item.severity) == 'HIGH')}",
+        f"- **Confidence:** {confidence}% ({_confidence_level(confidence)}) - reduced by missing regression tests and a large implementation refactor; repository documentation evidence is {'partial' if not rag.scanned or not rag.retrieved else 'available'}.",
+        f"- **Estimated review effort:** {report.review_effort_label} (from {pr.additions + pr.deletions} changed LOC, {pr.changed_files_count} files, and {'no' if _has_trigger(response, 'no_tests') else 'updated'} tests) | **Key review files:** {len(_file_risks(response))} | **Blocking findings:** {sum(1 for item in findings if _risk_label(item.severity) == 'HIGH')}",
         "",
         "## Decision Drivers",
         "",
@@ -134,11 +142,13 @@ def render_markdown(response: AnalyzeResponse) -> str:
     for label, value in _drivers(response):
         positive, _warning = status_words[label]
         if label == "Tests updated" and not value:
-            status = "FAIL - No test updates"
+            status = "❌ No test updates"
+        elif label == "Tests updated":
+            status = "✅ Updated"
         elif value:
-            status = "WARN - Large" if label == "Large implementation diff" else "WARN - Changed"
+            status = "⚠ Large" if label == "Large implementation diff" else "⚠ Changed"
         else:
-            status = f"OK - {positive if label == 'Security-sensitive files changed' else 'No changes'}"
+            status = f"✅ {positive if label == 'Security-sensitive files changed' else 'Unchanged'}"
         lines.append(f"| {label.replace(' files changed', '').replace(' implementation', '')} | {status} |")
     lines.extend(["", "## Summary", "", _summary(response, badge), "", "## Required Before Merge", ""])
     actions = _actions(response)
@@ -147,23 +157,24 @@ def render_markdown(response: AnalyzeResponse) -> str:
     lines.extend(["", "## Top Findings", ""])
     if findings:
         for item in findings:
-            severity = {"HIGH": "Critical", "MEDIUM": "Warning", "LOW": "Info"}[_risk_label(item.severity)]
+            severity = "HIGH" if _has_trigger(response, "no_tests") and (not item.file_path or item.file_path.startswith("(")) else {"HIGH": "Critical", "MEDIUM": "Warning", "LOW": "LOW"}[_risk_label(item.severity)]
             evidence = _relative_path(response, item.file_path) if item.file_path and not item.file_path.startswith("(") else "deterministic rule"
             lines.extend([f"- **{severity}:** {item.explanation}", f"  - **Evidence:** [`{evidence}`]({pr.url}/files)", f"  - **Action:** {item.recommended_action}"])
     else:
         lines.append("- **Info:** No evidence-backed findings were produced.")
 
-    lines.extend(["", "## Highest-Risk Files", ""])
-    for item in _file_risks(response):
+    lines.extend(["", "## Review Order", ""])
+    for index, item in enumerate(_file_risks(response), start=1):
         filename, risk, _reason = (item.filename, item.risk, item.reason) if hasattr(item, "filename") else item
         filename = _relative_path(response, filename)
         changed = next((file for file in pr.files if _relative_path(response, file.filename) == filename), None)
         loc = f"{changed.changes} LOC modified" if changed else "Changed implementation file"
         is_renderer = "report" in filename.lower() or "render" in filename.lower()
+        risk_score, review_minutes = _file_priority(response, filename, changed.changes if changed else 0, is_renderer)
         why = "Core report generation logic." if is_renderer else "Changed implementation behavior."
         impact = "Incorrect deployment recommendations shown to reviewers." if is_renderer else "A regression in the changed behavior."
         action = "Compare rendered output with the previous version." if is_renderer else "Review the changed lines and validate behavior."
-        lines.extend([f"- [`{filename}`]({pr.url}/files) - **{_risk_label(risk)}**", f"  - **Why reviewed:** {loc}; {why}{' No regression tests updated.' if _has_trigger(response, 'no_tests') else ''}", f"  - **Production impact:** {impact}", f"  - **Review:** {action}"])
+        lines.extend([f"### {index}. [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)} ({risk_score})**", f"- **Why surfaced:** {loc}; {why}{' No regression tests updated.' if _has_trigger(response, 'no_tests') else ''}", f"- **Suggested review:** {action}", f"- **Estimated review:** {review_minutes} minutes", ""])
 
     lines.extend(["", "## Suggested Reviewers", ""])
     reviewers = _suggested_reviewers(response)
@@ -176,6 +187,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
     lines.extend(["", "## Merge Readiness", "", f"**Final score: {readiness_score}/100** - {readiness.label if readiness else 'Not calculated'}."])
     if readiness:
         lines.extend([f"- {deduction}" for deduction in readiness.deductions])
+    if actions:
+        lines.append("- **Ready after:** " + " and ".join(action.rstrip(".").lower() for action in actions) + ".")
 
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
     lines.extend(["", "<details>", "<summary><strong>Evidence</strong></summary>", "", "### Repository Evidence", ""])
