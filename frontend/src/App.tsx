@@ -1,30 +1,35 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { analyzePullRequest, ApiError, fetchDemo, fetchDemos, fetchRepositoryHealth } from "./api/client";
+import { analyzePullRequest, ApiError, fetchDemo, fetchDemos } from "./api/client";
 import AgentPipelinePanel from "./components/AgentPipelinePanel";
-import ArchitecturalImpactCard from "./components/ArchitecturalImpactCard";
 import Card from "./components/Card";
 import CategoryBreakdown from "./components/CategoryBreakdown";
 import CitationsList from "./components/CitationsList";
-import ConfidenceCard from "./components/ConfidenceCard";
+import Collapsible from "./components/Collapsible";
 import DemoGallery from "./components/DemoGallery";
 import EmptyState from "./components/EmptyState";
 import EngineeringMetricsCard from "./components/EngineeringMetricsCard";
-import FileRiskList from "./components/FileRiskList";
 import Header from "./components/Header";
-import JudgeBadge from "./components/JudgeBadge";
 import LoadingState from "./components/LoadingState";
-import OperationalChecklistCard from "./components/OperationalChecklistCard";
-import SuggestedReviewersCard from "./components/SuggestedReviewersCard";
-import PositiveSignalsCard from "./components/PositiveSignalsCard";
-import UncertaintyCard from "./components/UncertaintyCard";
 import ProductionReadinessGauge from "./components/ProductionReadinessGauge";
 import RepoInput from "./components/RepoInput";
-import RepositoryHealthPanel from "./components/RepositoryHealthPanel";
-import RiskGauge from "./components/RiskGauge";
-import RolloutCard from "./components/RolloutCard";
-import TestAreasCard from "./components/TestAreasCard";
-import type { AnalyzeResponse, DemoSummary, RepositoryHealth } from "./types";
+import type { AnalyzeResponse, DemoSummary, EvidenceItem, RiskLevel } from "./types";
+
+const severityRank: Record<RiskLevel, number> = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+const confidenceLevel = (score: number) => score >= 75 ? "High" : score >= 50 ? "Medium" : "Low";
+const statusFor = (decision: string) => /concern|block|fail/i.test(decision) ? "WARN" : "PASS";
+const perspectiveFor: Record<string, string> = {
+  database: "Backend", security: "Security", tests: "QA", performance: "SRE", api: "API",
+};
+const badgeFor = (result: AnalyzeResponse) => {
+  const readiness = result.report.production_readiness?.score;
+  if (result.report.decision === "BLOCK" || (readiness !== undefined && readiness < 55)) return "Do Not Merge";
+  return result.report.decision === "ALLOW" && (readiness === undefined || readiness >= 80) ? "Ready" : "Review Needed";
+};
+const truncateWords = (text: string, max = 50) => {
+  const words = text.split(/\s+/).filter(Boolean);
+  return `${words.slice(0, max).join(" ")}${words.length > max ? "..." : ""}`;
+};
 
 export default function App() {
   const [demos, setDemos] = useState<DemoSummary[]>([]);
@@ -32,221 +37,87 @@ export default function App() {
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [repoHealth, setRepoHealth] = useState<RepositoryHealth | null>(null);
 
-  useEffect(() => {
-    fetchDemos().then(setDemos).catch(() => setDemos([]));
-  }, []);
+  useEffect(() => { fetchDemos().then(setDemos).catch(() => setDemos([])); }, []);
+  const findings = useMemo(() => result ? result.report.risk_categories.flatMap((category) => category.evidence)
+    .sort((a, b) => severityRank[a.severity] - severityRank[b.severity]).slice(0, 5) : [], [result]);
+  const fileRisks = useMemo(() => result ? [...result.ai.file_risks]
+    .sort((a, b) => severityRank[a.risk] - severityRank[b.risk]).slice(0, 3) : [], [result]);
 
-  useEffect(() => {
-    if (!result) {
-      setRepoHealth(null);
-      return;
-    }
-    fetchRepositoryHealth({ repository: `${result.pr.owner}/${result.pr.repo}` })
-      .then(setRepoHealth)
-      .catch(() => setRepoHealth(null));
-  }, [result]);
-
-  async function handleAnalyze(prUrl: string) {
-    setLoading(true);
-    setError(null);
-    setActiveDemoId(undefined);
-    try {
-      const res = await analyzePullRequest(prUrl);
-      setResult(res);
-    } catch (err) {
-      setResult(null);
-      setError(err instanceof ApiError ? err.message : "Something went wrong. Is the backend running?");
-    } finally {
-      setLoading(false);
-    }
+  async function run(action: () => Promise<AnalyzeResponse>) {
+    setLoading(true); setError(null);
+    try { setResult(await action()); }
+    catch (err) { setResult(null); setError(err instanceof ApiError ? err.message : "Something went wrong. Is the backend running?"); }
+    finally { setLoading(false); }
   }
 
-  async function handleSelectDemo(id: string) {
-    setLoading(true);
-    setError(null);
-    setActiveDemoId(id);
-    try {
-      const res = await fetchDemo(id);
-      setResult(res);
-    } catch {
-      setError("Couldn't load that demo. Is the backend running?");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <div className="min-h-screen font-body">
-      <Header />
-
-      <main className="mx-auto max-w-6xl px-6 py-10">
-        <div className="mb-8 flex flex-col gap-4">
-          <RepoInput onAnalyze={handleAnalyze} loading={loading} />
-          <DemoGallery demos={demos} onSelect={handleSelectDemo} activeId={activeDemoId} />
-          {error && (
-            <p className="rounded-md border border-risk-high/40 bg-risk-high/10 px-4 py-2 text-sm text-risk-high">
-              {error}
-            </p>
-          )}
-        </div>
-
-        {loading && <LoadingState />}
-
-        {!loading && !result && !error && <EmptyState />}
-
-        {!loading && result && (
-          <div className="flex flex-col gap-6">
-            <div className="flex items-center justify-between rounded-lg border border-steel bg-panel px-5 py-3 shadow-panel">
-              <div>
-                <p className="font-mono text-xs text-fog">
-                  {result.pr.owner}/{result.pr.repo} · #{result.pr.number}
-                </p>
-                <h2 className="font-display text-base font-semibold text-paper">
-                  {result.pr.title}
-                </h2>
-              </div>
-              <div className="flex items-center gap-2">
-                <span
-                  className={`rounded-full px-2.5 py-1 font-mono text-[11px] font-semibold ${
-                    result.report.decision === "BLOCK"
-                      ? "bg-risk-high/15 text-risk-high"
-                      : "bg-risk-low/15 text-risk-low"
-                  }`}
-                >
-                  {result.report.decision}
-                </span>
-                <JudgeBadge judge={result.judge} />
-                {!result.ai_enabled && (
-                  <span
-                    className="max-w-xs shrink-0 truncate rounded-md border border-amber/40 bg-amber/10 px-2.5 py-1 font-mono text-[11px] text-amber"
-                    title={result.ai_error ?? undefined}
-                  >
-                    Heuristics only — {result.ai_error ?? "Ollama unavailable"}
-                  </span>
-                )}
-              </div>
-            </div>
-
-            <Card title="Executive summary" eyebrow="Coordinator agent synthesis">
-              <p className="text-sm leading-relaxed text-paper">
-                {result.report.executive_summary || result.ai.summary}
-              </p>
-            </Card>
-
-            {repoHealth && repoHealth.analyses_count > 0 && (
-              <Card title="Repository health" eyebrow={`${result.pr.owner}/${result.pr.repo}`}>
-                <RepositoryHealthPanel health={repoHealth} />
-              </Card>
-            )}
-
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-              <Card title="Overall risk" eyebrow="Sentinel assessment" className="flex flex-col items-center justify-center lg:col-span-1">
-                <RiskGauge risk={result.ai.overall_risk} confidence={result.report.confidence} />
-                <p className="mt-3 text-center text-sm text-fog">Risk score: {result.report.risk_score}/100</p>
-              </Card>
-
-              <Card title="Risk score breakdown" eyebrow="By category" className="lg:col-span-2">
-                <CategoryBreakdown categories={result.report.risk_categories} />
-              </Card>
-            </div>
-
-            {result.report.production_readiness && (
-              <Card title="Production readiness" eyebrow="Derived score">
-                <ProductionReadinessGauge readiness={result.report.production_readiness} />
-              </Card>
-            )}
-
-            <Card title="Architectural impact" eyebrow="Affected subsystems">
-              <ArchitecturalImpactCard impact={result.report.architectural_impact} />
-              {result.ai.operational_risks.length > 0 && (
-                <ul className="mt-3 flex flex-col gap-1.5 border-t border-steel pt-3">
-                  {result.ai.operational_risks.map((risk) => (
-                    <li key={risk} className="flex items-start gap-2 text-sm text-fog">
-                      <span className="mt-0.5 text-amber">▲</span>
-                      {risk}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </Card>
-
-            {result.report.engineering_metrics && (
-              <Card title="Engineering change summary" eyebrow="Deterministic metrics">
-                <EngineeringMetricsCard metrics={result.report.engineering_metrics} />
-              </Card>
-            )}
-
-            <Card title="Agent pipeline" eyebrow="LangGraph execution">
-              <AgentPipelinePanel decisions={result.report.agent_decisions} />
-            </Card>
-
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-              <Card title="Files most likely to cause production issues" eyebrow="Hotspots">
-                <FileRiskList files={result.ai.file_risks} />
-              </Card>
-
-              <div className="flex flex-col gap-6">
-                <Card title="Deployment recommendation" eyebrow="Rollout strategy">
-                  {result.report.deployment_recommendation ? (
-                    <RolloutCard
-                      strategy={result.report.deployment_recommendation.strategy}
-                      reason={result.report.deployment_recommendation.reason}
-                      rollbackRequired={result.report.deployment_recommendation.rollback_required}
-                      alternativesConsidered={result.report.deployment_recommendation.alternatives_considered}
-                    />
-                  ) : (
-                    <RolloutCard
-                      strategy={result.ai.rollout_strategy}
-                      reason={result.ai.rollout_reason}
-                      rollbackRequired={result.ai.rollback_required}
-                    />
-                  )}
-                </Card>
-                <Card title="Suggested test areas" eyebrow="Before you merge">
-                  <TestAreasCard
-                    areas={result.ai.suggested_test_areas}
-                    coveragePct={result.ai.test_coverage_estimate_pct}
-                  />
-                </Card>
-                {result.report.operational_checklist.length > 0 && (
-                  <Card title="Operational checklist" eyebrow="Before merge">
-                    <OperationalChecklistCard items={result.report.operational_checklist} />
-                  </Card>
-                )}
-                {result.report.suggested_reviewers.length > 0 && (
-                  <Card title="Suggested reviewers" eyebrow="Who should sign off">
-                    <SuggestedReviewersCard reviewers={result.report.suggested_reviewers} />
-                  </Card>
-                )}
-                {result.report.positive_signals.length > 0 && (
-                  <Card title="Why this isn't rated higher" eyebrow="Positive evidence">
-                    <PositiveSignalsCard signals={result.report.positive_signals} />
-                  </Card>
-                )}
-                {result.report.uncertainties.length > 0 && (
-                  <Card title="What we couldn't determine" eyebrow="Known gaps in this analysis">
-                    <UncertaintyCard items={result.report.uncertainties} />
-                  </Card>
-                )}
-              </div>
-            </div>
-
-            <Card title="Repository context (RAG)" eyebrow="Retrieved documents & snippets">
-              <CitationsList rag={result.rag} />
-            </Card>
-
-            <Card title="Confidence" eyebrow="Evidence-backed explanation">
-              {result.report.confidence_explanation ? (
-                <ConfidenceCard confidence={result.report.confidence_explanation} />
-              ) : (
-                <p className="text-sm text-fog">{result.report.confidence}% confidence.</p>
-              )}
-            </Card>
-          </div>
-        )}
-      </main>
-    </div>
-  );
+  return <div className="min-h-screen font-body">
+    <Header />
+    <main className="mx-auto max-w-6xl px-6 py-10">
+      <div className="mb-8 flex flex-col gap-4">
+        <RepoInput onAnalyze={(url) => { setActiveDemoId(undefined); return run(() => analyzePullRequest(url)); }} loading={loading} />
+        <DemoGallery demos={demos} onSelect={(id) => { setActiveDemoId(id); return run(() => fetchDemo(id)); }} activeId={activeDemoId} />
+        {error && <p className="rounded-md border border-risk-high/40 bg-risk-high/10 px-4 py-2 text-sm text-risk-high">{error}</p>}
+      </div>
+      {loading && <LoadingState />}
+      {!loading && !result && !error && <EmptyState />}
+      {!loading && result && <Report result={result} findings={findings} fileRisks={fileRisks} />}
+    </main>
+  </div>;
 }
+
+function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; findings: EvidenceItem[]; fileRisks: AnalyzeResponse["ai"]["file_risks"] }) {
+  const { report, ai, pr } = result;
+  const readiness = report.production_readiness;
+  const confidence = report.confidence_explanation?.level || confidenceLevel(report.confidence);
+  const deployment = report.deployment_recommendation?.strategy || report.deployment_strategy;
+  const actionFor = (filename: string) => findings.find((item) => item.file_path === filename)?.recommended_action || "Review the changed lines and validate affected behavior.";
+  const perspectives = ["Backend", "Security", "QA", "SRE", "API"].map((name) => {
+    const decision = report.agent_decisions.find((item) => perspectiveFor[item.agent] === name);
+    return { name, status: decision ? statusFor(decision.decision) : "WARN", reason: decision?.reasoning || "No specialist evidence was available for this perspective." };
+  });
+  return <div className="flex flex-col gap-6">
+    <section className="rounded-lg border border-steel bg-panel p-5 shadow-panel">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div><p className="font-mono text-xs text-fog">{pr.owner}/{pr.repo} · #{pr.number}</p><h2 className="font-display text-base font-semibold text-paper">{pr.title}</h2></div>
+        <span className={`rounded-full px-3 py-1 font-mono text-xs font-semibold ${badgeFor(result) === "Do Not Merge" ? "bg-risk-high/15 text-risk-high" : badgeFor(result) === "Ready" ? "bg-risk-low/15 text-risk-low" : "bg-risk-medium/15 text-risk-medium"}`}>{badgeFor(result)}</span>
+      </div>
+      <div className="mt-5 grid grid-cols-2 gap-3 border-t border-steel pt-4 sm:grid-cols-5">
+        <Stat label="Decision" value={report.decision} /><Stat label="Risk" value={ai.overall_risk} /><Stat label="Confidence" value={confidence} /><Stat label="Readiness" value={`${readiness?.score ?? "n/a"}/100`} /><Stat label="Deployment" value={deployment} />
+      </div>
+    </section>
+
+    <Card title="Executive summary" eyebrow="What changed, main risk, merge decision">
+      <p className="text-sm leading-relaxed text-paper">{truncateWords(report.executive_summary || report.summary || ai.summary)}</p>
+    </Card>
+
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <Card title="Top findings" eyebrow="Evidence-backed · top 5">
+        {findings.length ? <ul className="flex flex-col gap-3">{findings.map((item, i) => <li key={`${item.file_path}-${i}`} className="border-b border-steel/60 pb-3 last:border-0 last:pb-0"><div className="flex items-center gap-2"><Severity level={item.severity} /><code className="truncate text-xs text-paper">{item.file_path}</code></div><p className="mt-1 text-xs text-fog">{item.explanation}</p><p className="mt-1 text-xs text-fog"><span className="text-paper">Evidence:</span> <code>{item.file_path}</code></p></li>)}</ul> : <p className="text-sm text-fog">No evidence-backed findings were produced.</p>}
+      </Card>
+      <Card title="Highest-risk files" eyebrow="Top 3 by risk">
+        <div className="flex flex-col gap-3">{fileRisks.map((file) => <div key={file.filename} className="border-b border-steel/60 pb-3 last:border-0 last:pb-0"><div className="flex items-center justify-between gap-2"><code className="truncate text-xs text-paper">{file.filename}</code><Severity level={file.risk} /></div><p className="mt-1 text-xs text-fog">{file.reason}</p><p className="mt-1 text-xs text-paper">Action: {actionFor(file.filename)}</p></div>)}{!fileRisks.length && <p className="text-sm text-fog">No files were individually flagged.</p>}</div>
+      </Card>
+    </div>
+
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <Card title="Required before merge" eyebrow="Actionable reviewer checklist">
+        {report.operational_checklist.length ? <ul className="flex flex-col gap-2">{report.operational_checklist.map((item) => <li key={item.task} className="flex gap-2 text-sm text-fog"><span className="text-paper">□</span>{item.task}</li>)}</ul> : <p className="text-sm text-fog">No additional mandatory action identified from available evidence.</p>}
+      </Card>
+      <Card title="Merge readiness" eyebrow="Risk + evidence + tests + documentation">
+        {readiness ? <><ProductionReadinessGauge readiness={readiness} /><p className="mt-3 text-xs text-fog">Derived from risk, evidence quality, test coverage, and documentation completeness.</p></> : <p className="text-sm text-fog">Readiness could not be calculated from the available evidence.</p>}
+      </Card>
+    </div>
+
+    <Card title="Review perspectives" eyebrow="Specialist outcome">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">{perspectives.map((perspective) => <div key={perspective.name} className="rounded-md border border-steel bg-raised p-3"><div className="flex justify-between gap-2"><span className="text-xs font-semibold text-paper">{perspective.name}</span><span className={perspective.status === "WARN" ? "font-mono text-xs text-risk-medium" : "font-mono text-xs text-risk-low"}>{perspective.status}</span></div><p className="mt-1 text-xs text-fog">{perspective.reason}</p></div>)}</div>
+    </Card>
+
+    <Collapsible header={<span className="font-display text-sm font-semibold text-paper">Technical details</span>}>
+      <div className="flex flex-col gap-6"><Card title="Risk breakdown" eyebrow="Raw category evidence"><CategoryBreakdown categories={report.risk_categories} /></Card><Card title="Detailed review reasoning" eyebrow="Expandable specialist detail"><AgentPipelinePanel decisions={report.agent_decisions} /></Card>{report.engineering_metrics && <Card title="Engineering metrics" eyebrow="Deterministic details"><EngineeringMetricsCard metrics={report.engineering_metrics} /></Card>}<Card title="Repository evidence" eyebrow="Retrieved documentation"><CitationsList rag={result.rag} /></Card></div>
+    </Collapsible>
+  </div>;
+}
+
+function Stat({ label, value }: { label: string; value: string }) { return <div><p className="font-mono text-[10px] uppercase tracking-wider text-fog">{label}</p><p className="mt-1 text-sm font-semibold text-paper">{value}</p></div>; }
+function Severity({ level }: { level: RiskLevel }) { const label = level === "HIGH" ? "Critical" : level === "MEDIUM" ? "Warning" : "Info"; const color = level === "HIGH" ? "bg-risk-high/15 text-risk-high" : level === "MEDIUM" ? "bg-risk-medium/15 text-risk-medium" : "bg-risk-low/15 text-risk-low"; return <span className={`shrink-0 rounded px-2 py-0.5 font-mono text-[10px] font-semibold ${color}`}>{label}</span>; }
