@@ -15,6 +15,9 @@ import Header from "./components/Header";
 import JudgeBadge from "./components/JudgeBadge";
 import LoadingState from "./components/LoadingState";
 import OperationalChecklistCard from "./components/OperationalChecklistCard";
+import SuggestedReviewersCard from "./components/SuggestedReviewersCard";
+import PositiveSignalsCard from "./components/PositiveSignalsCard";
+import UncertaintyCard from "./components/UncertaintyCard";
 import ProductionReadinessGauge from "./components/ProductionReadinessGauge";
 import RepoInput from "./components/RepoInput";
 import RepositoryHealthPanel from "./components/RepositoryHealthPanel";
@@ -210,6 +213,21 @@ export default function App() {
                 {result.report.operational_checklist.length > 0 && (
                   <Card title="Operational checklist" eyebrow="Before merge">
                     <OperationalChecklistCard items={result.report.operational_checklist} />
+                  </Card>
+                )}
+                {result.report.suggested_reviewers.length > 0 && (
+                  <Card title="Suggested reviewers" eyebrow="Who should sign off">
+                    <SuggestedReviewersCard reviewers={result.report.suggested_reviewers} />
+                  </Card>
+                )}
+                {result.report.positive_signals.length > 0 && (
+                  <Card title="Why this isn't rated higher" eyebrow="Positive evidence">
+                    <PositiveSignalsCard signals={result.report.positive_signals} />
+                  </Card>
+                )}
+                {result.report.uncertainties.length > 0 && (
+                  <Card title="What we couldn't determine" eyebrow="Known gaps in this analysis">
+                    <UncertaintyCard items={result.report.uncertainties} />
                   </Card>
                 )}
               </div>

@@ -211,6 +211,31 @@ export interface ChecklistItem {
   reason: string;
 }
 
+/** A reassuring, evidence-backed fact -- the mirror image of a triggered risk
+ * factor. Explains why the score ISN'T higher, not just that it isn't. */
+export interface PositiveSignal {
+  label: string;
+  reason: string;
+}
+
+/** An area PR Sentinel could NOT assess, and why -- an explicit admission of
+ * a gap rather than a silent omission or an overconfident guess. */
+export interface UncertaintyItem {
+  area: string;
+  reason: string;
+}
+
+/** A reviewer role/team recommendation derived from which subsystems this PR
+ * touches -- a deterministic stand-in for a CODEOWNERS lookup. Not a specific
+ * person: recommends the role that owns the affected area, backed by the
+ * matched file paths. */
+export interface SuggestedReviewer {
+  role: string;
+  reason: string;
+  matched_paths: string[];
+  required: boolean;
+}
+
 /** A row from the /api/history endpoint: one persisted completed analysis. */
 export interface HistoryEntry {
   id: number;
@@ -279,6 +304,9 @@ export interface RiskReport {
   engineering_metrics?: EngineeringMetrics | null;
   operational_checklist: ChecklistItem[];
   production_readiness?: ProductionReadinessScore | null;
+  suggested_reviewers: SuggestedReviewer[];
+  positive_signals: PositiveSignal[];
+  uncertainties: UncertaintyItem[];
 }
 
 export interface AIAnalysis {

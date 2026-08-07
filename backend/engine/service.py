@@ -17,6 +17,8 @@ from .config import get_settings
 from .github_client import GitHubError
 from . import history
 from .metrics import build_engineering_metrics, build_operational_checklist, derive_production_readiness_score
+from .reviewers import build_suggested_reviewers
+from .evidence_gaps import build_positive_signals, build_uncertainties
 from datetime import datetime, timezone
 
 from .models import (
@@ -212,6 +214,9 @@ def _build_report(
     production_readiness = derive_production_readiness_score(
         heuristics, category_breakdown, confidence_explanation.score, engineering_metrics
     )
+    suggested_reviewers = build_suggested_reviewers(pr, category_breakdown)
+    positive_signals = build_positive_signals(heuristics)
+    uncertainties = build_uncertainties(pr, heuristics, ai, rag, category_breakdown)
 
     return RiskReport(
         decision=decision,
@@ -237,6 +242,9 @@ def _build_report(
         engineering_metrics=engineering_metrics,
         operational_checklist=operational_checklist,
         production_readiness=production_readiness,
+        suggested_reviewers=suggested_reviewers,
+        positive_signals=positive_signals,
+        uncertainties=uncertainties,
         execution_metrics=ExecutionMetrics(
             generated_at=datetime.now(timezone.utc).isoformat(),
             total_duration_ms=total_duration_ms,

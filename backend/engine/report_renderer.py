@@ -231,6 +231,28 @@ def render_markdown(response: AnalyzeResponse) -> str:
             lines.append(f"- [ ] {item.task} — _{item.reason}_")
         lines.append("")
 
+    # --- Suggested Reviewers -----------------------------------------------------
+    if report.suggested_reviewers:
+        lines.extend(["## Suggested Reviewers", ""])
+        for reviewer in report.suggested_reviewers:
+            tag = "🔒 Required" if reviewer.required else "Recommended"
+            lines.append(f"- **{reviewer.role}** ({tag}) — {reviewer.reason}")
+        lines.append("")
+
+    # --- Why this isn't rated higher ----------------------------------------------
+    if report.positive_signals:
+        lines.extend(["## Why This Isn't Rated Higher", ""])
+        for signal in report.positive_signals:
+            lines.append(f"- ✅ {signal.label} — _{signal.reason}_")
+        lines.append("")
+
+    # --- What we couldn't determine ------------------------------------------------
+    if report.uncertainties:
+        lines.extend(["## What We Couldn't Determine", ""])
+        for item in report.uncertainties:
+            lines.append(f"- ⚠️ **{item.area}** — {item.reason}")
+        lines.append("")
+
     # --- Deployment Recommendation ------------------------------------------------
     rec = report.deployment_recommendation
     lines.extend(["## Deployment Recommendation", ""])

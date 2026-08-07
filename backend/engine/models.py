@@ -285,6 +285,39 @@ class ChecklistItem(BaseModel):
     reason: str
 
 
+class PositiveSignal(BaseModel):
+    """A reassuring, evidence-backed fact -- the mirror image of a triggered risk
+    factor. Every risk report explains what's dangerous; this explains what
+    ISN'T, so a LOW-risk verdict is backed by explicit absence-of-risk evidence
+    rather than just a lack of alarms."""
+
+    label: str
+    reason: str
+
+
+class UncertaintyItem(BaseModel):
+    """An area PR Sentinel could NOT assess, and why -- explicit admission of a
+    gap rather than silently omitting it or guessing. Distinct from a
+    PositiveSignal: this isn't 'no risk found', it's 'insufficient evidence to
+    make a determination either way'."""
+
+    area: str
+    reason: str
+
+
+class SuggestedReviewer(BaseModel):
+    """A reviewer role/team recommendation derived from which subsystems this PR
+    touches -- a lightweight, deterministic stand-in for a CODEOWNERS lookup.
+    Not a specific person: PR Sentinel doesn't have access to org membership,
+    so it recommends the *role* that owns the affected area and the evidence
+    (matched files) behind that recommendation."""
+
+    role: str
+    reason: str
+    matched_paths: list[str] = Field(default_factory=list)
+    required: bool = False  # True = should block merge without this reviewer's sign-off
+
+
 class ExecutionMetrics(BaseModel):
     generated_at: str
     total_duration_ms: int
@@ -320,6 +353,9 @@ class RiskReport(BaseModel):
     engineering_metrics: Optional[EngineeringMetrics] = None
     operational_checklist: list[ChecklistItem] = Field(default_factory=list)
     production_readiness: Optional[ProductionReadinessScore] = None
+    suggested_reviewers: list[SuggestedReviewer] = Field(default_factory=list)
+    positive_signals: list[PositiveSignal] = Field(default_factory=list)
+    uncertainties: list[UncertaintyItem] = Field(default_factory=list)
 
 
 class AIAnalysis(BaseModel):
