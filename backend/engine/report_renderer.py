@@ -81,6 +81,9 @@ def render_markdown(response: AnalyzeResponse) -> str:
         f"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% — {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
         f"| **Estimated Review Effort** | ⏱️ `{report.review_effort_label}` |",
         f"| **Recommended Deployment** | `{report.deployment_strategy}` |",
+        f"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% — {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
+        f"| **Estimated Review Effort** | ⏱️ `{report.review_effort_label}` |",
+        f"| **Recommended Deployment** | `{report.deployment_strategy}` |",
         "",
         "## Pull Request",
         "",
@@ -154,6 +157,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
             for item in cat.evidence:
                 conf_lbl = "High" if item.confidence >= 75 else ("Medium" if item.confidence >= 50 else "Low")
                 lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity ({conf_lbl} confidence)")
+                conf_lbl = "High" if item.confidence >= 75 else ("Medium" if item.confidence >= 50 else "Low")
+                lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity ({conf_lbl} confidence)")
                 lines.append(f"  - _Why it matters:_ {item.explanation}")
                 if item.snippet:
                     lines.append("  - _Evidence:_")
@@ -175,6 +180,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append("| Agent | Decision | Confidence | Time |")
         lines.append("|---|---|---|---|")
         for d in report.agent_decisions:
+            conf_lbl = "High" if d.confidence >= 75 else ("Medium" if d.confidence >= 50 else "Low")
+            lines.append(f"| {d.label} | {d.decision} | {conf_lbl} | {_format_duration(d.execution_time_ms)} |")
             conf_lbl = "High" if d.confidence >= 75 else ("Medium" if d.confidence >= 50 else "Low")
             lines.append(f"| {d.label} | {d.decision} | {conf_lbl} | {_format_duration(d.execution_time_ms)} |")
         lines.append("")
@@ -203,7 +210,16 @@ def render_markdown(response: AnalyzeResponse) -> str:
         if rag.retrieved:
             lines.append("**Top repository context retrieved:**")
             lines.append("")
+            lines.append("**Top repository context retrieved:**")
+            lines.append("")
             for chunk in rag.retrieved[:5]:
+                lines.append(f"#### `{chunk.path}`")
+                if chunk.retrieval_reason:
+                    lines.append(f"**Why retrieved:** {chunk.retrieval_reason}")
+                lines.append(f"```")
+                lines.append(f"{chunk.snippet[:300]}{'...' if len(chunk.snippet) > 300 else ''}")
+                lines.append(f"```")
+                lines.append("")
                 lines.append(f"#### `{chunk.path}`")
                 if chunk.retrieval_reason:
                     lines.append(f"**Why retrieved:** {chunk.retrieval_reason}")
@@ -230,6 +246,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
     lines.extend(["## Deployment Recommendation", ""])
     if rec:
         lines.append(f"**Chosen strategy: `{rec.strategy}`**")
+        lines.append(f"**Chosen strategy: `{rec.strategy}`**")
         lines.append("")
         lines.append(rec.reason or ai.rollout_reason)
         lines.append("")
@@ -241,16 +258,27 @@ def render_markdown(response: AnalyzeResponse) -> str:
             lines.append(f"- **Required approval:** `{rec.approval_level}`")
         lines.append(f"- **Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
         lines.append("")
+        if rec.monitoring_focus:
+            lines.append(f"- **Monitoring focus:** {rec.monitoring_focus}")
+        if rec.rollback_trigger:
+            lines.append(f"- **Rollback trigger:** {rec.rollback_trigger}")
+        if rec.approval_level:
+            lines.append(f"- **Required approval:** `{rec.approval_level}`")
+        lines.append(f"- **Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
+        lines.append("")
         if rec.alternatives_considered:
+            lines.append("**Alternatives considered:**")
             lines.append("**Alternatives considered:**")
             for alt in rec.alternatives_considered:
                 lines.append(f"- {alt}")
+            lines.append("")
             lines.append("")
 
     # --- Confidence explanation ------------------------------------------------
     conf = report.confidence_explanation
     if conf:
         lines.extend(["## Confidence", ""])
+        lines.append(f"**{conf.level}** ({conf.score}% score) — {conf.evidence_completeness} evidence")
         lines.append(f"**{conf.level}** ({conf.score}% score) — {conf.evidence_completeness} evidence")
         lines.append("")
         lines.append(conf.narrative)
