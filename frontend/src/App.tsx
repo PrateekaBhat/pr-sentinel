@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { analyzePullRequest, ApiError, fetchDemo, fetchDemos } from "./api/client";
+import { analyzePullRequest, ApiError, fetchDemo, fetchDemos, fetchRepositoryHealth } from "./api/client";
 import AgentPipelinePanel from "./components/AgentPipelinePanel";
 import ArchitecturalImpactCard from "./components/ArchitecturalImpactCard";
 import Card from "./components/Card";
@@ -15,11 +15,13 @@ import Header from "./components/Header";
 import JudgeBadge from "./components/JudgeBadge";
 import LoadingState from "./components/LoadingState";
 import OperationalChecklistCard from "./components/OperationalChecklistCard";
+import ProductionReadinessGauge from "./components/ProductionReadinessGauge";
 import RepoInput from "./components/RepoInput";
+import RepositoryHealthPanel from "./components/RepositoryHealthPanel";
 import RiskGauge from "./components/RiskGauge";
 import RolloutCard from "./components/RolloutCard";
 import TestAreasCard from "./components/TestAreasCard";
-import type { AnalyzeResponse, DemoSummary } from "./types";
+import type { AnalyzeResponse, DemoSummary, RepositoryHealth } from "./types";
 
 export default function App() {
   const [demos, setDemos] = useState<DemoSummary[]>([]);
@@ -27,10 +29,21 @@ export default function App() {
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [repoHealth, setRepoHealth] = useState<RepositoryHealth | null>(null);
 
   useEffect(() => {
     fetchDemos().then(setDemos).catch(() => setDemos([]));
   }, []);
+
+  useEffect(() => {
+    if (!result) {
+      setRepoHealth(null);
+      return;
+    }
+    fetchRepositoryHealth({ repository: `${result.pr.owner}/${result.pr.repo}` })
+      .then(setRepoHealth)
+      .catch(() => setRepoHealth(null));
+  }, [result]);
 
   async function handleAnalyze(prUrl: string) {
     setLoading(true);
@@ -119,6 +132,12 @@ export default function App() {
               </p>
             </Card>
 
+            {repoHealth && repoHealth.analyses_count > 0 && (
+              <Card title="Repository health" eyebrow={`${result.pr.owner}/${result.pr.repo}`}>
+                <RepositoryHealthPanel health={repoHealth} />
+              </Card>
+            )}
+
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
               <Card title="Overall risk" eyebrow="Sentinel assessment" className="flex flex-col items-center justify-center lg:col-span-1">
                 <RiskGauge risk={result.ai.overall_risk} confidence={result.report.confidence} />
@@ -129,6 +148,12 @@ export default function App() {
                 <CategoryBreakdown categories={result.report.risk_categories} />
               </Card>
             </div>
+
+            {result.report.production_readiness && (
+              <Card title="Production readiness" eyebrow="Derived score">
+                <ProductionReadinessGauge readiness={result.report.production_readiness} />
+              </Card>
+            )}
 
             <Card title="Architectural impact" eyebrow="Affected subsystems">
               <ArchitecturalImpactCard impact={result.report.architectural_impact} />

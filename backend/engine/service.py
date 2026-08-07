@@ -15,7 +15,8 @@ from .categories import (
 )
 from .config import get_settings
 from .github_client import GitHubError
-from .metrics import build_engineering_metrics, build_operational_checklist
+from . import history
+from .metrics import build_engineering_metrics, build_operational_checklist, derive_production_readiness_score
 from datetime import datetime, timezone
 
 from .models import (
@@ -208,6 +209,9 @@ def _build_report(
 
     engineering_metrics = build_engineering_metrics(pr, category_breakdown)
     operational_checklist = build_operational_checklist(category_breakdown, heuristics, engineering_metrics)
+    production_readiness = derive_production_readiness_score(
+        heuristics, category_breakdown, confidence_explanation.score, engineering_metrics
+    )
 
     return RiskReport(
         decision=decision,
@@ -232,6 +236,7 @@ def _build_report(
         deployment_recommendation=deployment_recommendation,
         engineering_metrics=engineering_metrics,
         operational_checklist=operational_checklist,
+        production_readiness=production_readiness,
         execution_metrics=ExecutionMetrics(
             generated_at=datetime.now(timezone.utc).isoformat(),
             total_duration_ms=total_duration_ms,
@@ -308,6 +313,10 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         judge=judge_result,
         source="live",
     )
+    try:
+        history.record_analysis(response)
+    except Exception:  # noqa: BLE001 — history is best-effort, never blocks the response
+        pass
     return response
 
 

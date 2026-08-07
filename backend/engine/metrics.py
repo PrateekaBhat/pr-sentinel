@@ -17,8 +17,10 @@ from .models import (
     ChecklistItem,
     EngineeringMetrics,
     HeuristicResult,
+    ProductionReadinessScore,
     PullRequestData,
     RiskCategory,
+    RiskLevel,
 )
 
 # A conservative regex for "this line looks like a new public function/route",
@@ -106,6 +108,30 @@ def build_engineering_metrics(
 
     doc_coverage_pct = round((doc_files_changed / pr.changed_files_count) * 100) if pr.changed_files_count else 0
 
+    # --- Ratio metrics (Feature 2) ------------------------------------------
+    # Risk density: how much risk per file touched. A PR that scores 40 across
+    # 3 files is a very different signal than 40 across 60 files.
+    risk_density = round(sum(c.score for c in categories) / pr.changed_files_count, 2) if pr.changed_files_count else 0.0
+
+    critical_categories = {"Authentication", "Secrets", "Data Layer"}
+    critical_files = {
+        f for c in categories if c.category in critical_categories for f in c.evidence_files
+    }
+    critical_file_ratio = round(len(critical_files) / pr.changed_files_count, 3) if pr.changed_files_count else 0.0
+
+    code_files = [
+        f for f in files
+        if not _DOC_FILE_RE.search(f.filename) and not (tests_category and f.filename in tests_category.evidence_files)
+    ]
+    test_ratio = round(test_files_touched / len(code_files), 3) if code_files else 0.0
+
+    documentation_ratio = round(doc_files_changed / pr.changed_files_count, 3) if pr.changed_files_count else 0.0
+
+    average_file_diff_size = round((pr.additions + pr.deletions) / pr.changed_files_count, 1) if pr.changed_files_count else 0.0
+
+    total_changes = sum(f.changes for f in files) or 1
+    hotspot_concentration_pct = round((largest_file_changes / total_changes) * 100) if largest_file_changes else 0
+
     return EngineeringMetrics(
         public_apis_modified=public_apis_modified,
         api_routes_changed=api_routes_changed,
@@ -122,6 +148,13 @@ def build_engineering_metrics(
         largest_file=largest_file or "n/a",
         largest_file_changes=largest_file_changes,
         most_impacted_subsystem=most_impacted_subsystem,
+        risk_density=risk_density,
+        critical_file_ratio=critical_file_ratio,
+        test_ratio=test_ratio,
+        dependency_churn=dependency_updates,
+        documentation_ratio=documentation_ratio,
+        average_file_diff_size=average_file_diff_size,
+        hotspot_concentration_pct=hotspot_concentration_pct,
     )
 
 
@@ -210,3 +243,70 @@ def build_operational_checklist(
     add("Confirm the rollback plan for this change", "Standard release-safety gate before merge.")
 
     return items
+
+
+def derive_production_readiness_score(
+    heuristics: HeuristicResult,
+    categories: list[RiskCategory],
+    confidence: int,
+    em: EngineeringMetrics,
+) -> ProductionReadinessScore:
+    """A single 0-100 score summarizing 'is this ready to ship', built entirely
+    from numbers already computed elsewhere in the pipeline — deterministic and
+    reproducible, not an LLM guess. Starts at 100 and subtracts points for each
+    concrete readiness gap, so the explanation is just the list of deductions."""
+    score = 100
+    reasons: list[str] = []
+    by_category = {c.category: c for c in categories}
+
+    # Risk
+    risk_penalty = min(35, heuristics.score // 3)
+    if risk_penalty:
+        score -= risk_penalty
+        reasons.append(f"-{risk_penalty} for overall risk score ({heuristics.score}/100)")
+
+    # Confidence
+    if confidence < 70:
+        conf_penalty = min(15, (70 - confidence) // 2)
+        score -= conf_penalty
+        reasons.append(f"-{conf_penalty} for below-target confidence ({confidence}%)")
+
+    # Tests
+    if em.test_files_touched == 0 and by_category.get("Application/Core Logic", None) and by_category["Application/Core Logic"].evidence:
+        score -= 15
+        reasons.append("-15 for no test files touched despite implementation changes")
+    elif heuristics.tests_deleted:
+        score -= 8
+        reasons.append("-8 for deleted test files")
+
+    # Deployment complexity proxy: infra/CI/DB categories touched together
+    complexity_categories = [c for c in ("Infrastructure", "CI/CD", "Data Layer") if by_category.get(c) and by_category[c].evidence]
+    if len(complexity_categories) >= 2:
+        score -= 10
+        reasons.append(f"-10 for multi-domain deployment complexity ({', '.join(complexity_categories)})")
+
+    # Documentation
+    if em.documentation_ratio == 0 and em.lines_added > 300:
+        score -= 5
+        reasons.append("-5 for a large change with no accompanying documentation update")
+
+    # Secrets
+    secrets_cat = by_category.get("Secrets")
+    if secrets_cat and secrets_cat.evidence:
+        score -= 20
+        reasons.append("-20 for changes touching files matched as secrets/credentials")
+
+    # Dependencies
+    if em.dependency_updates > 3:
+        score -= 5
+        reasons.append(f"-5 for high dependency churn ({em.dependency_updates} manifests changed)")
+
+    score = max(0, min(100, score))
+    if score >= 80:
+        label = "Ready"
+    elif score >= 55:
+        label = "Needs attention"
+    else:
+        label = "Not ready"
+
+    return ProductionReadinessScore(score=score, label=label, deductions=reasons)

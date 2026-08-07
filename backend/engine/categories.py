@@ -15,6 +15,7 @@ from .models import (
     PullRequestData,
     RAGContext,
     RiskCategory,
+    RiskFactorFlag,
     RiskLevel,
 )
 
@@ -506,6 +507,14 @@ def build_confidence_explanation(
 
     level = _confidence_label(score)
 
+    checks = [
+        RiskFactorFlag(key="repo_docs", label="Repository documentation found", passed=repo_context_available),
+        RiskFactorFlag(key="heuristic_llm_agree", label="Heuristic and LLM assessments agree", passed=agreement),
+        RiskFactorFlag(key="agents_completed", label="All applicable specialist agents completed", passed=all_agents_ran),
+        RiskFactorFlag(key="ai_available", label="AI pipeline was available", passed=ai_enabled),
+        RiskFactorFlag(key="grounded", label="Groundedness check passed", passed=bool(judge_grounded) if judge_grounded is not None else True),
+    ]
+
     return ConfidenceExplanation(
         score=score,
         level=level,
@@ -513,6 +522,7 @@ def build_confidence_explanation(
         llm_heuristic_agreement=agreement,
         evidence_completeness=completeness,
         narrative=narrative,
+        checks=checks,
     )
 
 

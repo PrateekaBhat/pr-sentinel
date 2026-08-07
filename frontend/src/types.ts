@@ -146,10 +146,12 @@ export interface ArchitecturalImpact {
 
 export interface ConfidenceExplanation {
   score: number;
+  level?: string;
   repository_context_available: boolean;
   llm_heuristic_agreement: boolean;
   evidence_completeness: "complete" | "partial";
   narrative: string;
+  checks: RiskFactorFlag[];
 }
 
 export interface DeploymentRecommendation {
@@ -184,6 +186,22 @@ export interface EngineeringMetrics {
   largest_file: string;
   largest_file_changes: number;
   most_impacted_subsystem: string;
+  risk_density: number;
+  critical_file_ratio: number;
+  test_ratio: number;
+  dependency_churn: number;
+  documentation_ratio: number;
+  average_file_diff_size: number;
+  hotspot_concentration_pct: number;
+}
+
+/** A single 0-100 "is this ready to ship" score, derived deterministically
+ * from risk, confidence, tests, deployment complexity, docs, secrets, and
+ * dependency churn. */
+export interface ProductionReadinessScore {
+  score: number;
+  label: "Ready" | "Needs attention" | "Not ready" | string;
+  deductions: string[];
 }
 
 /** One actionable pre-merge task, generated from a detected risk rather than
@@ -191,6 +209,51 @@ export interface EngineeringMetrics {
 export interface ChecklistItem {
   task: string;
   reason: string;
+}
+
+/** A row from the /api/history endpoint: one persisted completed analysis. */
+export interface HistoryEntry {
+  id: number;
+  repository: string;
+  pr_number: number;
+  pr_title: string;
+  author: string;
+  analyzed_at: string;
+  decision: string;
+  overall_risk: string;
+  risk_score: number;
+  confidence: number;
+  deployment_recommendation: string;
+  total_duration_ms: number;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+  heuristic_score: number;
+  categories_triggered: string[];
+  agent_decisions: Array<{
+    agent: string;
+    label: string;
+    decision: string;
+    confidence: number;
+    execution_time_ms: number;
+  }>;
+  human_decision: string | null;
+  human_reason: string | null;
+}
+
+/** Aggregate stats from /api/repository-health, powering the dashboard's
+ * Repository Health panel. */
+export interface RepositoryHealth {
+  repository: string | null;
+  analyses_count: number;
+  average_risk_score: number;
+  average_confidence: number;
+  average_files_changed: number;
+  average_review_duration_ms: number;
+  deployment_distribution: Record<string, number>;
+  top_recurring_categories: Array<[string, number]>;
+  risk_trend: Array<{ analyzed_at: string; pr_number: number; risk_score: number }>;
+  decision_trend: Array<{ analyzed_at: string; pr_number: number; decision: string }>;
 }
 
 export interface RiskReport {
@@ -215,6 +278,7 @@ export interface RiskReport {
   deployment_recommendation?: DeploymentRecommendation | null;
   engineering_metrics?: EngineeringMetrics | null;
   operational_checklist: ChecklistItem[];
+  production_readiness?: ProductionReadinessScore | null;
 }
 
 export interface AIAnalysis {

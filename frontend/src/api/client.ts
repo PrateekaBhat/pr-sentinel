@@ -1,4 +1,4 @@
-import type { AnalyzeResponse, DemoSummary } from "../types";
+import type { AnalyzeResponse, DemoSummary, HistoryEntry, RepositoryHealth } from "../types";
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -35,4 +35,22 @@ export async function fetchDemos(): Promise<DemoSummary[]> {
 export async function fetchDemo(id: string): Promise<AnalyzeResponse> {
   const res = await fetch(`${BASE_URL}/api/demos/${id}`);
   return handleResponse<AnalyzeResponse>(res);
+}
+
+export async function fetchHistory(params: { limit?: number; repository?: string } = {}): Promise<HistoryEntry[]> {
+  const search = new URLSearchParams();
+  if (params.limit) search.set("limit", String(params.limit));
+  if (params.repository) search.set("repository", params.repository);
+  const qs = search.toString();
+  const res = await fetch(`${BASE_URL}/api/history${qs ? `?${qs}` : ""}`);
+  return handleResponse<HistoryEntry[]>(res);
+}
+
+export async function fetchRepositoryHealth(params: { repository?: string; window?: number } = {}): Promise<RepositoryHealth> {
+  const search = new URLSearchParams();
+  if (params.repository) search.set("repository", params.repository);
+  if (params.window) search.set("window", String(params.window));
+  const qs = search.toString();
+  const res = await fetch(`${BASE_URL}/api/repository-health${qs ? `?${qs}` : ""}`);
+  return handleResponse<RepositoryHealth>(res);
 }

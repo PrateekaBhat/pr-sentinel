@@ -213,6 +213,7 @@ class ConfidenceExplanation(BaseModel):
     llm_heuristic_agreement: bool
     evidence_completeness: str  # "complete" | "partial"
     narrative: str = ""
+    checks: list[RiskFactorFlag] = Field(default_factory=list)  # ✓/✗ explainability checklist
 
 
 class DeploymentRecommendation(BaseModel):
@@ -256,6 +257,24 @@ class EngineeringMetrics(BaseModel):
     largest_file: str = "n/a"
     largest_file_changes: int = 0
     most_impacted_subsystem: str = "None"
+    # Ratio metrics
+    risk_density: float = 0.0            # risk score / files changed
+    critical_file_ratio: float = 0.0     # critical files / total files
+    test_ratio: float = 0.0              # test files touched / code files touched
+    dependency_churn: int = 0            # alias of dependency_updates, kept explicit per spec
+    documentation_ratio: float = 0.0     # doc files / total files
+    average_file_diff_size: float = 0.0  # (additions+deletions) / files changed
+    hotspot_concentration_pct: int = 0   # largest file's share of total diff churn
+
+
+class ProductionReadinessScore(BaseModel):
+    """A single 0-100 'is this ready to ship' score, derived deterministically
+    from risk, confidence, tests, deployment complexity, docs, secrets, and
+    dependency churn — every point deducted is explained in `deductions`."""
+
+    score: int
+    label: str  # "Ready" | "Needs attention" | "Not ready"
+    deductions: list[str] = Field(default_factory=list)
 
 
 class ChecklistItem(BaseModel):
@@ -300,6 +319,7 @@ class RiskReport(BaseModel):
     deployment_recommendation: Optional[DeploymentRecommendation] = None
     engineering_metrics: Optional[EngineeringMetrics] = None
     operational_checklist: list[ChecklistItem] = Field(default_factory=list)
+    production_readiness: Optional[ProductionReadinessScore] = None
 
 
 class AIAnalysis(BaseModel):

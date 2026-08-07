@@ -26,8 +26,14 @@ export default function ConfidenceCard({ confidence }: { confidence: ConfidenceE
       </div>
       <p className="text-sm leading-relaxed text-fog">{confidence.narrative}</p>
       <div className="flex flex-col gap-1.5 border-t border-steel pt-3">
-        <CheckRow ok={confidence.repository_context_available} label="Repository context (RAG) was available" />
-        <CheckRow ok={confidence.llm_heuristic_agreement} label="LLM and heuristic analyses agree" />
+        {confidence.checks && confidence.checks.length > 0 ? (
+          confidence.checks.map((check) => <CheckRow key={check.key} ok={check.passed} label={check.label} />)
+        ) : (
+          <>
+            <CheckRow ok={confidence.repository_context_available} label="Repository context (RAG) was available" />
+            <CheckRow ok={confidence.llm_heuristic_agreement} label="LLM and heuristic analyses agree" />
+          </>
+        )}
       </div>
     </div>
   );
