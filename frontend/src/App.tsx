@@ -132,7 +132,7 @@ function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; find
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">{perspectives.map((perspective) => <div key={perspective.name} className="rounded-md border border-steel bg-raised p-3"><div className="flex justify-between gap-2"><span className="text-xs font-semibold text-paper">{perspective.name}</span><span className={perspective.status === "WARN" ? "font-mono text-xs text-risk-medium" : "font-mono text-xs text-risk-low"}>{perspective.status}</span></div><p className="mt-1 text-xs text-fog">{perspective.reason}</p></div>)}</div>
     </Card>
 
-    <Collapsible header={<span className="font-display text-sm font-semibold text-paper">Technical details</span>}>
+    <Collapsible header={<span className="font-display text-sm font-semibold text-paper">Evidence &amp; scoring</span>}>
       <div className="flex flex-col gap-6"><Card title="Risk breakdown" eyebrow="Raw category evidence"><CategoryBreakdown categories={report.risk_categories} /></Card><Card title="Detailed review reasoning" eyebrow="Expandable specialist detail"><AgentPipelinePanel decisions={report.agent_decisions} /></Card>{report.engineering_metrics && <Card title="Engineering metrics" eyebrow="Deterministic details"><EngineeringMetricsCard metrics={report.engineering_metrics} /></Card>}<Card title="Repository evidence" eyebrow="Retrieved documentation"><CitationsList rag={result.rag} /></Card></div>
     </Collapsible>
   </div>;

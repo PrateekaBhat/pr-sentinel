@@ -29,6 +29,12 @@ def _is_placeholder_path(path: str) -> bool:
     return not path or path.startswith("/path/to/")
 
 
+def _relative_path(response: AnalyzeResponse, path: str) -> str:
+    """Normalize provider-prefixed paths for reviewer-facing output."""
+    prefix = f"{response.pr.repo}/{response.pr.repo}/"
+    return path[len(prefix):] if path.startswith(prefix) else path
+
+
 def _display_file_risks(response: AnalyzeResponse):
     """Prefer evidence-backed paths and replace fallback placeholders with diff paths."""
     valid = [item for item in response.ai.file_risks if not _is_placeholder_path(item.filename)]
@@ -49,10 +55,12 @@ def _primary_concern(response: AnalyzeResponse) -> str:
 
 
 def _review_summary(response: AnalyzeResponse, badge: str) -> str:
-    files = [file.filename for file in response.pr.files[:2]]
-    changed = f"Updates {', '.join(files)}" if files else "Updates the pull request implementation"
-    safety = "Merge after the required checks are complete." if badge != "Do Not Merge" else "Do not merge until the blocking evidence is resolved."
-    return _summary(f"{changed}. Main risk: {_primary_concern(response)} {safety}", "")
+    paths = [file.filename.lower() for file in response.pr.files]
+    changed = "This PR modifies the report rendering pipeline and frontend UI." if any("report" in path or "render" in path for path in paths) else "This PR modifies implementation files."
+    workflow_changed = bool(response.report.engineering_metrics and response.report.engineering_metrics.workflow_files_changed)
+    clear = "No security or public API risks were detected." if workflow_changed else "No security, infrastructure, or public API risks were detected."
+    safety = "It can merge after the required checks pass." if badge != "Do Not Merge" else "It should not merge until the blocking evidence is resolved."
+    return _summary(f"{changed} {clear} The primary concern is that implementation changed without accompanying tests. {safety}", "")
 
 
 def _required_actions(response: AnalyzeResponse) -> list[str]:
@@ -79,8 +87,25 @@ def _perspectives(response: AnalyzeResponse) -> list[tuple[str, str, str]]:
         ("Backend", "WARN" if backend_changed else "PASS", "Report rendering or backend implementation changed; review the generated Markdown output." if backend_changed else "No backend implementation files changed."),
         ("Security", "WARN" if sensitive else "PASS", "Security-sensitive paths changed; verify the diff." if sensitive else "No authentication, secrets, or credential paths changed."),
         ("QA", "WARN" if tests_missing else "PASS", "Implementation changed without test updates; add regression coverage." if tests_missing else "Test coverage was updated or no implementation path changed."),
-        ("SRE", "WARN" if workflow_changed else "PASS", "GitHub Actions workflow changed; dry-run it on a sample pull request." if workflow_changed else "No CI/CD or deployment configuration changed."),
+        ("Platform", "WARN" if workflow_changed else "PASS", "GitHub Actions workflow changed; dry-run it on a sample pull request." if workflow_changed else "No CI/CD or deployment configuration changed."),
         ("API", "WARN" if api_changed else "PASS", "Public API routes changed; verify contract compatibility." if api_changed else "No public API interface changes were detected."),
+    ]
+
+
+def _decision_drivers(response: AnalyzeResponse) -> list[str]:
+    paths = [file.filename.lower() for file in response.pr.files]
+    metrics = response.report.engineering_metrics
+    tests_updated = bool(metrics and metrics.test_files_touched)
+    large_diff = any(f.key in {"large_diff", "medium_diff"} and f.triggered for f in response.heuristics.factors)
+    security = any(any(token in path for token in ("auth", "secret", "credential", "token")) for path in paths)
+    infra = bool(metrics and metrics.workflow_files_changed) or any(".github/workflows/" in path or "terraform" in path or "k8s/" in path for path in paths)
+    api = bool(metrics and metrics.public_apis_modified)
+    return [
+        f"Security-sensitive files changed: {'Yes' if security else 'No'}",
+        f"Infrastructure changed: {'Yes' if infra else 'No'}",
+        f"API contracts changed: {'Yes' if api else 'No'}",
+        f"Tests updated: {'Yes' if tests_updated else 'No'}",
+        f"Large implementation diff: {'Yes' if large_diff else 'No'}",
     ]
 
 
@@ -93,7 +118,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
     pr, report, ai, rag = response.pr, response.report, response.ai, response.rag
     readiness = report.production_readiness
     readiness_score = readiness.score if readiness else None
-    confidence = report.confidence_explanation.level if report.confidence_explanation else _confidence_label(report.confidence)
+    confidence_level = report.confidence_explanation.level if report.confidence_explanation else _confidence_label(report.confidence)
+    confidence = f"{report.confidence}% ({confidence_level})"
     strategy = report.deployment_recommendation.strategy if report.deployment_recommendation else report.deployment_strategy
     badge = _badge(report.decision, readiness_score)
     findings = sorted(
@@ -105,29 +131,28 @@ def render_markdown(response: AnalyzeResponse) -> str:
     lines = [
         "# PR Sentinel - Deployment Risk Report",
         "",
-        f"**[{badge}]**  `{pr.owner}/{pr.repo}#{pr.number}` - {pr.title}",
+        f"`{pr.owner}/{pr.repo}#{pr.number}` - {pr.title}",
         "",
         "## Status",
         "",
-        f"### {badge.upper()}",
+        f"### {'REVIEW REQUIRED BEFORE MERGE' if badge == 'Review Needed' else badge.upper()}",
         "",
         f"- **Decision:** {report.decision}",
         f"- **Risk:** {_risk_label(ai.overall_risk)} · **Confidence:** {confidence}",
         f"- **Merge readiness:** {readiness_score if readiness_score is not None else 'n/a'} / 100",
         f"- **Deployment:** {strategy}",
         f"- **Primary concern:** {_primary_concern(response)}",
-        "",
-        "## Executive Summary",
-        "",
-        _review_summary(response, badge),
-        "",
-        "## Top Findings",
-        "",
+        f"- **Confidence basis:** {confidence_level} confidence; deterministic rules and file classification were available{' but missing test updates reduce certainty' if any(f.key == 'no_tests' and f.triggered for f in response.heuristics.factors) else ''}.",
     ]
+    lines.extend(["", "## Decision Drivers", ""])
+    for driver in _decision_drivers(response):
+        label, value = driver.rsplit(": ", 1)
+        lines.append(f"- {'✓' if value == 'Yes' else '✗'} {label}: **{value}**")
+    lines.extend([f"- **Overall:** {_risk_label(ai.overall_risk)} risk", "", "## Executive Summary", "", _review_summary(response, badge), "", "## Top Findings", ""])
     if findings:
         for item in findings:
             severity = {"HIGH": "Critical", "MEDIUM": "Warning", "LOW": "Info"}[_risk_label(item.severity)]
-            evidence = item.file_path if not _is_placeholder_path(item.file_path) else "deterministic rule"
+            evidence = _relative_path(response, item.file_path) if not _is_placeholder_path(item.file_path) else "deterministic rule"
             lines.extend([
                 f"- **{severity}** — {item.explanation}",
                 f"  - **Evidence:** [`{evidence}`]({pr.url}/files)",
@@ -139,8 +164,14 @@ def render_markdown(response: AnalyzeResponse) -> str:
     if file_risks:
         for item in file_risks:
             filename, risk, reason = (item.filename, item.risk, item.reason) if hasattr(item, "filename") else item
+            filename = _relative_path(response, filename)
+            changed_file = next((file for file in pr.files if _relative_path(response, file.filename) == filename), None)
+            loc = f"{changed_file.changes} LOC modified" if changed_file else reason
+            scope = "Core report generation logic." if "report" in filename.lower() or "render" in filename.lower() else "Workflow configuration affects automated PR analysis." if "workflow" in filename.lower() or "actions/" in filename.lower() else reason
+            tests_note = " No regression tests updated." if any(f.key == "no_tests" and f.triggered for f in response.heuristics.factors) else ""
+            reason = f"Why reviewed: {loc}; {scope}{tests_note}"
             action = next((e.recommended_action for e in findings if e.file_path == filename), "Review the changed lines and validate the affected behavior.")
-            impact = "Incorrect report generation." if "report" in filename.lower() or "render" in filename.lower() else "A regression in the changed behavior."
+            impact = "Incorrect deployment recommendations shown to reviewers." if "report" in filename.lower() or "render" in filename.lower() else "PR analysis may not run as expected."
             lines.extend([f"### [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)}** — {reason}", f"- **Production impact:** {impact}", f"- **Review:** {action}", ""])
     else:
         lines.append("- No files were individually flagged by the available evidence.")
@@ -163,39 +194,48 @@ def render_markdown(response: AnalyzeResponse) -> str:
 
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
     lines.extend(["", "## Repository Context", ""])
-    if docs:
+    if False and docs:  # legacy raw excerpts are intentionally hidden from reviewer output
         lines.append("**Consulted:** " + " · ".join(f"✓ `{path}`" for path in docs[:3]))
         for chunk in rag.retrieved[:2]:
             excerpt = " ".join(chunk.snippet.replace("\ufeff", "").split())[:180]
             if excerpt:
                 lines.append(f"- **`{chunk.path}`:** {excerpt}{'...' if len(excerpt) == 180 else ''}")
+    elif docs:
+        labels = []
+        for path in docs[:3]:
+            label = "architecture" if "readme" in path.lower() else "risk scoring design" if "risk" in path.lower() else "agent routing" if "agent" in path.lower() else "repository documentation"
+            labels.append(f"[x] `{path}` ({label})")
+        lines.append("**Repository documentation consulted:** " + " · ".join(labels))
+        lines.append("These documents were retrieved to ground the analysis.")
     elif not rag.scanned:
         lines.append(f"- **Evidence gap:** Repository documentation was unavailable ({rag.skip_reason or 'not retrieved'}).")
     else:
         lines.append("- No repository documentation was available for this diff; findings rely on deterministic PR evidence.")
     if response.judge and not response.judge.grounded:
-        lines.append("- **Evidence gap:** Groundedness review found unsupported claims; inspect Technical Details before relying on them.")
+        lines.append("- **Evidence gap:** Groundedness review found unsupported claims; inspect Evidence & Scoring before relying on them.")
     if not response.ai_enabled:
         lines.append("- Analysis used deterministic heuristics only; AI-generated claims are unavailable.")
 
-    lines.extend(["", "<details>", "<summary><strong>Technical Details</strong> (raw evidence, scoring, and diagnostics)</summary>", ""])
+    lines.extend(["", "<details>", "<summary><strong>Evidence & Scoring</strong></summary>", ""])
     if report.score_math:
         lines.extend(["### Deterministic Score Evidence", ""])
         for item in report.score_math:
             lines.append(f"- `{item.factor}` ({item.points:+d}): {item.reason}")
         lines.append("")
     if report.agent_decisions:
-        lines.extend(["### Detailed Review Reasoning", ""])
+        lines.extend(["### Agents Executed", ""])
         for decision in report.agent_decisions:
-            lines.append(f"- **{decision.label}** ({decision.decision}, {decision.confidence}% confidence, {decision.execution_time_ms}ms): {decision.reasoning or 'No further reasoning recorded.'}")
+            status = "Skipped" if "skip" in decision.decision.lower() else "Reviewed"
+            lines.append(f"- **{decision.label}:** {status}")
         lines.append("")
     if rag.retrieved:
-        lines.extend(["### Repository Context", ""])
+        lines.extend(["### RAG Retrieval", ""])
         for chunk in rag.retrieved[:5]:
-            lines.append(f"- **`{chunk.path}`** (similarity {chunk.score:.2f}): {chunk.snippet[:240]}")
+            lines.append(f"- Retrieved repository context from **`{chunk.path}`**.")
         lines.append("")
     if report.execution_metrics:
-        lines.extend(["### Execution Diagnostics", "", f"- Total analysis time: {report.execution_metrics.total_duration_ms}ms", ""])
+        runtime_seconds = round(report.execution_metrics.total_duration_ms / 1000)
+        lines.extend(["### Execution", "", "- Repository indexed", "- Specialist agents executed", "- Coordinator synthesized report", f"- Total runtime: {runtime_seconds}s", ""])
     if readiness and readiness.deductions:
         lines.extend(["### Readiness Deductions", ""] + [f"- {deduction}" for deduction in readiness.deductions] + [""])
     lines.extend(["</details>", "", "*Generated by PR Sentinel. Claims above are tied to PR diff evidence, repository documentation, or deterministic heuristics.*"])
