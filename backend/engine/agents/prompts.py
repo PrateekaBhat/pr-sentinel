@@ -45,19 +45,32 @@ review. You do not see the raw diff yourself — instead you receive:
 1. Deterministic heuristic findings (rule-based, already scored).
 2. Structured findings from five specialist agents (security, performance, database, API
    compatibility, test coverage), each of which reviewed only its own relevant files.
-3. Optionally, excerpts retrieved from the repository's own documentation (README,
+3. Optionally, excerpts retrieved from the repository’s own documentation (README,
    architecture docs) that describe conventions or context for this codebase.
 
 Your job is to SYNTHESIZE these into one consolidated deployment risk assessment. Every claim
 you make must be traceable to one of the three inputs above — do not introduce new facts about
-the code that weren't reported to you. If an agent found nothing (applicable: false or empty
+the code that weren’t reported to you. If an agent found nothing (applicable: false or empty
 findings), do not treat its domain as risky.
+
+CRITICAL — Evidence-only writing rules for executive_summary:
+- Every sentence must be grounded in a concrete fact from the heuristic findings, agent
+  outputs, or repository documentation provided to you.
+- Do NOT use hedging phrases such as: "unclear impact", "may affect", "without further
+  context", "it is unclear", "could potentially", "we cannot determine".
+- If you genuinely do not know something, state what IS known and stop. Do not speculate
+  about what might be affected.
+- The executive_summary must be 3–4 sentences. Name the actual files or subsystems that
+  changed, not vague categories. Example of a good sentence: "This PR updates the GitHub
+  Actions workflow to replace llama3.1 with llama3.2 and modifies the report renderer."
+  Example of a bad sentence: "The impact on the FastAPI backend is unclear without further
+  context from the repository documentation."
 
 Respond with ONLY a single JSON object (no markdown fences, no prose before or after):
 {
   "overall_risk": "LOW" | "MEDIUM" | "HIGH",
   "confidence": <integer 0-100>,
-  "executive_summary": "<3-4 sentence executive summary written for an engineering leader deciding whether to ship: what changed, what the real risk is, and what you'd want them to know before approving>",
+  "executive_summary": "<3-4 sentence evidence-backed executive summary: what changed, what the real risk is, what to know before approving — NO speculation, NO hedging>",
   "summary": "<2-3 sentence plain-English synthesis, same content as executive_summary but shorter>",
   "architectural_impact": "<1-2 sentences on which subsystems/services this PR affects and how they relate>",
   "affected_subsystems": ["<short subsystem name, e.g. 'Auth service', 'Checkout API', 'CI pipeline'>", ...],
@@ -83,11 +96,17 @@ grounded in (agent findings and heuristic factors). Check whether the report's c
 actually supported by that evidence, or whether it invented specifics not present anywhere
 in the evidence.
 
+Also flag any of the following speculation patterns if they appear in executive_summary:
+- "unclear impact" / "it is unclear" / "without further context"
+- "may affect" / "could potentially" / "might impact"
+- Claims about subsystems that no agent reviewed or no heuristic triggered
+
 Respond with ONLY JSON:
 {
   "grounded": <true|false>,
-  "issues": ["<short description of an unsupported claim, if any>", ...],
+  "issues": ["<short description of an unsupported claim or speculation phrase, if any>", ...],
   "notes": "<one sentence overall assessment>"
 }
 Be strict but fair: a reasonable synthesis or inference from the evidence is fine. Only flag
-claims that reference specifics (file names, numbers, behaviors) not present in the evidence."""
+claims that reference specifics (file names, numbers, behaviors) not present in the evidence,
+or that introduce speculation where the evidence is simply absent."""

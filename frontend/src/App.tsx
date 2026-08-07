@@ -9,10 +9,12 @@ import CitationsList from "./components/CitationsList";
 import ConfidenceCard from "./components/ConfidenceCard";
 import DemoGallery from "./components/DemoGallery";
 import EmptyState from "./components/EmptyState";
+import EngineeringMetricsCard from "./components/EngineeringMetricsCard";
 import FileRiskList from "./components/FileRiskList";
 import Header from "./components/Header";
 import JudgeBadge from "./components/JudgeBadge";
 import LoadingState from "./components/LoadingState";
+import OperationalChecklistCard from "./components/OperationalChecklistCard";
 import RepoInput from "./components/RepoInput";
 import RiskGauge from "./components/RiskGauge";
 import RolloutCard from "./components/RolloutCard";
@@ -142,6 +144,12 @@ export default function App() {
               )}
             </Card>
 
+            {result.report.engineering_metrics && (
+              <Card title="Engineering change summary" eyebrow="Deterministic metrics">
+                <EngineeringMetricsCard metrics={result.report.engineering_metrics} />
+              </Card>
+            )}
+
             <Card title="Agent pipeline" eyebrow="LangGraph execution">
               <AgentPipelinePanel decisions={result.report.agent_decisions} />
             </Card>
@@ -174,6 +182,11 @@ export default function App() {
                     coveragePct={result.ai.test_coverage_estimate_pct}
                   />
                 </Card>
+                {result.report.operational_checklist.length > 0 && (
+                  <Card title="Operational checklist" eyebrow="Before merge">
+                    <OperationalChecklistCard items={result.report.operational_checklist} />
+                  </Card>
+                )}
               </div>
             </div>
 

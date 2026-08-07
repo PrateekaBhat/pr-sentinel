@@ -166,6 +166,33 @@ export interface ExecutionMetrics {
   rag_cache_hit: boolean;
 }
 
+/** Deterministic counts describing the shape of the change — an expansion of
+ * "files changed" into what an engineer wants to know before reviewing. */
+export interface EngineeringMetrics {
+  public_apis_modified: number;
+  api_routes_changed: number;
+  config_files_changed: number;
+  workflow_files_changed: number;
+  documentation_files_changed: number;
+  documentation_coverage_pct: number;
+  test_files_touched: number;
+  test_coverage_delta_files: number;
+  dependency_updates: number;
+  lines_added: number;
+  lines_removed: number;
+  deleted_files: number;
+  largest_file: string;
+  largest_file_changes: number;
+  most_impacted_subsystem: string;
+}
+
+/** One actionable pre-merge task, generated from a detected risk rather than
+ * a static template. */
+export interface ChecklistItem {
+  task: string;
+  reason: string;
+}
+
 export interface RiskReport {
   decision: string;
   risk_score: number;
@@ -186,6 +213,8 @@ export interface RiskReport {
   architectural_impact: ArchitecturalImpact;
   confidence_explanation?: ConfidenceExplanation | null;
   deployment_recommendation?: DeploymentRecommendation | null;
+  engineering_metrics?: EngineeringMetrics | null;
+  operational_checklist: ChecklistItem[];
 }
 
 export interface AIAnalysis {

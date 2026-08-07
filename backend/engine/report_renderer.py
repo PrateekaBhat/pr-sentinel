@@ -78,8 +78,9 @@ def render_markdown(response: AnalyzeResponse) -> str:
         f"| **Decision** | `{report.decision}` |",
         f"| **Overall Risk** | `{_risk_label(ai.overall_risk)}` |",
         f"| **Risk Score** | {report.risk_score} / 100 |",
-        f"| **Confidence** | {report.confidence}% ({report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
-        f"| **Recommended Deployment** | {report.deployment_strategy} |",
+        f"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% — {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
+        f"| **Estimated Review Effort** | ⏱️ `{report.review_effort_label}` |",
+        f"| **Recommended Deployment** | `{report.deployment_strategy}` |",
         "",
         "## Pull Request",
         "",
@@ -102,6 +103,38 @@ def render_markdown(response: AnalyzeResponse) -> str:
     lines.append(impact.narrative or "No clearly affected subsystems were detected.")
     lines.append("")
 
+    # --- Engineering Change Summary (deterministic metrics) --------------------
+    em = report.engineering_metrics
+    if em:
+        lines.extend(["## Engineering Change Summary", ""])
+        lines.append("| Metric | Value |")
+        lines.append("|---|---|")
+        lines.append(f"| Public APIs / routes modified | {em.public_apis_modified} |")
+        lines.append(f"| API-layer files changed | {em.api_routes_changed} |")
+        lines.append(f"| Configuration files changed | {em.config_files_changed} |")
+        lines.append(f"| Workflow / CI files changed | {em.workflow_files_changed} |")
+        lines.append(f"| Documentation files changed | {em.documentation_files_changed} ({em.documentation_coverage_pct}% of diff) |")
+        lines.append(f"| Test files touched | {em.test_files_touched} |")
+        lines.append(f"| Dependency manifests updated | {em.dependency_updates} |")
+        lines.append(f"| Lines added / removed | +{em.lines_added} / -{em.lines_removed} |")
+        lines.append(f"| Files deleted | {em.deleted_files} |")
+        lines.append(f"| Largest file touched | `{em.largest_file}` ({em.largest_file_changes} changes) |")
+        lines.append(f"| Most impacted subsystem | {em.most_impacted_subsystem} |")
+        lines.append("")
+
+    # --- Score Calculation Math ------------------------------------------------
+    if report.score_math:
+        lines.extend(["## Score Calculation Math", ""])
+        lines.append("The overall risk score is calculated deterministically from triggered rule weights:")
+        lines.append("")
+        lines.append("| Factor | Points | Rule / Evidence |")
+        lines.append("|---|---|---|")
+        for item in report.score_math:
+            pts = f"+{item.points}" if item.points > 0 else f"{item.points}"
+            lines.append(f"| {item.factor} | `{pts}` | {item.reason} |")
+        lines.append(f"| **Total Calculated Score** | **`{report.risk_score}`** | |")
+        lines.append("")
+
     # --- Score breakdown by category -------------------------------------------
     if report.risk_categories:
         lines.extend(["## Risk Score Breakdown", ""])
@@ -119,7 +152,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
             lines.append(cat.summary)
             lines.append("")
             for item in cat.evidence:
-                lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity, {item.confidence}% confidence")
+                conf_lbl = "High" if item.confidence >= 75 else ("Medium" if item.confidence >= 50 else "Low")
+                lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity ({conf_lbl} confidence)")
                 lines.append(f"  - _Why it matters:_ {item.explanation}")
                 if item.snippet:
                     lines.append("  - _Evidence:_")
@@ -141,7 +175,8 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append("| Agent | Decision | Confidence | Time |")
         lines.append("|---|---|---|---|")
         for d in report.agent_decisions:
-            lines.append(f"| {d.label} | {d.decision} | {d.confidence}% | {_format_duration(d.execution_time_ms)} |")
+            conf_lbl = "High" if d.confidence >= 75 else ("Medium" if d.confidence >= 50 else "Low")
+            lines.append(f"| {d.label} | {d.decision} | {conf_lbl} | {_format_duration(d.execution_time_ms)} |")
         lines.append("")
         for d in report.agent_decisions:
             lines.append(f"<details><summary><strong>{d.label}</strong> reasoning</summary>")
@@ -166,11 +201,16 @@ def render_markdown(response: AnalyzeResponse) -> str:
                 lines.append(f"- `{path}`")
             lines.append("")
         if rag.retrieved:
-            lines.append("**Top context snippets that influenced this analysis:**")
-            for chunk in rag.retrieved[:5]:
-                lines.append(f"- `{chunk.path}` (relevance {chunk.score:.2f})")
-                lines.append(f"  > {chunk.snippet[:220]}{'...' if len(chunk.snippet) > 220 else ''}")
+            lines.append("**Top repository context retrieved:**")
             lines.append("")
+            for chunk in rag.retrieved[:5]:
+                lines.append(f"#### `{chunk.path}`")
+                if chunk.retrieval_reason:
+                    lines.append(f"**Why retrieved:** {chunk.retrieval_reason}")
+                lines.append(f"```")
+                lines.append(f"{chunk.snippet[:300]}{'...' if len(chunk.snippet) > 300 else ''}")
+                lines.append(f"```")
+                lines.append("")
         else:
             lines.append("No chunk was similar enough to the diff to be surfaced as supporting context.")
             lines.append("")
@@ -178,27 +218,40 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append(f"Repository context was not retrieved for this run ({rag.skip_reason or 'not available'}).")
         lines.append("")
 
-    # --- Deployment recommendation ------------------------------------------------
+    # --- Operational Checklist --------------------------------------------------
+    if report.operational_checklist:
+        lines.extend(["## Operational Checklist", "", "**Before Merge**", ""])
+        for item in report.operational_checklist:
+            lines.append(f"- [ ] {item.task} — _{item.reason}_")
+        lines.append("")
+
+    # --- Deployment Recommendation ------------------------------------------------
     rec = report.deployment_recommendation
     lines.extend(["## Deployment Recommendation", ""])
     if rec:
-        lines.append(f"**Chosen strategy: {rec.strategy}**")
+        lines.append(f"**Chosen strategy: `{rec.strategy}`**")
         lines.append("")
         lines.append(rec.reason or ai.rollout_reason)
         lines.append("")
+        if rec.monitoring_focus:
+            lines.append(f"- **Monitoring focus:** {rec.monitoring_focus}")
+        if rec.rollback_trigger:
+            lines.append(f"- **Rollback trigger:** {rec.rollback_trigger}")
+        if rec.approval_level:
+            lines.append(f"- **Required approval:** `{rec.approval_level}`")
+        lines.append(f"- **Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
+        lines.append("")
         if rec.alternatives_considered:
-            lines.append("**Alternatives considered and why they weren't chosen:**")
+            lines.append("**Alternatives considered:**")
             for alt in rec.alternatives_considered:
                 lines.append(f"- {alt}")
             lines.append("")
-        lines.append(f"**Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
-        lines.append("")
 
     # --- Confidence explanation ------------------------------------------------
     conf = report.confidence_explanation
     if conf:
         lines.extend(["## Confidence", ""])
-        lines.append(f"**{conf.score}%** — {conf.evidence_completeness} evidence")
+        lines.append(f"**{conf.level}** ({conf.score}% score) — {conf.evidence_completeness} evidence")
         lines.append("")
         lines.append(conf.narrative)
         lines.append("")

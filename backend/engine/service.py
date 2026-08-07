@@ -3,7 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import github_client, heuristics
+from . import github_client
+from . import heuristics as heuristics_mod
 from .agents.graph import run_pipeline
 from .ai_analyzer import analyze_with_heuristics_only
 from .categories import (
@@ -14,6 +15,7 @@ from .categories import (
 )
 from .config import get_settings
 from .github_client import GitHubError
+from .metrics import build_engineering_metrics, build_operational_checklist
 from datetime import datetime, timezone
 
 from .models import (
@@ -172,18 +174,49 @@ def _build_report(
     confidence_explanation = build_confidence_explanation(
         heuristics, ai, rag, ai_enabled, judge.grounded if judge else None
     )
+    effort_minutes, effort_label = heuristics_mod.calculate_review_effort(pr, heuristics)
+
+    # Rollout metadata mapping per strategy
+    monitoring_map = {
+        "Canary": "Monitor CI pipeline step completion, runner resource usage, and error rate during early deployment.",
+        "Standard": "Standard telemetry monitoring; verify post-merge automated build checks.",
+        "Blue/Green": "Monitor database connection pools, migration lock times, and API error rates on green environment.",
+        "Manual Approval": "Verify staging environment end-to-end integration tests before manual production promotion.",
+    }
+    rollback_map = {
+        "Canary": "Immediate rollback on any pipeline failure or unexpected workflow runner exit code.",
+        "Standard": "Standard git revert if post-merge production regression is detected.",
+        "Blue/Green": "Instant traffic switch back to blue environment if green telemetry degrades.",
+        "Manual Approval": "Revert commit and restore database snapshot if schema migration fails.",
+    }
+    approval_map = {
+        "Canary": "Platform / DevOps Lead",
+        "Standard": "Peer Code Reviewer",
+        "Blue/Green": "Lead Backend & SRE Engineer",
+        "Manual Approval": "Staff Security & Infrastructure Code Owner",
+    }
+
     deployment_recommendation = DeploymentRecommendation(
         strategy=ai.rollout_strategy,
         reason=ai.rollout_reason,
+        monitoring_focus=monitoring_map.get(ai.rollout_strategy, "Monitor error rates and service latency post-merge."),
+        rollback_trigger=rollback_map.get(ai.rollout_strategy, "Revert pull request if production telemetry degrades."),
+        approval_level=approval_map.get(ai.rollout_strategy, "Standard Peer Review"),
         alternatives_considered=_DEPLOYMENT_ALTERNATIVES.get(ai.rollout_strategy, []),
         rollback_required=ai.rollback_required,
     )
+
+    engineering_metrics = build_engineering_metrics(pr, category_breakdown)
+    operational_checklist = build_operational_checklist(category_breakdown, heuristics, engineering_metrics)
 
     return RiskReport(
         decision=decision,
         risk_score=heuristics.score,
         confidence=confidence_explanation.score,
+        review_effort_minutes=effort_minutes,
+        review_effort_label=effort_label,
         deployment_strategy=ai.rollout_strategy,
+        score_math=heuristics.score_math,
         risk_breakdown=_build_risk_breakdown(heuristics),
         risk_categories=category_breakdown,
         findings=_build_findings(heuristics, ai),
@@ -197,6 +230,8 @@ def _build_report(
         architectural_impact=architectural_impact,
         confidence_explanation=confidence_explanation,
         deployment_recommendation=deployment_recommendation,
+        engineering_metrics=engineering_metrics,
+        operational_checklist=operational_checklist,
         execution_metrics=ExecutionMetrics(
             generated_at=datetime.now(timezone.utc).isoformat(),
             total_duration_ms=total_duration_ms,
@@ -232,7 +267,7 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
 
     repo_context_ms = int((time.perf_counter_ns() - start) / 1_000_000) - repo_loaded_ms
 
-    heuristic_result = heuristics.analyze(pr)
+    heuristic_result = heuristics_mod.analyze(pr)
     ai_enabled = True
     ai_error: str | None = None
     judge_result = None

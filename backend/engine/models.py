@@ -69,9 +69,16 @@ class HeuristicFactor(BaseModel):
     reason: str
 
 
+class ScoreMathFactor(BaseModel):
+    factor: str
+    points: int
+    reason: str
+
+
 class HeuristicResult(BaseModel):
     score: int  # 0-100
     factors: list[HeuristicFactor]
+    score_math: list[ScoreMathFactor] = Field(default_factory=list)
     tests_touched: bool
     tests_deleted: bool
     migration_touched: bool
@@ -94,7 +101,8 @@ class RAGChunk(BaseModel):
 
     path: str
     snippet: str
-    score: float = 0.0  # similarity score, higher = more relevant
+    score: float = 0.0  # cosine similarity score; positive = more relevant
+    retrieval_reason: str = ""  # human-readable explanation of why this chunk was retrieved
 
 
 class RAGContext(BaseModel):
@@ -200,6 +208,7 @@ class ConfidenceExplanation(BaseModel):
     """Explains *why* the model is as confident as it is, instead of a bare number."""
 
     score: int  # 0-100
+    level: str = "Medium"  # "High" | "Medium" | "Low" — human-readable tier derived from score
     repository_context_available: bool
     llm_heuristic_agreement: bool
     evidence_completeness: str  # "complete" | "partial"
@@ -207,10 +216,13 @@ class ConfidenceExplanation(BaseModel):
 
 
 class DeploymentRecommendation(BaseModel):
-    """The chosen rollout strategy plus the reasoning and alternatives considered."""
+    """The chosen rollout strategy plus reasoning, monitoring, rollback, and approval rules."""
 
     strategy: str  # "Standard" | "Canary" | "Blue/Green" | "Manual Approval"
     reason: str = ""
+    monitoring_focus: str = ""
+    rollback_trigger: str = ""
+    approval_level: str = ""
     alternatives_considered: list[str] = Field(default_factory=list)
     rollback_required: bool = False
 
@@ -225,6 +237,35 @@ class RepositoryIntelligence(BaseModel):
     default_branch: Optional[str] = None
 
 
+class EngineeringMetrics(BaseModel):
+    """Deterministic counts describing the shape of the change — an expansion of
+    'files changed' into what an engineer wants to know before reviewing."""
+
+    public_apis_modified: int = 0
+    api_routes_changed: int = 0
+    config_files_changed: int = 0
+    workflow_files_changed: int = 0
+    documentation_files_changed: int = 0
+    documentation_coverage_pct: int = 0
+    test_files_touched: int = 0
+    test_coverage_delta_files: int = 0
+    dependency_updates: int = 0
+    lines_added: int = 0
+    lines_removed: int = 0
+    deleted_files: int = 0
+    largest_file: str = "n/a"
+    largest_file_changes: int = 0
+    most_impacted_subsystem: str = "None"
+
+
+class ChecklistItem(BaseModel):
+    """One actionable pre-merge task, generated from a detected risk rather
+    than a static template."""
+
+    task: str
+    reason: str
+
+
 class ExecutionMetrics(BaseModel):
     generated_at: str
     total_duration_ms: int
@@ -236,7 +277,10 @@ class RiskReport(BaseModel):
     decision: str
     risk_score: int
     confidence: int
+    review_effort_minutes: int = 15
+    review_effort_label: str = "15 minutes"
     deployment_strategy: str
+    score_math: list[ScoreMathFactor] = Field(default_factory=list)
     risk_breakdown: dict[str, int] = Field(default_factory=dict)
     risk_categories: list[RiskCategory] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
@@ -254,6 +298,8 @@ class RiskReport(BaseModel):
     architectural_impact: ArchitecturalImpact = Field(default_factory=ArchitecturalImpact)
     confidence_explanation: Optional[ConfidenceExplanation] = None
     deployment_recommendation: Optional[DeploymentRecommendation] = None
+    engineering_metrics: Optional[EngineeringMetrics] = None
+    operational_checklist: list[ChecklistItem] = Field(default_factory=list)
 
 
 class AIAnalysis(BaseModel):

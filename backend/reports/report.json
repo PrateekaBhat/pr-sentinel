@@ -1,0 +1,950 @@
+{
+  "pr": {
+    "owner": "PrateekaBhat",
+    "repo": "pr-sentinel",
+    "number": 2,
+    "title": "Improve report",
+    "body": "Improve report",
+    "author": "PrateekaBhat",
+    "url": "https://github.com/PrateekaBhat/pr-sentinel/pull/2",
+    "created_at": "2026-08-06T10:03:23Z",
+    "mergeable_state": "clean",
+    "mergeable": true,
+    "state": "open",
+    "additions": 2809,
+    "deletions": 412,
+    "changed_files_count": 27,
+    "labels": [],
+    "commit_messages": [
+      "Improve report",
+      "Formatting changes",
+      "Fix ollama timeout issue",
+      "feat: implement core agent routing logic, categorization engine, and PR report generation"
+    ],
+    "files": [
+      {
+        "filename": ".github/workflows/pr-sentinel.yml",
+        "status": "modified",
+        "additions": 20,
+        "deletions": 1,
+        "changes": 21,
+        "patch": "@@ -9,7 +9,11 @@ jobs:\n     runs-on: ubuntu-latest\n     env:\n       OLLAMA_BASE_URL: http://localhost:11434\n-      OLLAMA_MODEL: llama3.1\n+      # llama3.1 (8B) is too slow for a CPU-only GitHub-hosted runner (2 vCPU) \u2014\n+      # a single agent call can exceed its own timeout before it even finishes\n+      # loading the model. llama3.2 (3B) trades some analysis depth for something\n+      # that actually completes in CI; run a bigger model on self-hosted runners.\n+      OLLAMA_MODEL: llama3.2\n       OLLAMA_EMBED_MODEL: nomic-embed-text\n       CHROMA_PERSIST_DIR: ./backend/tmpchroma\n     steps:\n@@ -41,6 +45,21 @@ jobs:\n           echo \"Ollama did not start in time\"\n           exit 1\n \n+      - name: Pull Ollama models\n+        run: |\n+          docker exec pr-sentinel-ollama ollama pull \"${OLLAMA_MODEL}\"\n+          docker exec pr-sentinel-ollama ollama pull \"${OLLAMA_EMBED_MODEL}\"\n+\n+      - name: Warm up Ollama models\n+        run: |\n+          # Loading model weights into memory on first inference can itself take\n+          # a while \u2014 do that here, outside the per-request timeouts the app\n+          # uses, so the actual analysis run isn't racing a cold start.\n+          curl -sS http://localhost:11434/api/generate \\\n+            -d \"{\\\"model\\\": \\\"${OLLAMA_MODEL}\\\", \\\"prompt\\\": \\\"hi\\\", \\\"stream\\\": false}\" > /dev/null\n+          curl -sS http://localhost:11434/api/embeddings \\\n+            -d \"{\\\"model\\\": \\\"${OLLAMA_EMBED_MODEL}\\\", \\\"prompt\\\": \\\"hi\\\"}\" > /dev/null\n+\n       - name: Analyze pull request\n         id: analyze\n         continue-on-error: true"
+      },
+      {
+        "filename": "backend/engine/agent_routing.py",
+        "status": "modified",
+        "additions": 19,
+        "deletions": 1,
+        "changes": 20,
+        "patch": "@@ -12,7 +12,25 @@\n         r\"(^|/)(auth|authn|authz|login|session|jwt|oauth|security|payment|billing|checkout|stripe)(/|\\.)\",\n         re.I,\n     ),\n-    \"database\": re.compile(r\"(^|/)(migrations?|schema|models?|entity|repository)(/|\\.)|\\.sql$\", re.I),\n+    # Database agent: only files with clear persistence-layer signals.\n+    # A plain models.py in engine/, app/, or backend/ is a Pydantic/domain model,\n+    # NOT a database model \u2014 it must not route to this agent.\n+    \"database\": re.compile(\n+        r\"\"\"\n+        (^|/)alembic(/|\\.)            # Alembic migration directories\n+        | (^|/)migrations?(/|\\.)      # Django / SQLAlchemy migrations\n+        | (^|/)flyway(/|\\.)           # Flyway migrations\n+        | (^|/)liquibase(/|\\.)        # Liquibase migrations\n+        | (^|/)prisma(/|\\.)           # Prisma schema directory\n+        | schema\\.prisma$             # Prisma schema file\n+        | \\.sql$                      # Raw SQL files\n+        | (^|/)db/models?(/|\\.)       # models under explicit db/ prefix\n+        | (^|/)database/models?(/|\\.) # models under explicit database/ prefix\n+        | (^|/)entity(/|\\.)           # JPA / TypeORM entity classes\n+        | (^|/)repository(/|\\.)       # Repository / DAO pattern\n+        \"\"\",\n+        re.I | re.VERBOSE,\n+    ),\n     \"performance\": re.compile(r\"(^|/)(cache|redis|queue|worker|perf|benchmark|index)(/|\\.)\", re.I),\n     \"api\": re.compile(r\"(^|/)(routes?|controllers?|api|graphql|endpoints?)(/|\\.)\", re.I),\n     \"tests\": re.compile(r\"(^|/)(tests?|__tests__|spec)(/|\\.)|\\.(test|spec)\\.\", re.I),"
+      },
+      {
+        "filename": "backend/engine/agents/nodes.py",
+        "status": "modified",
+        "additions": 29,
+        "deletions": 2,
+        "changes": 31,
+        "patch": "@@ -76,10 +76,12 @@ async def run_agent(domain: str, state: AgentState) -> dict:\n         data = await chat_json(system, user, timeout=120.0)\n         findings = [str(x) for x in (data.get(\"findings\") or [])][:4]\n         risk_note = str(data.get(\"risk_note\", \"\"))\n+        confidence = int(data.get(\"confidence\", 60))\n     except OllamaError as exc:\n         logger.warning(\"%s agent failed: %s\", domain, exc)\n         findings = []\n         risk_note = f\"Agent call failed ({exc}); files were not analyzed by AI for this domain.\"\n+        confidence = 0\n     duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)\n \n     return {\n@@ -90,6 +92,7 @@ async def run_agent(domain: str, state: AgentState) -> dict:\n             files_reviewed=[f.filename for f in files],\n             findings=findings,\n             risk_note=risk_note,\n+            confidence=confidence,\n         ),\n         f\"{domain}_status\": {\n             \"agent\": domain,\n@@ -163,7 +166,15 @@ async def coordinator_node(state: AgentState) -> dict:\n     rag = state.get(\"rag\")\n \n     start = time.perf_counter_ns()\n-    data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)\n+    try:\n+        data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)\n+    except OllamaError as exc:\n+        # Don't let a coordinator failure blow away the whole graph run: the specialist\n+        # agents above may have already succeeded, and we want their findings/timing to\n+        # survive so the fallback report is accurate rather than looking instantaneous.\n+        duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)\n+        logger.warning(\"Coordinator failed: %s\", exc)\n+        return {\"coordinator_error\": str(exc), \"coordinator_duration_ms\": duration_ms}\n \n     risk_value = str(data.get(\"overall_risk\", \"MEDIUM\")).upper()\n     overall_risk = RiskLevel(risk_value) if risk_value in RiskLevel.__members__ else RiskLevel.MEDIUM\n@@ -196,13 +207,29 @@ async def coordinator_node(state: AgentState) -> dict:\n         for domain in [\"security\", \"performance\", \"database\", \"api\", \"tests\"]\n     ]\n \n+    strategy = str(data.get(\"rollout_strategy\", \"Standard\")).strip()\n+    valid_strategies = {\"Standard\", \"Canary\", \"Blue/Green\", \"Manual Approval\"}\n+    if strategy not in valid_strategies:\n+        # Best-effort normalization if the model drifted from the enum (e.g. \"Standard merge\").\n+        lowered = strategy.lower()\n+        if \"canary\" in lowered:\n+            strategy = \"Canary\"\n+        elif \"blue\" in lowered or \"green\" in lowered:\n+            strategy = \"Blue/Green\"\n+        elif \"manual\" in lowered or \"approval\" in lowered:\n+            strategy = \"Manual Approval\"\n+        else:\n+            strategy = \"Standard\"\n+\n     result = AIAnalysis(\n         overall_risk=overall_risk,\n         confidence=int(data.get(\"confidence\", 60)),\n         summary=data.get(\"summary\", \"\"),\n+        executive_summary=data.get(\"executive_summary\") or data.get(\"summary\", \"\"),\n         architectural_impact=data.get(\"architectural_impact\", \"\"),\n+        affected_subsystems=[str(x) for x in (data.get(\"affected_subsystems\") or [])],\n         operational_risks=data.get(\"operational_risks\", []) or [],\n-        rollout_strategy=data.get(\"rollout_strategy\", \"Standard merge\"),\n+        rollout_strategy=strategy,\n         rollout_reason=data.get(\"rollout_reason\", \"\"),\n         rollback_required=bool(data.get(\"rollback_required\", False)),\n         test_coverage_estimate_pct=data.get(\"test_coverage_estimate_pct\"),"
+      },
+      {
+        "filename": "backend/engine/agents/prompts.py",
+        "status": "modified",
+        "additions": 38,
+        "deletions": 11,
+        "changes": 49,
+        "patch": "@@ -32,54 +32,81 @@\n Respond with ONLY a JSON object, no prose, no markdown fences:\n {\n   \"findings\": [\"<short, specific finding>\", ...],\n-  \"risk_note\": \"<one sentence: does this domain add risk to this PR, and why>\"\n+  \"risk_note\": \"<one sentence: does this domain add risk to this PR, and why>\",\n+  \"confidence\": <integer 0-100, how confident you are in this assessment given what you were shown>\n }\n List at most 4 findings. If you see nothing concerning, return an empty findings list and\n-say so plainly in risk_note \u2014 do not invent a problem to seem thorough.\n+say so plainly in risk_note \u2014 do not invent a problem to seem thorough. Lower your confidence\n+if the diff was truncated or you were only shown a partial patch.\n \"\"\"\n \n COORDINATOR_SYSTEM_PROMPT = \"\"\"You are the coordinating Staff Engineer for a pull request risk\n review. You do not see the raw diff yourself \u2014 instead you receive:\n 1. Deterministic heuristic findings (rule-based, already scored).\n 2. Structured findings from five specialist agents (security, performance, database, API\n    compatibility, test coverage), each of which reviewed only its own relevant files.\n-3. Optionally, excerpts retrieved from the repository's own documentation (README,\n+3. Optionally, excerpts retrieved from the repository\u2019s own documentation (README,\n    architecture docs) that describe conventions or context for this codebase.\n \n Your job is to SYNTHESIZE these into one consolidated deployment risk assessment. Every claim\n you make must be traceable to one of the three inputs above \u2014 do not introduce new facts about\n-the code that weren't reported to you. If an agent found nothing (applicable: false or empty\n+the code that weren\u2019t reported to you. If an agent found nothing (applicable: false or empty\n findings), do not treat its domain as risky.\n \n+CRITICAL \u2014 Evidence-only writing rules for executive_summary:\n+- Every sentence must be grounded in a concrete fact from the heuristic findings, agent\n+  outputs, or repository documentation provided to you.\n+- Do NOT use hedging phrases such as: \"unclear impact\", \"may affect\", \"without further\n+  context\", \"it is unclear\", \"could potentially\", \"we cannot determine\".\n+- If you genuinely do not know something, state what IS known and stop. Do not speculate\n+  about what might be affected.\n+- The executive_summary must be 3\u20134 sentences. Name the actual files or subsystems that\n+  changed, not vague categories. Example of a good sentence: \"This PR updates the GitHub\n+  Actions workflow to replace llama3.1 with llama3.2 and modifies the report renderer.\"\n+  Example of a bad sentence: \"The impact on the FastAPI backend is unclear without further\n+  context from the repository documentation.\"\n+\n Respond with ONLY a single JSON object (no markdown fences, no prose before or after):\n {\n   \"overall_risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n   \"confidence\": <integer 0-100>,\n-  \"summary\": \"<2-3 sentence plain-English synthesis>\",\n-  \"architectural_impact\": \"<1-2 sentences>\",\n+  \"executive_summary\": \"<3-4 sentence evidence-backed executive summary: what changed, what the real risk is, what to know before approving \u2014 NO speculation, NO hedging>\",\n+  \"summary\": \"<2-3 sentence plain-English synthesis, same content as executive_summary but shorter>\",\n+  \"architectural_impact\": \"<1-2 sentences on which subsystems/services this PR affects and how they relate>\",\n+  \"affected_subsystems\": [\"<short subsystem name, e.g. 'Auth service', 'Checkout API', 'CI pipeline'>\", ...],\n   \"operational_risks\": [\"<short phrase>\", ...],\n-  \"rollout_strategy\": \"<short label, e.g. 'Canary' | 'Standard merge' | 'Feature-flagged rollout' | 'Staged rollout'>\",\n-  \"rollout_reason\": \"<1-2 sentences justifying the strategy, referencing which agent(s) or heuristic drove it>\",\n+  \"rollout_strategy\": \"Standard\" | \"Canary\" | \"Blue/Green\" | \"Manual Approval\",\n+  \"rollout_reason\": \"<2-3 sentences justifying the strategy \u2014 explain what would happen under each of the other strategies and why this one is the right trade-off, referencing which agent(s) or heuristic drove it>\",\n   \"rollback_required\": <true|false>,\n   \"test_coverage_estimate_pct\": <integer 0-100 or null>,\n   \"suggested_test_areas\": [\"<short phrase>\", ...],\n   \"risk_factors\": [ {\"key\": \"<snake_case>\", \"label\": \"<short label>\", \"passed\": <true|false>}, ... ],\n   \"file_risks\": [ {\"filename\": \"<path>\", \"risk\": \"LOW\"|\"MEDIUM\"|\"HIGH\", \"reason\": \"<short reason, cite which agent/heuristic>\"}, ... ]\n }\n Limit file_risks to the 5 files most likely to cause production issues, drawn from what the\n-agents actually reviewed. Limit risk_factors to at most 6 categories.\"\"\"\n+agents actually reviewed. Limit risk_factors to at most 6 categories. Choose rollout_strategy\n+from exactly the four listed options: 'Standard' for low-risk, well-tested changes; 'Canary'\n+for medium-risk changes to a live code path; 'Blue/Green' for infrastructure or schema changes\n+where instant rollback matters; 'Manual Approval' for high-risk changes (auth, payments,\n+secrets, or destructive migrations) that a human must explicitly sign off on.\"\"\"\n \n JUDGE_SYSTEM_PROMPT = \"\"\"You are a verification pass (LLM-as-judge) over another model's\n pull-request risk report. You are given the report plus the evidence it was supposed to be\n grounded in (agent findings and heuristic factors). Check whether the report's claims are\n actually supported by that evidence, or whether it invented specifics not present anywhere\n in the evidence.\n \n+Also flag any of the following speculation patterns if they appear in executive_summary:\n+- \"unclear impact\" / \"it is unclear\" / \"without further context\"\n+- \"may affect\" / \"could potentially\" / \"might impact\"\n+- Claims about subsystems that no agent reviewed or no heuristic triggered\n+\n Respond with ONLY JSON:\n {\n   \"grounded\": <true|false>,\n-  \"issues\": [\"<short description of an unsupported claim, if any>\", ...],\n+  \"issues\": [\"<short description of an unsupported claim or speculation phrase, if any>\", ...],\n   \"notes\": \"<one sentence overall assessment>\"\n }\n Be strict but fair: a reasonable synthesis or inference from the evidence is fine. Only flag\n-claims that reference specifics (file names, numbers, behaviors) not present in the evidence.\"\"\"\n+claims that reference specifics (file names, numbers, behaviors) not present in the evidence,\n+or that introduce speculation where the evidence is simply absent.\"\"\""
+      },
+      {
+        "filename": "backend/engine/agents/state.py",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0,
+        "changes": 1,
+        "patch": "@@ -24,5 +24,6 @@ class AgentState(TypedDict, total=False):\n \n     coordinator_result: AIAnalysis\n     coordinator_duration_ms: int\n+    coordinator_error: str\n     judge_result: JudgeVerdict\n     judge_duration_ms: int"
+      },
+      {
+        "filename": "backend/engine/ai_analyzer.py",
+        "status": "modified",
+        "additions": 14,
+        "deletions": 5,
+        "changes": 19,
+        "patch": "@@ -118,9 +118,11 @@ async def analyze_with_ai(pr: PullRequestData, heuristics: HeuristicResult) -> A\n             overall_risk=overall_risk,\n             confidence=int(data.get(\"confidence\", 60)),\n             summary=data.get(\"summary\", \"\"),\n+            executive_summary=data.get(\"executive_summary\") or data.get(\"summary\", \"\"),\n             architectural_impact=data.get(\"architectural_impact\", \"\"),\n+            affected_subsystems=[str(x) for x in (data.get(\"affected_subsystems\") or [])],\n             operational_risks=data.get(\"operational_risks\", []) or [],\n-            rollout_strategy=data.get(\"rollout_strategy\", \"Standard merge\"),\n+            rollout_strategy=data.get(\"rollout_strategy\", \"Standard\"),\n             rollout_reason=data.get(\"rollout_reason\", \"\"),\n             rollback_required=bool(data.get(\"rollback_required\", False)),\n             test_coverage_estimate_pct=data.get(\"test_coverage_estimate_pct\"),\n@@ -147,17 +149,24 @@ def analyze_with_heuristics_only(\n     top_files = sorted(pr.files, key=lambda f: f.changes, reverse=True)[:5]\n \n     fallback_note = reason or \"Ollama isn't configured.\"\n+    summary_text = (\n+        f\"Heuristic-only analysis ({fallback_note}): \"\n+        f\"{len(triggered)} risk signal(s) triggered across {pr.changed_files_count} changed file(s).\"\n+    )\n \n     return AIAnalysis(\n         overall_risk=risk,\n         confidence=55,\n-        summary=(\n-            f\"Heuristic-only analysis ({fallback_note}): \"\n-            f\"{len(triggered)} risk signal(s) triggered across {pr.changed_files_count} changed file(s).\"\n+        summary=summary_text,\n+        executive_summary=(\n+            summary_text\n+            + \" This is a deterministic, rule-based assessment only \u2014 no LLM synthesis, specialist\"\n+            \" agent review, or repository context was available for this run.\"\n         ),\n         architectural_impact=\"Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment.\",\n+        affected_subsystems=sorted({f.label for f in triggered}),\n         operational_risks=[f.label for f in triggered][:5],\n-        rollout_strategy=\"Canary\" if risk != RiskLevel.LOW else \"Standard merge\",\n+        rollout_strategy=\"Manual Approval\" if risk == RiskLevel.HIGH else (\"Canary\" if risk == RiskLevel.MEDIUM else \"Standard\"),\n         rollout_reason=\"Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.\",\n         rollback_required=risk == RiskLevel.HIGH,\n         test_coverage_estimate_pct=None,"
+      },
+      {
+        "filename": "backend/engine/categories.py",
+        "status": "added",
+        "additions": 549,
+        "deletions": 0,
+        "changes": 549,
+        "patch": "@@ -0,0 +1,549 @@\n+\ufefffrom __future__ import annotations\n+\n+import re\n+from typing import Any\n+\n+from .models import (\n+    AgentDecision,\n+    AgentFinding,\n+    AIAnalysis,\n+    ArchitecturalImpact,\n+    ChangedFile,\n+    ConfidenceExplanation,\n+    EvidenceItem,\n+    HeuristicResult,\n+    PullRequestData,\n+    RAGContext,\n+    RiskCategory,\n+    RiskLevel,\n+)\n+\n+# Fixed taxonomy the whole report is scored against. Order matters.\n+CATEGORIES = [\n+    \"Authentication\",\n+    \"API\",\n+    \"Data Layer\",\n+    \"Infrastructure\",\n+    \"CI/CD\",\n+    \"Dependencies\",\n+    \"Secrets\",\n+    \"Tests\",\n+    \"Application/Core Logic\",\n+    \"Documentation\",\n+]\n+\n+# ---------------------------------------------------------------------------\n+# Persistence-layer guard \u2014 used to prevent domain/Pydantic model files from\n+# being classified as Data Layer just because they contain \"model\" in the path.\n+# A file is a persistence-layer file only if it has one of these signals:\n+#   - lives under a migrations/ or alembic/ directory\n+#   - is a .sql file\n+#   - is a Prisma schema\n+#   - is under db/ or database/ (explicit DB subdirectory prefix)\n+#   - is a Flyway / Liquibase migration\n+#   - contains an ORM base-class declaration pattern in a db-prefixed path\n+# ---------------------------------------------------------------------------\n+_PERSISTENCE_LAYER_RE = re.compile(\n+    r\"\"\"\n+    (^|/)alembic(/|\\.)              # Alembic migration directories\n+    | (^|/)migrations?(/|\\.)        # Django / Flask / SQLAlchemy migrations folder\n+    | (^|/)flyway(/|\\.)             # Flyway\n+    | (^|/)liquibase(/|\\.)          # Liquibase\n+    | (^|/)prisma(/|\\.)             # Prisma schema directory\n+    | schema\\.prisma$               # Prisma schema file by name\n+    | \\.sql$                        # Raw SQL files\n+    | (^|/)db/models?(/|\\.)         # models under an explicit db/ subdirectory\n+    | (^|/)database/models?(/|\\.)   # models under an explicit database/ subdirectory\n+    | (^|/)entity(/|\\.)             # JPA / TypeORM entity classes\n+    | (^|/)repository(/|\\.)         # Repository / DAO pattern\n+    \"\"\",\n+    re.I | re.VERBOSE,\n+)\n+\n+\n+def _is_persistence_layer_file(filename: str) -> bool:\n+    \"\"\"True only when there is hard evidence that the file belongs to the database\n+    / persistence layer. A file named models.py in a general engine/, app/, or\n+    backend/ directory does NOT qualify unless the path itself carries DB signals.\"\"\"\n+    return bool(_PERSISTENCE_LAYER_RE.search(filename))\n+\n+\n+# Category patterns \u2014 broad enough to match by convention, but Data Layer has\n+# an extra guard (_is_persistence_layer_file) applied in classify_files().\n+CATEGORY_PATTERNS: dict[str, re.Pattern] = {\n+    \"Authentication\": re.compile(\n+        r\"(^|/)(auth|authn|authz|login|session|jwt|oauth|sso|permissions?|rbac)(/|\\.)\",\n+        re.I,\n+    ),\n+    \"API\": re.compile(\n+        r\"(^|/)(routes?|controllers?|api|graphql|endpoints?|openapi|swagger)(/|\\.)\",\n+        re.I,\n+    ),\n+    # Data Layer pattern intentionally conservative \u2014 only matches paths that carry\n+    # explicit persistence-layer vocabulary. \"models.py\" in an engine/ dir does not match.\n+    \"Data Layer\": re.compile(\n+        r\"\"\"\n+        (^|/)alembic(/|\\.)\n+        | (^|/)migrations?(/|\\.)\n+        | (^|/)flyway(/|\\.)\n+        | (^|/)liquibase(/|\\.)\n+        | (^|/)prisma(/|\\.)\n+        | schema\\.prisma$\n+        | \\.sql$\n+        | (^|/)db/models?(/|\\.)\n+        | (^|/)database/models?(/|\\.)\n+        | (^|/)entity(/|\\.)\n+        | (^|/)repository(/|\\.)\n+        \"\"\",\n+        re.I | re.VERBOSE,\n+    ),\n+    \"Infrastructure\": re.compile(\n+        r\"(^|/)(terraform|infra|deploy|docker|k8s|kubernetes|helm|ansible)(/|\\.)|dockerfile\",\n+        re.I,\n+    ),\n+    \"CI/CD\": re.compile(\n+        r\"(^|/)(\\.github/workflows|\\.gitlab-ci|jenkinsfile|\\.circleci|\\.travis)\",\n+        re.I,\n+    ),\n+    \"Dependencies\": re.compile(\n+        r\"(^|/)(package(-lock)?\\.json|requirements.*\\.txt|pyproject\\.toml|poetry\\.lock\"\n+        r\"|go\\.(mod|sum)|pom\\.xml|build\\.gradle|gemfile|cargo\\.(toml|lock)|yarn\\.lock)$\",\n+        re.I,\n+    ),\n+    \"Secrets\": re.compile(\n+        r\"(^|/)(\\.env|secrets?|credentials?|vault|\\.pem|\\.key$|\\.p12$)\",\n+        re.I,\n+    ),\n+    \"Tests\": re.compile(\n+        r\"(^|/)(tests?|__tests__|spec)(/|\\.)|\\.(test|spec)\\.\",\n+        re.I,\n+    ),\n+    # General implementation files: engine/, core/, lib/, etc. \u2014 catch-all for\n+    # domain models, service layer, renderers, clients, etc.\n+    \"Application/Core Logic\": re.compile(\n+        r\"\"\"\n+        (^|/)(engine|core|lib|src|app|backend)(/[^/]+)*/\n+        (models?|services?|utils?|helpers?|handlers?|\n+        processors?|pipelines?|analyzers?|renderers?|\n+        clients?|managers?|agent\\w*)\n+        \\.(py|ts|js|go|java|rb|rs)$\n+        \"\"\",\n+        re.I | re.VERBOSE,\n+    ),\n+    \"Documentation\": re.compile(\n+        r\"(^|/)(readme|docs?/|changelog|architecture)|\\.(md|mdx|rst)$\",\n+        re.I,\n+    ),\n+}\n+\n+_SEVERITY_ORDER = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2}\n+\n+_RECOMMENDED_ACTIONS = {\n+    \"Authentication\": \"Require an explicit review from the security/auth code-owners group before merge.\",\n+    \"API\": \"Confirm the change is backward compatible or bump the API version; update client SDKs/docs.\",\n+    \"Data Layer\": \"Verify the migration is reversible and run it against a staging copy of production data first.\",\n+    \"Infrastructure\": \"Review the deployment/IaC diff with an SRE and stage the change through a lower environment.\",\n+    \"CI/CD\": \"Dry-run the updated pipeline on a branch before merging to avoid breaking the main build.\",\n+    \"Dependencies\": \"Check the changelog/CVE feed for the bumped packages before approving.\",\n+    \"Secrets\": \"Confirm no plaintext secret was committed; rotate any credential that may have been exposed.\",\n+    \"Tests\": \"Add or restore coverage for the touched code paths before this ships.\",\n+    \"Application/Core Logic\": \"Review the logic change for correctness; ensure the affected code paths have test coverage.\",\n+    \"Documentation\": \"No action required beyond a standard doc review.\",\n+}\n+\n+# Per-category point weight per evidence item. High-sensitivity categories\n+# contribute more to the score per file; documentation and CI contribute less,\n+# so a PR that only touches docs/workflow/reports does not dominate the score.\n+_CATEGORY_EVIDENCE_WEIGHT = {\n+    \"Authentication\": 30,\n+    \"API\": 25,\n+    \"Data Layer\": 25,\n+    \"Infrastructure\": 20,\n+    \"CI/CD\": 12,\n+    \"Dependencies\": 10,\n+    \"Secrets\": 35,\n+    \"Tests\": 10,\n+    \"Application/Core Logic\": 8,\n+    \"Documentation\": 5,\n+}\n+\n+_SEVERITY_BONUS = {RiskLevel.HIGH: 25, RiskLevel.MEDIUM: 10, RiskLevel.LOW: 0}\n+\n+\n+def _confidence_label(score: int) -> str:\n+    \"\"\"Convert a 0-100 confidence score to a human-readable tier.\"\"\"\n+    if score >= 75:\n+        return \"High\"\n+    if score >= 50:\n+        return \"Medium\"\n+    return \"Low\"\n+\n+\n+def _snippet_for(f: ChangedFile, max_lines: int = 6, max_chars: int = 320) -> str | None:\n+    if not f.patch:\n+        return None\n+    lines = [l for l in f.patch.splitlines() if l.startswith(\"+\") or l.startswith(\"-\")][:max_lines]\n+    return \"\\n\".join(lines)[:max_chars] or None\n+\n+\n+def _explain_file_for_category(f: ChangedFile, category: str) -> str:\n+    \"\"\"Generate a human-readable explanation of why a file is relevant to the\n+    given category. Favours specificity over generic \"file changed\" language.\"\"\"\n+    fname = f.filename.lower()\n+    change_summary = (\n+        f\"{'added' if f.status == 'added' else 'removed' if f.status == 'removed' else 'modified'}\"\n+        f\", +{f.additions}/\\u2212{f.deletions} lines\"\n+    )\n+\n+    if category == \"Authentication\":\n+        return (\n+            f\"This file is part of the authentication/authorization layer ({change_summary}). \"\n+            \"Changes here can affect session handling, token validation, or access control.\"\n+        )\n+    if category == \"API\":\n+        return (\n+            f\"This file defines or modifies API routes, controllers, or endpoint handlers ({change_summary}). \"\n+            \"Changes here may alter the public API contract consumed by clients.\"\n+        )\n+    if category == \"Data Layer\":\n+        return (\n+            f\"This file contains persistence-layer changes ({change_summary}): \"\n+            \"a migration, ORM schema definition, or raw SQL that directly affects the database state.\"\n+        )\n+    if category == \"Infrastructure\":\n+        return (\n+            f\"This file configures infrastructure or deployment ({change_summary}). \"\n+            \"Changes here can affect how the application is packaged, deployed, or scaled.\"\n+        )\n+    if category == \"CI/CD\":\n+        return (\n+            f\"This file defines the CI/CD pipeline ({change_summary}). \"\n+            \"Changes here affect how automated tests, builds, and deployments are triggered.\"\n+        )\n+    if category == \"Dependencies\":\n+        if \"lock\" in fname:\n+            return (\n+                f\"This lock file was updated ({change_summary}), indicating a dependency version change. \"\n+                \"Review the diff for removed packages or major version bumps that could introduce \"\n+                \"breaking changes or new vulnerabilities.\"\n+            )\n+        return (\n+            f\"This dependency manifest was changed ({change_summary}). \"\n+            \"Added, removed, or updated packages may introduce new vulnerabilities or break compatibility.\"\n+        )\n+    if category == \"Secrets\":\n+        return (\n+            f\"This file may contain or expose credentials ({change_summary}). \"\n+            \"Review carefully to ensure no plaintext secrets were committed.\"\n+        )\n+    if category == \"Tests\":\n+        return (\n+            f\"This test file was modified ({change_summary}). \"\n+            \"Review whether coverage was added or removed alongside the production code change.\"\n+        )\n+    if category == \"Application/Core Logic\":\n+        basename = f.filename.split(\"/\")[-1]\n+        if \"model\" in fname:\n+            return (\n+                f\"This file defines internal domain or data-transfer models ({change_summary}). \"\n+                \"No ORM base classes, Alembic migrations, or persistence-layer signals were detected \"\n+                \"in this path\\u2014this is a Pydantic/dataclass domain model, not a database schema.\"\n+            )\n+        if \"report\" in fname or \"render\" in fname:\n+            return (\n+                f\"This file handles report generation or output rendering ({change_summary}). \"\n+                \"Changes here affect how risk assessments are formatted and presented.\"\n+            )\n+        if \"service\" in fname:\n+            return (\n+                f\"This file contains service-layer orchestration logic ({change_summary}). \"\n+                \"Review for correctness of the changed business rules or data flow.\"\n+            )\n+        if \"client\" in fname:\n+            return (\n+                f\"This file is an external client adapter ({change_summary}). \"\n+                \"Review changes to API calls, retry logic, or error-handling behaviour.\"\n+            )\n+        if \"agent\" in fname:\n+            return (\n+                f\"This file is part of the LangGraph agent pipeline ({change_summary}). \"\n+                \"Changes here affect specialist-agent routing, prompts, or coordinator synthesis.\"\n+            )\n+        return (\n+            f\"This is a core implementation file ({change_summary}). \"\n+            f\"Review the changed logic in `{basename}` for correctness and test coverage.\"\n+        )\n+    if category == \"Documentation\":\n+        return (\n+            f\"This documentation file was {f.status} ({change_summary}). \"\n+            \"No runtime or production code was changed by this file.\"\n+        )\n+    return f\"{category} file changed ({change_summary}).\"\n+\n+\n+def classify_files(files: list[ChangedFile]) -> dict[str, list[ChangedFile]]:\n+    \"\"\"Deterministically buckets changed files into the fixed category taxonomy.\n+\n+    Key invariant enforced here:\n+    - A file named models.py in engine/, app/, or a general backend directory is\n+      classified as Application/Core Logic, NOT Data Layer, unless the path itself\n+      contains migration/sql/alembic/prisma signals.\n+    - Unmatched implementation files (.py/.ts/.js/.go) fall into Application/Core Logic\n+      as a safe catch-all rather than being silently dropped.\n+    \"\"\"\n+    buckets: dict[str, list[ChangedFile]] = {c: [] for c in CATEGORIES}\n+    for f in files:\n+        matched_specific = False\n+        for category, pattern in CATEGORY_PATTERNS.items():\n+            if category == \"Application/Core Logic\":\n+                # Applied as fallback below; skip in the primary pass.\n+                continue\n+            if not pattern.search(f.filename):\n+                continue\n+            # Extra guard: Data Layer requires hard persistence-layer evidence.\n+            if category == \"Data Layer\" and not _is_persistence_layer_file(f.filename):\n+                continue\n+            buckets[category].append(f)\n+            matched_specific = True\n+\n+        # Application/Core Logic: match the pattern OR fall back for any unmatched\n+        # implementation file so nothing is silently dropped from the report.\n+        app_pattern = CATEGORY_PATTERNS[\"Application/Core Logic\"]\n+        if app_pattern.search(f.filename) or (\n+            not matched_specific\n+            and re.search(r\"\\.(py|ts|js|go|java|rb|rs)$\", f.filename, re.I)\n+        ):\n+            buckets[\"Application/Core Logic\"].append(f)\n+\n+    return buckets\n+\n+\n+# Maps the LLM specialist-agent domains onto the fixed category taxonomy so agent\n+# findings can enrich the deterministic file-based evidence with reasoning.\n+_AGENT_DOMAIN_TO_CATEGORIES = {\n+    \"security\": [\"Authentication\", \"Secrets\"],\n+    \"database\": [\"Data Layer\"],\n+    \"api\": [\"API\"],\n+    \"tests\": [\"Tests\"],\n+    \"performance\": [\"Infrastructure\"],\n+}\n+\n+\n+def build_category_breakdown(\n+    pr: PullRequestData,\n+    heuristics: HeuristicResult,\n+    ai: AIAnalysis,\n+) -> list[RiskCategory]:\n+    \"\"\"Builds the per-category score breakdown. Deterministic file classification is\n+    the backbone (so this works even in the heuristics-only fallback path); when agent\n+    findings are available they enrich the evidence with reasoning and confidence.\"\"\"\n+    buckets = classify_files(pr.files)\n+\n+    file_risk_by_name = {fr.filename: fr for fr in ai.file_risks}\n+    findings_by_domain = {af.agent: af for af in ai.agent_findings}\n+\n+    categories: list[RiskCategory] = []\n+    for category in CATEGORIES:\n+        files = buckets[category]\n+        evidence: list[EvidenceItem] = []\n+        worst = RiskLevel.LOW\n+\n+        # Pull in reasoning from whichever specialist agent covers this category.\n+        agent_note = None\n+        for domain, cats in _AGENT_DOMAIN_TO_CATEGORIES.items():\n+            if category in cats:\n+                finding = findings_by_domain.get(domain)\n+                if finding and finding.applicable:\n+                    agent_note = finding\n+\n+        for f in files:\n+            fr = file_risk_by_name.get(f.filename)\n+            # Authentication/Secrets/Data Layer default to MEDIUM when unreviewed;\n+            # all other categories default to LOW.\n+            if fr:\n+                severity = fr.risk\n+            elif category in (\"Authentication\", \"Secrets\", \"Data Layer\"):\n+                severity = RiskLevel.MEDIUM\n+            else:\n+                severity = RiskLevel.LOW\n+\n+            if _SEVERITY_ORDER[severity] > _SEVERITY_ORDER[worst]:\n+                worst = severity\n+\n+            # Evidence explanation: prefer LLM reasoning \u2192 agent finding \u2192 deterministic label.\n+            if fr and fr.reason:\n+                explanation = fr.reason\n+            elif agent_note and agent_note.findings:\n+                explanation = agent_note.findings[0]\n+            else:\n+                explanation = _explain_file_for_category(f, category)\n+\n+            # Confidence: High if LLM reviewed; Medium if an agent covered the domain;\n+            # Low if purely path-heuristic.\n+            if fr:\n+                raw_confidence = 75\n+            elif agent_note:\n+                raw_confidence = agent_note.confidence\n+            else:\n+                raw_confidence = 50\n+\n+            evidence.append(\n+                EvidenceItem(\n+                    file_path=f.filename,\n+                    snippet=_snippet_for(f),\n+                    explanation=explanation,\n+                    confidence=raw_confidence,\n+                    severity=severity,\n+                    recommended_action=_RECOMMENDED_ACTIONS.get(category, \"Review before merge.\"),\n+                )\n+            )\n+\n+        # Special case: no tests touched is evidence for the Tests category.\n+        if category == \"Tests\" and not files and not heuristics.tests_touched:\n+            evidence.append(\n+                EvidenceItem(\n+                    file_path=\"(no test files touched)\",\n+                    snippet=None,\n+                    explanation=(\n+                        \"This PR modifies implementation files but does not add or update any \"\n+                        \"test files. Confirm whether the changed logic paths are covered by \"\n+                        \"existing tests, or whether new tests are warranted.\"\n+                    ),\n+                    confidence=85,\n+                    severity=RiskLevel.MEDIUM,\n+                    recommended_action=_RECOMMENDED_ACTIONS[\"Tests\"],\n+                )\n+            )\n+            worst = RiskLevel.MEDIUM\n+\n+        # Calibrated scoring: per-item weight varies by category sensitivity,\n+        # plus a severity bonus. This prevents low-sensitivity categories like\n+        # Documentation from dominating the overall score.\n+        weight = _CATEGORY_EVIDENCE_WEIGHT.get(category, 8)\n+        score = min(100, len(evidence) * weight + _SEVERITY_BONUS.get(worst, 0))\n+        if not evidence:\n+            score = 0\n+            worst = RiskLevel.LOW\n+\n+        summary = (\n+            f\"{len(files)} file(s) touched in this category.\"\n+            if files\n+            else \"No files in this category were changed.\"\n+        )\n+        if category == \"Tests\" and not files and not heuristics.tests_touched:\n+            summary = \"No test files were touched by this PR.\"\n+\n+        categories.append(\n+            RiskCategory(\n+                category=category,\n+                score=score,\n+                status=worst,\n+                summary=summary,\n+                evidence=evidence,\n+                reasons=[e.explanation for e in evidence[:5]],\n+                evidence_files=[f.filename for f in files],\n+            )\n+        )\n+\n+    return categories\n+\n+\n+def build_architectural_impact(\n+    pr: PullRequestData,\n+    categories: list[RiskCategory],\n+    ai: AIAnalysis,\n+) -> ArchitecturalImpact:\n+    affected = [c.category for c in categories if c.evidence]\n+    narrative = ai.architectural_impact or (\n+        f\"This change touches {', '.join(affected)}.\" if affected else \"No clearly affected subsystems were detected.\"\n+    )\n+    return ArchitecturalImpact(affected_subsystems=affected, narrative=narrative)\n+\n+\n+def build_confidence_explanation(\n+    heuristics: HeuristicResult,\n+    ai: AIAnalysis,\n+    rag: RAGContext,\n+    ai_enabled: bool,\n+    judge_grounded: bool | None,\n+) -> ConfidenceExplanation:\n+    repo_context_available = bool(rag.scanned and rag.retrieved)\n+\n+    heuristic_band = (\n+        RiskLevel.HIGH if heuristics.score >= 70\n+        else RiskLevel.MEDIUM if heuristics.score >= 35\n+        else RiskLevel.LOW\n+    )\n+    agreement = heuristic_band == ai.overall_risk\n+\n+    all_agents_ran = ai_enabled and all(af.applicable or not af.files_reviewed for af in ai.agent_findings)\n+    completeness = \"complete\" if (ai_enabled and repo_context_available and all_agents_ran) else \"partial\"\n+\n+    reasons = []\n+    reasons.append(\n+        \"Repository documentation was retrieved and used as context\"\n+        if repo_context_available\n+        else \"No repository documentation was available to ground the analysis\"\n+    )\n+    reasons.append(\n+        \"the heuristic score and the LLM's risk assessment agree\"\n+        if agreement\n+        else \"the heuristic score and the LLM's risk assessment diverge; a conservative bias was applied\"\n+    )\n+    if not ai_enabled:\n+        reasons.append(\"the AI pipeline was unavailable; this is a deterministic heuristics-only assessment\")\n+    elif judge_grounded is False:\n+        reasons.append(\"the groundedness judge flagged claims that weren't fully traceable to evidence\")\n+        completeness = \"partial\"\n+\n+    narrative = \"; \".join(reasons) + \".\"\n+\n+    score = ai.confidence\n+    if completeness == \"partial\":\n+        score = min(score, 65)\n+    if judge_grounded is False:\n+        score = min(score, 55)\n+\n+    level = _confidence_label(score)\n+\n+    return ConfidenceExplanation(\n+        score=score,\n+        level=level,\n+        repository_context_available=repo_context_available,\n+        llm_heuristic_agreement=agreement,\n+        evidence_completeness=completeness,\n+        narrative=narrative,\n+    )\n+\n+\n+def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:\n+    decisions: list[AgentDecision] = []\n+    for domain in [\"security\", \"database\", \"api\", \"tests\", \"performance\"]:\n+        status = state.get(f\"{domain}_status\")\n+        finding: AgentFinding | None = state.get(f\"{domain}_finding\")\n+        if status is None or finding is None:\n+            continue\n+        if not finding.applicable:\n+            decision = \"Skipped \\u2014 no files in this agent\\u2019s domain were touched\"\n+            reasoning = finding.risk_note\n+            confidence = 100\n+        elif finding.findings:\n+            decision = f\"Concerns raised ({len(finding.findings)})\"\n+            reasoning = \" \".join(finding.findings[:2])\n+            confidence = finding.confidence\n+        else:\n+            decision = \"No concerns raised\"\n+            reasoning = finding.risk_note or \"Reviewed the relevant files and found nothing actionable.\"\n+            confidence = finding.confidence\n+\n+        decisions.append(\n+            AgentDecision(\n+                agent=domain,\n+                label=status[\"label\"] if isinstance(status, dict) else status.label,\n+                decision=decision,\n+                reasoning=reasoning,\n+                confidence=confidence,\n+                execution_time_ms=status[\"duration_ms\"] if isinstance(status, dict) else status.duration_ms,\n+            )\n+        )\n+    return decisions"
+      },
+      {
+        "filename": "backend/engine/demo_data.py",
+        "status": "modified",
+        "additions": 136,
+        "deletions": 30,
+        "changes": 166,
+        "patch": "@@ -6,12 +6,16 @@\n \"\"\"\n from __future__ import annotations\n \n+from .categories import build_agent_decisions\n from .models import (\n     AgentFinding,\n     AIAnalysis,\n     AnalyzeResponse,\n+    ArchitecturalImpact,\n     ChangedFile,\n+    ConfidenceExplanation,\n     DemoSummary,\n+    DeploymentRecommendation,\n     FileRisk,\n     HeuristicFactor,\n     HeuristicResult,\n@@ -315,6 +319,83 @@\n                 FileRisk(filename=\"migrations/0042_add_refund_reason.sql\", risk=RiskLevel.LOW, reason=\"Additive, nullable column; low risk on its own.\"),\n             ],\n         ),\n+        report=RiskReport(\n+            decision=\"ALLOW\",\n+            risk_score=35,\n+            confidence=84,\n+            deployment_strategy=\"Blue/Green\",\n+            risk_breakdown={\"Database\": 35, \"Tests\": 15},\n+            findings=[\"Database migration detected\", \"No test files touched\"],\n+            evidence=[\n+                \"Database migration detected: Matched in migrations/0042_add_refund_reason.sql\",\n+                \"migrations/backfill_refund_reason.py: Untested backfill logic against production data volume.\",\n+            ],\n+            timeline=[\n+                TimelineStage(stage=\"Repository Loaded\", duration_ms=90),\n+                TimelineStage(stage=\"Repository Context Retrieved\", duration_ms=60),\n+                TimelineStage(stage=\"Database\", duration_ms=210),\n+                TimelineStage(stage=\"Final Decision\", duration_ms=140),\n+            ],\n+            agent_statuses=[\n+                AgentStatus(agent=\"security\", label=\"Security\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+                AgentStatus(agent=\"database\", label=\"Database\", status=\"Completed\", files_reviewed=3, duration_ms=210),\n+                AgentStatus(agent=\"api\", label=\"API Compatibility\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+                AgentStatus(agent=\"tests\", label=\"Test Coverage\", status=\"Completed\", files_reviewed=0, duration_ms=90),\n+                AgentStatus(agent=\"performance\", label=\"Performance\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+            ],\n+            agent_decisions=build_agent_decisions({\n+                \"database_status\": {\"agent\": \"database\", \"label\": \"Database\", \"status\": \"Completed\", \"files_reviewed\": 3, \"duration_ms\": 210},\n+                \"database_finding\": AgentFinding(\n+                    agent=\"database\", label=\"Database\", applicable=True,\n+                    files_reviewed=[\"migrations/0042_add_refund_reason.sql\", \"migrations/backfill_refund_reason.py\", \"schema.sql\"],\n+                    findings=[\"Migration is additive and reversible\", \"Backfill script has no explicit idempotency guard\"],\n+                    risk_note=\"Schema change is safe on its own; the backfill script is the main residual risk.\",\n+                    confidence=78,\n+                ),\n+                \"tests_status\": {\"agent\": \"tests\", \"label\": \"Test Coverage\", \"status\": \"Completed\", \"files_reviewed\": 0, \"duration_ms\": 90},\n+                \"tests_finding\": AgentFinding(\n+                    agent=\"tests\", label=\"Test Coverage\", applicable=True, files_reviewed=[],\n+                    findings=[\"No test verifies backfill idempotency if re-run\"],\n+                    risk_note=\"No test files were touched despite new migration logic.\",\n+                    confidence=70,\n+                ),\n+            }),\n+            repository_metadata=RepositoryMetadata(\n+                default_branch=\"main\",\n+                technologies=[\"Python\"],\n+                files_changed_count=3,\n+            ),\n+            summary=\"A low-risk, additive schema change: a nullable column plus a backfill script.\",\n+            executive_summary=\"This PR adds a nullable refund_reason column and a backfill script for \"\n+            \"historical invoice rows. The schema change itself is backward compatible and low risk, but the \"\n+            \"backfill script lacks an idempotency guard and could contend for row locks on large tables if \"\n+            \"re-run. Recommend a Blue/Green rollout so the migration can be validated independently before \"\n+            \"any application code depends on the new column.\",\n+            architectural_impact=ArchitecturalImpact(\n+                affected_subsystems=[\"Database\", \"Tests\"],\n+                narrative=\"Backward-compatible schema addition to the billing-platform invoices table; safe \"\n+                \"to deploy ahead of the application code that will eventually read refund_reason.\",\n+            ),\n+            confidence_explanation=ConfidenceExplanation(\n+                score=84,\n+                repository_context_available=False,\n+                llm_heuristic_agreement=True,\n+                evidence_completeness=\"complete\",\n+                narrative=\"This assessment is based on complete evidence: the database specialist agent \"\n+                \"reviewed all three changed files, and the heuristic score and LLM risk assessment agree \"\n+                \"this is a medium-risk, well-scoped migration.\",\n+            ),\n+            deployment_recommendation=DeploymentRecommendation(\n+                strategy=\"Blue/Green\",\n+                reason=\"Ship the migration ahead of any code that depends on it, and monitor backfill job \"\n+                \"duration and lock contention on the invoices table before cutting application traffic over.\",\n+                alternatives_considered=[\n+                    \"Standard (too risky \u2014 no visibility into backfill lock contention before it runs)\",\n+                    \"Canary (insufficient isolation for a schema-level change)\",\n+                ],\n+                rollback_required=False,\n+            ),\n+        ),\n     ),\n     \"docs-refactor\": AnalyzeResponse(\n         source=\"demo\",\n@@ -381,37 +462,62 @@\n             file_risks=[\n                 FileRisk(filename=\"docs/README.md\", risk=RiskLevel.LOW, reason=\"Navigation links updated; verify none are stale.\"),\n             ],\n-            report=RiskReport(\n-                decision=\"ALLOW\",\n-                risk_score=0,\n-                confidence=97,\n-                deployment_strategy=\"Standard merge\",\n-                risk_breakdown={\n-                    \"General\": 0,\n-                },\n-                findings=[\n-                    \"Documentation-only change\",\n-                ],\n-                evidence=[\n-                    \"No source, config, or infrastructure files were touched.\",\n-                ],\n-                timeline=[\n-                    TimelineStage(stage=\"Repository Loaded\", duration_ms=20),\n-                    TimelineStage(stage=\"Repository Context Retrieved\", duration_ms=45),\n-                    TimelineStage(stage=\"Final Decision\", duration_ms=70),\n-                ],\n-                agent_statuses=[\n-                    AgentStatus(agent=\"security\", label=\"Security\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n-                    AgentStatus(agent=\"database\", label=\"Database\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n-                    AgentStatus(agent=\"api\", label=\"API Compatibility\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n-                    AgentStatus(agent=\"tests\", label=\"Test Coverage\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n-                    AgentStatus(agent=\"performance\", label=\"Performance\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+        ),\n+        report=RiskReport(\n+            decision=\"ALLOW\",\n+            risk_score=0,\n+            confidence=97,\n+            deployment_strategy=\"Standard\",\n+            risk_breakdown={\n+                \"General\": 0,\n+            },\n+            findings=[\n+                \"Documentation-only change\",\n+            ],\n+            evidence=[\n+                \"No source, config, or infrastructure files were touched.\",\n+            ],\n+            timeline=[\n+                TimelineStage(stage=\"Repository Loaded\", duration_ms=20),\n+                TimelineStage(stage=\"Repository Context Retrieved\", duration_ms=45),\n+                TimelineStage(stage=\"Final Decision\", duration_ms=70),\n+            ],\n+            agent_statuses=[\n+                AgentStatus(agent=\"security\", label=\"Security\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+                AgentStatus(agent=\"database\", label=\"Database\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+                AgentStatus(agent=\"api\", label=\"API Compatibility\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+                AgentStatus(agent=\"tests\", label=\"Test Coverage\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+                AgentStatus(agent=\"performance\", label=\"Performance\", status=\"Skipped\", files_reviewed=0, duration_ms=0),\n+            ],\n+            repository_metadata=RepositoryMetadata(\n+                default_branch=\"main\",\n+                technologies=[\"Markdown\"],\n+                files_changed_count=4,\n+            ),\n+            summary=\"Documentation-only change with no impact on application behavior.\",\n+            executive_summary=\"This PR is a pure documentation restructuring with no source, config, or \"\n+            \"infrastructure changes. It carries no production risk and is safe to merge without a staged rollout.\",\n+            architectural_impact=ArchitecturalImpact(\n+                affected_subsystems=[\"Documentation\"],\n+                narrative=\"None \u2014 no source, config, or infrastructure files were touched.\",\n+            ),\n+            confidence_explanation=ConfidenceExplanation(\n+                score=97,\n+                repository_context_available=False,\n+                llm_heuristic_agreement=True,\n+                evidence_completeness=\"complete\",\n+                narrative=\"This assessment is based on complete evidence: the change touches only \"\n+                \"documentation files, and the heuristic score and LLM risk assessment agree there is no \"\n+                \"production risk.\",\n+            ),\n+            deployment_recommendation=DeploymentRecommendation(\n+                strategy=\"Standard\",\n+                reason=\"No runtime code paths are affected; a normal merge is sufficient.\",\n+                alternatives_considered=[\n+                    \"Canary (unnecessary \u2014 no code path is affected)\",\n+                    \"Manual Approval (unnecessary overhead for a docs-only change)\",\n                 ],\n-                repository_metadata=RepositoryMetadata(\n-                    default_branch=\"main\",\n-                    technologies=[\"Markdown\"],\n-                    files_changed_count=4,\n-                ),\n+                rollback_required=False,\n             ),\n         ),\n     ),"
+      },
+      {
+        "filename": "backend/engine/heuristics.py",
+        "status": "modified",
+        "additions": 9,
+        "deletions": 3,
+        "changes": 12,
+        "patch": "@@ -9,7 +9,10 @@\n     (\"auth\", \"Authentication logic touched\", 40, re.compile(r\"(^|/)(auth|authn|authz|login|session)(/|\\.)\", re.I)),\n     (\"payment\", \"Payment / billing logic touched\", 45, re.compile(r\"(^|/)(payment|billing|checkout|stripe|invoice)(/|\\.)\", re.I)),\n     (\"config\", \"Configuration files changed\", 30, re.compile(r\"(^|/)(config|settings|\\.env|helm|k8s|kubernetes)(/|\\.)\", re.I)),\n-    (\"infra\", \"Infrastructure / deployment files changed\", 30, re.compile(r\"(^|/)(terraform|infra|deploy|docker|ci|\\.github/workflows)(/|\\.)\", re.I)),\n+    # Reduced from 30 \u2192 20: a CI/CD workflow change is lower risk than a genuine\n+    # IaC or deployment change (Terraform, Kubernetes, Docker). The workflow\n+    # heuristic fires frequently on routine PRs and was over-inflating scores.\n+    (\"infra\", \"Infrastructure / deployment files changed\", 20, re.compile(r\"(^|/)(terraform|infra|deploy|docker|ci|\\.github/workflows)(/|\\.)\", re.I)),\n     (\"migration\", \"Database migration detected\", 35, re.compile(r\"(^|/)(migrations?|schema)(/|\\.).*\\.(sql|py|ts|js)$|alembic\", re.I)),\n     (\"api_contract\", \"Public API contract changed\", 25, re.compile(r\"(^|/)(routes?|controllers?|api|graphql|schema\\.graphql|openapi)(/|\\.)\", re.I)),\n ]\n@@ -49,13 +52,16 @@ def analyze(pr: PullRequestData) -> HeuristicResult:\n \n     non_test_files = [f for f in pr.files if not TEST_PATH_RE.search(f.filename)]\n     if non_test_files and not tests_touched:\n-        score += 15\n+        # Reduced from 15 \u2192 10: missing tests is a signal worth noting, but a\n+        # documentation-heavy or report-generation PR should not score 15 pts\n+        # just because it touches no test files.\n+        score += 10\n         factors.append(\n             HeuristicFactor(\n                 key=\"no_tests\",\n                 label=\"No test files touched\",\n                 triggered=True,\n-                weight=15,\n+                weight=10,\n                 reason=\"This PR changes code but doesn't add or modify any tests.\",\n             )\n         )"
+      },
+      {
+        "filename": "backend/engine/models.py",
+        "status": "modified",
+        "additions": 67,
+        "deletions": 6,
+        "changes": 73,
+        "patch": "@@ -94,7 +94,8 @@ class RAGChunk(BaseModel):\n \n     path: str\n     snippet: str\n-    score: float = 0.0  # similarity score, higher = more relevant\n+    score: float = 0.0  # cosine similarity score; positive = more relevant\n+    retrieval_reason: str = \"\"  # human-readable explanation of why this chunk was retrieved\n \n \n class RAGContext(BaseModel):\n@@ -119,6 +120,20 @@ class AgentFinding(BaseModel):\n     files_reviewed: list[str] = Field(default_factory=list)\n     findings: list[str] = Field(default_factory=list)\n     risk_note: str = \"\"\n+    confidence: int = 60  # 0-100, how confident this agent is in its own findings\n+\n+\n+class AgentDecision(BaseModel):\n+    \"\"\"Surfaces one node's execution inside the LangGraph pipeline: what it decided,\n+    why, how confident it was, and how long it took. This is what makes the multi-agent\n+    graph auditable rather than a black box.\"\"\"\n+\n+    agent: str\n+    label: str\n+    decision: str  # e.g. \"Skipped \u2014 no files in domain\" | \"No concerns raised\" | \"Concerns raised\"\n+    reasoning: str\n+    confidence: int  # 0-100\n+    execution_time_ms: int\n \n \n class JudgeVerdict(BaseModel):\n@@ -149,18 +164,57 @@ class RepositoryMetadata(BaseModel):\n     files_changed_count: int\n \n \n+class EvidenceItem(BaseModel):\n+    \"\"\"A single, structured piece of evidence backing a finding: exactly what file,\n+    what changed, why it matters, how confident we are, how severe it is, and what to\n+    do about it. This is the atomic unit auditors trace claims back to.\"\"\"\n+\n+    file_path: str\n+    snippet: Optional[str] = None  # code / diff excerpt or retrieved RAG context\n+    explanation: str\n+    confidence: int  # 0-100\n+    severity: RiskLevel\n+    recommended_action: str\n+\n+\n class RiskCategory(BaseModel):\n+    \"\"\"One row of the risk score breakdown, e.g. 'Authentication' or 'CI/CD'.\"\"\"\n+\n     category: str\n-    score: int\n+    score: int  # 0-100\n     status: RiskLevel\n+    summary: str = \"\"\n+    evidence: list[EvidenceItem] = Field(default_factory=list)\n+    # legacy fields kept for renderer / frontend backward compatibility\n     reasons: list[str] = Field(default_factory=list)\n     evidence_files: list[str] = Field(default_factory=list)\n \n \n-class EvidenceItem(BaseModel):\n-    category: str\n-    files: list[str] = Field(default_factory=list)\n-    reason: str\n+class ArchitecturalImpact(BaseModel):\n+    \"\"\"Which subsystems this PR touches and how they relate, in plain English.\"\"\"\n+\n+    affected_subsystems: list[str] = Field(default_factory=list)\n+    narrative: str = \"\"\n+\n+\n+class ConfidenceExplanation(BaseModel):\n+    \"\"\"Explains *why* the model is as confident as it is, instead of a bare number.\"\"\"\n+\n+    score: int  # 0-100\n+    level: str = \"Medium\"  # \"High\" | \"Medium\" | \"Low\" \u2014 human-readable tier derived from score\n+    repository_context_available: bool\n+    llm_heuristic_agreement: bool\n+    evidence_completeness: str  # \"complete\" | \"partial\"\n+    narrative: str = \"\"\n+\n+\n+class DeploymentRecommendation(BaseModel):\n+    \"\"\"The chosen rollout strategy plus the reasoning and alternatives considered.\"\"\"\n+\n+    strategy: str  # \"Standard\" | \"Canary\" | \"Blue/Green\" | \"Manual Approval\"\n+    reason: str = \"\"\n+    alternatives_considered: list[str] = Field(default_factory=list)\n+    rollback_required: bool = False\n \n \n class RepositoryIntelligence(BaseModel):\n@@ -192,18 +246,25 @@ class RiskReport(BaseModel):\n     evidence_items: list[EvidenceItem] = Field(default_factory=list)\n     timeline: list[TimelineStage] = Field(default_factory=list)\n     agent_statuses: list[AgentStatus] = Field(default_factory=list)\n+    agent_decisions: list[AgentDecision] = Field(default_factory=list)\n     repository_metadata: RepositoryMetadata\n     repository_intelligence: RepositoryIntelligence = Field(default_factory=RepositoryIntelligence)\n     execution_metrics: Optional[ExecutionMetrics] = None\n     summary: str = \"\"\n+    executive_summary: str = \"\"\n     high_risk_files: list[str] = Field(default_factory=list)\n+    architectural_impact: ArchitecturalImpact = Field(default_factory=ArchitecturalImpact)\n+    confidence_explanation: Optional[ConfidenceExplanation] = None\n+    deployment_recommendation: Optional[DeploymentRecommendation] = None\n \n \n class AIAnalysis(BaseModel):\n     overall_risk: RiskLevel\n     confidence: int  # 0-100\n     summary: str\n+    executive_summary: str = \"\"\n     architectural_impact: str\n+    affected_subsystems: list[str] = Field(default_factory=list)\n     operational_risks: list[str] = Field(default_factory=list)\n     rollout_strategy: str\n     rollout_reason: str"
+      },
+      {
+        "filename": "backend/engine/rag/retriever.py",
+        "status": "modified",
+        "additions": 37,
+        "deletions": 2,
+        "changes": 39,
+        "patch": "@@ -11,6 +11,31 @@\n logger = logging.getLogger(\"pr_sentinel.rag\")\n \n \n+def _infer_retrieval_reason(path: str, snippet: str) -> str:\n+    \"\"\"Generate a human-readable explanation of why a document chunk was retrieved,\n+    based on its source path and a brief look at the snippet content.\"\"\"\n+    path_lower = path.lower()\n+    if \"readme\" in path_lower:\n+        return \"Describes the project architecture, component overview, and heuristic scoring pipeline.\"\n+    if \"architecture\" in path_lower or \"design\" in path_lower:\n+        return \"Contains architecture or design documentation relevant to the changed subsystems.\"\n+    if \"contributing\" in path_lower:\n+        return \"Describes development conventions and contribution guidelines for this repository.\"\n+    if \"changelog\" in path_lower or \"history\" in path_lower:\n+        return \"Contains the project changelog; useful for cross-referencing prior related changes.\"\n+    if \"api\" in path_lower or \"openapi\" in path_lower or \"swagger\" in path_lower:\n+        return \"Documents the public API surface; relevant to API-contract change detection.\"\n+    if \"deploy\" in path_lower or \"infra\" in path_lower or \"ops\" in path_lower:\n+        return \"Describes deployment or infrastructure conventions for this codebase.\"\n+    if \"security\" in path_lower or \"auth\" in path_lower:\n+        return \"Contains security or authentication documentation relevant to this domain.\"\n+    if \"test\" in path_lower:\n+        return \"Describes testing conventions or test coverage expectations for this repository.\"\n+    # Generic fallback: use a snippet of the content itself\n+    first_line = snippet.strip().splitlines()[0][:120] if snippet.strip() else \"\"\n+    return f\"Contains relevant repository context: \\\"{first_line}\\\"\" if first_line else \"Retrieved as relevant repository context for this analysis.\"\n+\n+\n def _build_query(pr: PullRequestData) -> str:\n     top_files = \", \".join(f.filename for f in pr.files[:10])\n     return f\"{pr.title}. Labels: {', '.join(pr.labels)}. Files changed: {top_files}\"\n@@ -35,7 +60,12 @@ async def get_rag_context(pr: PullRequestData, token: str = \"\") -> RAGContext:\n             )\n \n         retrieved = [\n-            RAGChunk(path=hit[\"path\"], snippet=hit[\"snippet\"][:500], score=1 - hit[\"distance\"])\n+            RAGChunk(\n+                path=hit[\"path\"],\n+                snippet=hit[\"snippet\"][:500],\n+                score=max(0.0, 1.0 - hit[\"distance\"]),\n+                retrieval_reason=_infer_retrieval_reason(hit[\"path\"], hit[\"snippet\"]),\n+            )\n             for hit in raw_hits\n         ]\n \n@@ -67,7 +97,12 @@ async def get_rag_context(pr: PullRequestData, token: str = \"\") -> RAGContext:\n         )\n \n     retrieved = [\n-        RAGChunk(path=hit[\"path\"], snippet=hit[\"snippet\"][:500], score=1 - hit[\"distance\"])\n+        RAGChunk(\n+            path=hit[\"path\"],\n+            snippet=hit[\"snippet\"][:500],\n+            score=max(0.0, 1.0 - hit[\"distance\"]),\n+            retrieval_reason=_infer_retrieval_reason(hit[\"path\"], hit[\"snippet\"]),\n+        )\n         for hit in raw_hits\n     ]\n "
+      },
+      {
+        "filename": "backend/engine/report_renderer.py",
+        "status": "modified",
+        "additions": 166,
+        "deletions": 88,
+        "changes": 254,
+        "patch": "@@ -15,138 +15,216 @@ def _decision_emoji(decision: str) -> str:\n     return \"\ud83d\udeab\" if decision == \"BLOCK\" else \"\u2705\"\n \n \n+def _format_timestamp(raw: str) -> str:\n+    \"\"\"Render an ISO-8601 timestamp (often with microseconds, e.g.\n+    '2026-08-06T10:04:37.276438+00:00') as a short, human-readable UTC\n+    string, e.g. 'Aug 6, 2026, 10:04 UTC'. Falls back to the raw value\n+    (trimmed to whole seconds) if parsing fails.\"\"\"\n+    try:\n+        dt = datetime.fromisoformat(raw)\n+        if dt.tzinfo is None:\n+            dt = dt.replace(tzinfo=timezone.utc)\n+        dt = dt.astimezone(timezone.utc)\n+        return f\"{dt.strftime('%b %-d, %Y, %H:%M')} UTC\"\n+    except (ValueError, TypeError):\n+        return raw[:19].replace(\"T\", \" \") + \" UTC\" if len(raw) >= 19 else raw\n+\n+\n+def _format_duration(ms: int | float) -> str:\n+    \"\"\"Render a millisecond duration as a compact, human-readable string.\n+    Sub-second durations stay in ms (e.g. '820ms'); anything at or above\n+    one second is shown in seconds (e.g. '4.5s'), and a minute or more\n+    is shown as 'Xm Ys'.\"\"\"\n+    ms = round(ms)\n+    if ms < 1000:\n+        return f\"{ms}ms\"\n+    seconds = ms / 1000\n+    if seconds < 60:\n+        text = f\"{seconds:.1f}\"\n+        if text.endswith(\".0\"):\n+            text = text[:-2]\n+        return f\"{text}s\"\n+    minutes, rem_seconds = divmod(seconds, 60)\n+    return f\"{int(minutes)}m {rem_seconds:.0f}s\"\n+\n+\n def render_markdown(response: AnalyzeResponse) -> str:\n-    \"\"\"Generate a professional Markdown report suitable for GitHub PR comments and artifacts.\"\"\"\n+    \"\"\"Generate a production engineering risk assessment, in Markdown, suitable for\n+    GitHub PR comments: explainable (every score traces to evidence), auditable\n+    (agent-by-agent and RAG-by-RAG breakdown), and free of raw heuristic-speak.\"\"\"\n     pr = response.pr\n     report = response.report\n     ai = response.ai\n     rag = response.rag\n     metrics = report.execution_metrics\n-    generated = metrics.generated_at if metrics else datetime.now(timezone.utc).isoformat()\n+    generated_raw = metrics.generated_at if metrics else datetime.now(timezone.utc).isoformat()\n+    generated = _format_timestamp(generated_raw)\n+\n+    decision_emoji = _decision_emoji(report.decision)\n \n     lines: list[str] = [\n-        \"# PR Sentinel \u2014 Deployment Risk Report\",\n+        \"# PR Sentinel \u2014 Release Risk Assessment\",\n+        \"\",\n+        f\"**Generated:** {generated}  \u00b7  **Repository:** [{pr.repository.full_name}]({pr.url})  \u00b7  **PR:** #{pr.number}\",\n         \"\",\n-        f\"**Generated:** {generated}\",\n+        f\"### {decision_emoji} {report.decision} \u2014 {_risk_label(ai.overall_risk)} risk (score {report.risk_score}/100)\",\n         \"\",\n-        \"## Summary\",\n+        \"## Executive Summary\",\n         \"\",\n-        report.summary or ai.summary,\n+        report.executive_summary or report.summary or ai.summary,\n         \"\",\n-        f\"| Field | Value |\",\n-        f\"|-------|-------|\",\n+        \"| | |\",\n+        \"|---|---|\",\n         f\"| **Decision** | `{report.decision}` |\",\n         f\"| **Overall Risk** | `{_risk_label(ai.overall_risk)}` |\",\n         f\"| **Risk Score** | {report.risk_score} / 100 |\",\n-        f\"| **Confidence** | {report.confidence}% |\",\n-        f\"| **Deployment** | {report.deployment_strategy} |\",\n+        f\"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% \u2014 {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |\",\n+        f\"| **Recommended Deployment** | {report.deployment_strategy} |\",\n         \"\",\n-        \"## Repository\",\n+        \"## Pull Request\",\n         \"\",\n-        f\"- **Repository:** [{pr.repository.full_name}]({pr.url})\",\n-        f\"- **PR:** #{pr.number} \u2014 {pr.title}\",\n+        f\"- **Title:** {pr.title}\",\n         f\"- **Author:** @{pr.author}\",\n         f\"- **Branch:** `{pr.head_branch or 'unknown'}` \u2192 `{pr.base_branch or report.repository_intelligence.default_branch or 'main'}`\",\n-        f\"- **Language:** {report.repository_intelligence.primary_language or pr.repository.primary_language or 'Unknown'}\",\n-        f\"- **Framework:** {report.repository_intelligence.framework or pr.repository.framework or 'Unknown'}\",\n-        f\"- **Stars:** {pr.repository.stars:,}\",\n+        f\"- **Language / Framework:** {report.repository_intelligence.primary_language or pr.repository.primary_language or 'Unknown'} / \"\n+        f\"{report.repository_intelligence.framework or pr.repository.framework or 'Unknown'}\",\n         f\"- **Files Changed:** {pr.changed_files_count} (+{pr.additions}/-{pr.deletions})\",\n-        f\"- **Commits:** {len(pr.commit_messages)}\",\n         f\"- **Merge Status:** {pr.mergeable_state or 'unknown'}\",\n         \"\",\n     ]\n \n-    intel = report.repository_intelligence\n-    if intel.containerization or intel.ci_provider or intel.infrastructure:\n-        lines.extend([\"## Repository Intelligence\", \"\"])\n-        if intel.containerization:\n-            lines.append(f\"- **Containerization:** {intel.containerization}\")\n-        if intel.ci_provider:\n-            lines.append(f\"- **CI Provider:** {intel.ci_provider}\")\n-        if intel.infrastructure:\n-            lines.append(f\"- **Infrastructure:** {', '.join(intel.infrastructure)}\")\n-        lines.append(f\"- **Estimated Size:** {intel.estimated_size}\")\n-        lines.append(f\"- **Default Branch:** `{intel.default_branch or 'main'}`\")\n+    # --- Architectural Impact -------------------------------------------------\n+    impact = report.architectural_impact\n+    lines.extend([\"## Architectural Impact\", \"\"])\n+    if impact.affected_subsystems:\n+        lines.append(\"**Affected subsystems:** \" + \", \".join(f\"`{s}`\" for s in impact.affected_subsystems))\n         lines.append(\"\")\n+    lines.append(impact.narrative or \"No clearly affected subsystems were detected.\")\n+    lines.append(\"\")\n \n+    # --- Score breakdown by category -------------------------------------------\n     if report.risk_categories:\n-        lines.extend([\"## Risk Breakdown\", \"\"])\n+        lines.extend([\"## Risk Score Breakdown\", \"\"])\n+        lines.append(\"| Category | Status | Score | Evidence |\")\n+        lines.append(\"|---|---|---|---|\")\n         for cat in report.risk_categories:\n-            lines.append(f\"### {cat.category} \u2014 `{_risk_label(cat.status)}` (score: {cat.score})\")\n-            for reason in cat.reasons:\n-                lines.append(f\"- {reason}\")\n-            if cat.evidence_files:\n-                files = \", \".join(f\"`{f}`\" for f in cat.evidence_files[:5])\n-                lines.append(f\"- **Evidence files:** {files}\")\n-            lines.append(\"\")\n+            lines.append(f\"| {cat.category} | `{_risk_label(cat.status)}` | {cat.score}/100 | {len(cat.evidence)} item(s) |\")\n+        lines.append(\"\")\n \n-    if report.evidence_items:\n-        lines.extend([\"## Evidence\", \"\"])\n-        for item in report.evidence_items:\n-            lines.append(f\"### {item.category}\")\n-            if item.files:\n-                lines.append(f\"**Detected from:** {', '.join(f'`{f}`' for f in item.files)}\")\n-            lines.append(f\"**Reason:** {item.reason}\")\n+        for cat in report.risk_categories:\n+            if not cat.evidence:\n+                continue\n+            lines.append(f\"<details><summary><strong>{cat.category}</strong> \u2014 {_risk_label(cat.status)} ({cat.score}/100)</summary>\")\n+            lines.append(\"\")\n+            lines.append(cat.summary)\n+            lines.append(\"\")\n+            for item in cat.evidence:\n+                conf_lbl = \"High\" if item.confidence >= 75 else (\"Medium\" if item.confidence >= 50 else \"Low\")\n+                lines.append(f\"- **`{item.file_path}`** \u2014 {_risk_label(item.severity)} severity ({conf_lbl} confidence)\")\n+                lines.append(f\"  - _Why it matters:_ {item.explanation}\")\n+                if item.snippet:\n+                    lines.append(\"  - _Evidence:_\")\n+                    lines.append(\"    ```diff\")\n+                    for l in item.snippet.splitlines():\n+                        lines.append(f\"    {l}\")\n+                    lines.append(\"    ```\")\n+                lines.append(f\"  - _Recommended action:_ {item.recommended_action}\")\n+            lines.append(\"\")\n+            lines.append(\"</details>\")\n             lines.append(\"\")\n \n-    if report.high_risk_files:\n-        lines.extend([\"## Changed High-Risk Files\", \"\"])\n-        for f in report.high_risk_files:\n-            lines.append(f\"- `{f}`\")\n+    # --- LangGraph agent pipeline ------------------------------------------------\n+    if report.agent_decisions:\n+        lines.extend([\"## Agent Pipeline (LangGraph)\", \"\"])\n+        lines.append(\"Each specialist agent only reviews files in its own domain; the coordinator agent\")\n+        lines.append(\"synthesizes their output (below) into the executive summary and risk breakdown above.\")\n         lines.append(\"\")\n-\n-    lines.extend([\n-        \"## Deployment Recommendation\",\n-        \"\",\n-        f\"**Strategy:** {ai.rollout_strategy}\",\n-        \"\",\n-        f\"**Reason:** {ai.rollout_reason}\",\n-        \"\",\n-        f\"**Confidence:** {ai.confidence}%\",\n-        \"\",\n-        f\"**Rollback Required:** {'Yes' if ai.rollback_required else 'No'}\",\n-        \"\",\n-    ])\n-\n-    if report.agent_statuses:\n-        lines.extend([\"## Agent Pipeline\", \"\"])\n-        lines.append(\"| Agent | Status | Files | Duration |\")\n-        lines.append(\"|-------|--------|-------|----------|\")\n-        for status in report.agent_statuses:\n-            dur = f\"{status.duration_ms}ms\" if status.duration_ms else \"\u2014\"\n-            lines.append(\n-                f\"| {status.label} | {status.status} | {status.files_reviewed} | {dur} |\"\n-            )\n+        lines.append(\"| Agent | Decision | Confidence | Time |\")\n+        lines.append(\"|---|---|---|---|\")\n+        for d in report.agent_decisions:\n+            conf_lbl = \"High\" if d.confidence >= 75 else (\"Medium\" if d.confidence >= 50 else \"Low\")\n+            lines.append(f\"| {d.label} | {d.decision} | {conf_lbl} | {_format_duration(d.execution_time_ms)} |\")\n         lines.append(\"\")\n+        for d in report.agent_decisions:\n+            lines.append(f\"<details><summary><strong>{d.label}</strong> reasoning</summary>\")\n+            lines.append(\"\")\n+            lines.append(d.reasoning or \"_No further reasoning recorded._\")\n+            lines.append(\"\")\n+            lines.append(\"</details>\")\n+            lines.append(\"\")\n \n+    # --- RAG pipeline ------------------------------------------------------------\n+    lines.extend([\"## Repository Context (RAG)\", \"\"])\n     if rag.scanned:\n-        cache_label = \"Repository context cache hit\" if rag.cache_hit else \"Repository indexed\"\n-        lines.extend([\n-            \"## Repository Context (RAG)\",\n-            \"\",\n-            f\"**Status:** {cache_label}\",\n-            f\"**Branch:** `{rag.default_branch}`\",\n-            f\"**Indexed documents:** {rag.indexed_files} file(s), {rag.chunks_indexed} chunk(s)\",\n-            \"\",\n-        ])\n+        cache_label = \"cache hit\" if rag.cache_hit else \"freshly indexed\"\n+        lines.append(\n+            f\"Indexed **{rag.indexed_files}** repository document(s) into **{rag.chunks_indexed}** chunk(s) \"\n+            f\"from branch `{rag.default_branch}` ({cache_label}).\"\n+        )\n+        lines.append(\"\")\n         if rag.indexed_doc_paths:\n             lines.append(\"**Documents retrieved:**\")\n             for path in rag.indexed_doc_paths:\n                 lines.append(f\"- `{path}`\")\n             lines.append(\"\")\n         if rag.retrieved:\n-            lines.append(\"**Top retrieved chunks:**\")\n+            lines.append(\"**Top repository context retrieved:**\")\n+            lines.append(\"\")\n             for chunk in rag.retrieved[:5]:\n-                lines.append(f\"- `[{chunk.path}]` (score: {chunk.score:.2f})\")\n-                lines.append(f\"  > {chunk.snippet[:200]}...\")\n+                lines.append(f\"#### `{chunk.path}`\")\n+                if chunk.retrieval_reason:\n+                    lines.append(f\"**Why retrieved:** {chunk.retrieval_reason}\")\n+                lines.append(f\"```\")\n+                lines.append(f\"{chunk.snippet[:300]}{'...' if len(chunk.snippet) > 300 else ''}\")\n+                lines.append(f\"```\")\n+                lines.append(\"\")\n+        else:\n+            lines.append(\"No chunk was similar enough to the diff to be surfaced as supporting context.\")\n             lines.append(\"\")\n+    else:\n+        lines.append(f\"Repository context was not retrieved for this run ({rag.skip_reason or 'not available'}).\")\n+        lines.append(\"\")\n+\n+    # --- Deployment recommendation ------------------------------------------------\n+    rec = report.deployment_recommendation\n+    lines.extend([\"## Deployment Recommendation\", \"\"])\n+    if rec:\n+        lines.append(f\"**Chosen strategy: {rec.strategy}**\")\n+        lines.append(\"\")\n+        lines.append(rec.reason or ai.rollout_reason)\n+        lines.append(\"\")\n+        if rec.alternatives_considered:\n+            lines.append(\"**Alternatives considered and why they weren't chosen:**\")\n+            for alt in rec.alternatives_considered:\n+                lines.append(f\"- {alt}\")\n+            lines.append(\"\")\n+        lines.append(f\"**Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}\")\n+        lines.append(\"\")\n+\n+    # --- Confidence explanation ------------------------------------------------\n+    conf = report.confidence_explanation\n+    if conf:\n+        lines.extend([\"## Confidence\", \"\"])\n+        lines.append(f\"**{conf.level}** ({conf.score}% score) \u2014 {conf.evidence_completeness} evidence\")\n+        lines.append(\"\")\n+        lines.append(conf.narrative)\n+        lines.append(\"\")\n+        lines.append(f\"- Repository context available: {'Yes' if conf.repository_context_available else 'No'}\")\n+        lines.append(f\"- LLM and heuristic analyses agree: {'Yes' if conf.llm_heuristic_agreement else 'No'}\")\n+        lines.append(\"\")\n+\n+    if report.high_risk_files:\n+        lines.extend([\"## Changed High-Risk Files\", \"\"])\n+        for f in report.high_risk_files:\n+            lines.append(f\"- `{f}`\")\n+        lines.append(\"\")\n \n     if report.timeline:\n         lines.extend([\"## Execution Metrics\", \"\"])\n         total = metrics.total_duration_ms if metrics else sum(t.duration_ms for t in report.timeline)\n-        lines.append(f\"- **Total duration:** {total:,}ms\")\n+        lines.append(f\"- **Total duration:** {_format_duration(total)}\")\n         for stage in report.timeline:\n-            lines.append(f\"- {stage.stage}: {stage.duration_ms:,}ms\")\n+            lines.append(f\"- {stage.stage}: {_format_duration(stage.duration_ms)}\")\n         lines.append(\"\")\n \n     if response.judge:\n@@ -164,7 +242,7 @@ def render_markdown(response: AnalyzeResponse) -> str:\n \n     if not response.ai_enabled:\n         lines.extend([\n-            \"> \u26a0\ufe0f **Note:** AI analysis unavailable \u2014 report based on deterministic heuristics only.\",\n+            \"> \u26a0\ufe0f **Note:** AI analysis unavailable \u2014 this report reflects deterministic heuristics only.\",\n             f\"> {response.ai_error or 'Ollama unavailable'}\",\n             \"\",\n         ])\n@@ -262,7 +340,7 @@ def render_console(response: AnalyzeResponse) -> str:\n                 \"Failed\": _RED,\n                 \"Running\": _YELLOW,\n             }.get(status.status, _DIM)\n-            dur = f\" ({status.duration_ms}ms)\" if status.duration_ms else \"\"\n+            dur = f\" ({_format_duration(status.duration_ms)})\" if status.duration_ms else \"\"\n             lines.append(\n                 f\"  {_color('\u25cf', status_color)} {status.label}: \"\n                 f\"{_color(status.status, status_color)}{dur}\"\n@@ -287,8 +365,8 @@ def render_console(response: AnalyzeResponse) -> str:\n     metrics = report.execution_metrics\n     if metrics:\n         lines.append(\n-            f\"  {_color('Duration:', _DIM)} {metrics.total_duration_ms:,}ms \"\n-            f\"{_color('|', _DIM)} {_color('Generated:', _DIM)} {metrics.generated_at[:19]}\"\n+            f\"  {_color('Duration:', _DIM)} {_format_duration(metrics.total_duration_ms)} \"\n+            f\"{_color('|', _DIM)} {_color('Generated:', _DIM)} {_format_timestamp(metrics.generated_at)}\"\n         )\n         lines.append(\"\")\n "
+      },
+      {
+        "filename": "backend/engine/service.py",
+        "status": "modified",
+        "additions": 67,
+        "deletions": 18,
+        "changes": 85,
+        "patch": "@@ -6,14 +6,25 @@\n from . import github_client, heuristics\n from .agents.graph import run_pipeline\n from .ai_analyzer import analyze_with_heuristics_only\n+from .categories import (\n+    build_agent_decisions,\n+    build_architectural_impact,\n+    build_category_breakdown,\n+    build_confidence_explanation,\n+)\n from .config import get_settings\n from .github_client import GitHubError\n+from datetime import datetime, timezone\n+\n from .models import (\n     AIAnalysis,\n     AnalyzeResponse,\n     AnalyzeRequest,\n     AgentStatus,\n+    DeploymentRecommendation,\n+    ExecutionMetrics,\n     HeuristicResult,\n+    JudgeVerdict,\n     PullRequestData,\n     RAGContext,\n     RepositoryMetadata,\n@@ -24,6 +35,7 @@\n )\n from .ollama_client import OllamaError\n from .rag.retriever import get_rag_context\n+from .report_renderer import render_markdown\n \n \n def _infer_technologies(files: list[Any]) -> list[str]:\n@@ -113,7 +125,9 @@ def _build_timeline(\n         status = state.get(f\"{domain}_status\")\n         if status is None:\n             continue\n-        timeline.append(TimelineStage(stage=status.label, duration_ms=status.duration_ms))\n+        label = status[\"label\"] if isinstance(status, dict) else status.label\n+        duration = status[\"duration_ms\"] if isinstance(status, dict) else status.duration_ms\n+        timeline.append(TimelineStage(stage=label, duration_ms=duration))\n     final_ms = 0\n     if state.get(\"coordinator_duration_ms\") is not None:\n         final_ms += state[\"coordinator_duration_ms\"]\n@@ -132,6 +146,14 @@ def _infer_repository_metadata(pr: PullRequestData, rag: RAGContext) -> Reposito\n     )\n \n \n+_DEPLOYMENT_ALTERNATIVES = {\n+    \"Standard\": [\"Canary (unnecessary \u2014 low measured risk)\", \"Manual Approval (unnecessary overhead for this change)\"],\n+    \"Canary\": [\"Standard (skipped \u2014 this touches a live code path)\", \"Blue/Green (more than this change warrants)\"],\n+    \"Blue/Green\": [\"Canary (insufficient isolation for an infra/schema change)\", \"Standard (too risky to ship all-at-once)\"],\n+    \"Manual Approval\": [\"Canary (not sufficient given the sensitivity of what changed)\", \"Standard (too risky without human sign-off)\"],\n+}\n+\n+\n def _build_report(\n     pr: PullRequestData,\n     heuristics: HeuristicResult,\n@@ -140,37 +162,53 @@ def _build_report(\n     state: dict[str, Any],\n     repo_loaded_ms: int,\n     repo_context_ms: int,\n+    ai_enabled: bool,\n+    judge: JudgeVerdict | None,\n+    total_duration_ms: int,\n ) -> RiskReport:\n     decision = \"BLOCK\" if ai.overall_risk == RiskLevel.HIGH else \"ALLOW\"\n+    category_breakdown = build_category_breakdown(pr, heuristics, ai)\n+    architectural_impact = build_architectural_impact(pr, category_breakdown, ai)\n+    confidence_explanation = build_confidence_explanation(\n+        heuristics, ai, rag, ai_enabled, judge.grounded if judge else None\n+    )\n+    deployment_recommendation = DeploymentRecommendation(\n+        strategy=ai.rollout_strategy,\n+        reason=ai.rollout_reason,\n+        alternatives_considered=_DEPLOYMENT_ALTERNATIVES.get(ai.rollout_strategy, []),\n+        rollback_required=ai.rollback_required,\n+    )\n+\n     return RiskReport(\n         decision=decision,\n         risk_score=heuristics.score,\n-        confidence=ai.confidence,\n+        confidence=confidence_explanation.score,\n         deployment_strategy=ai.rollout_strategy,\n         risk_breakdown=_build_risk_breakdown(heuristics),\n+        risk_categories=category_breakdown,\n         findings=_build_findings(heuristics, ai),\n         evidence=_build_evidence(heuristics, ai),\n         timeline=_build_timeline(repo_loaded_ms, repo_context_ms, state),\n         agent_statuses=_build_agent_statuses(state),\n+        agent_decisions=build_agent_decisions(state),\n         repository_metadata=_infer_repository_metadata(pr, rag),\n+        summary=ai.summary,\n+        executive_summary=ai.executive_summary or ai.summary,\n+        architectural_impact=architectural_impact,\n+        confidence_explanation=confidence_explanation,\n+        deployment_recommendation=deployment_recommendation,\n+        execution_metrics=ExecutionMetrics(\n+            generated_at=datetime.now(timezone.utc).isoformat(),\n+            total_duration_ms=total_duration_ms,\n+            ai_enabled=ai_enabled,\n+            rag_cache_hit=rag.cache_hit,\n+        ),\n     )\n \n \n def render_comment(response: AnalyzeResponse) -> str:\n-    findings = response.report.findings or [response.ai.summary]\n-    details = \"\\n\".join(f\"\u2022 {item}\" for item in findings[:5])\n-    return (\n-        \"## PR Sentinel Report\\n\\n\"\n-        f\"Overall Risk: {response.ai.overall_risk}\\n\\n\"\n-        f\"Decision: {response.report.decision}\\n\\n\"\n-        f\"Risk Score: {response.report.risk_score} / 100\\n\\n\"\n-        f\"Confidence: {response.ai.confidence}%\\n\\n\"\n-        \"Top Findings\\n\\n\"\n-        f\"{details}\\n\\n\"\n-        \"Recommended Deployment\\n\\n\"\n-        f\"{response.ai.rollout_strategy}\\n\\n\"\n-        \"View Full Report\\n\"\n-    )\n+    \"\"\"Polished Markdown suitable for posting as a GitHub PR comment.\"\"\"\n+    return render_markdown(response)\n \n \n async def analyze_pr_url(pr_url: str, token: str = \"\") -> AnalyzeResponse:\n@@ -201,8 +239,14 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = \"\") -> Ana\n     state: dict[str, Any] = {}\n     try:\n         state = await run_pipeline(pr, heuristic_result, rag_context)\n-        ai_result = state[\"coordinator_result\"]\n+        ai_result = state.get(\"coordinator_result\")\n         judge_result = state.get(\"judge_result\")\n+        if ai_result is None:\n+            # Coordinator failed gracefully (see coordinator_node) \u2014 specialist agent\n+            # findings/timing in `state` are still real and get reflected in the report.\n+            ai_enabled = False\n+            ai_error = state.get(\"coordinator_error\") or \"Coordinator did not produce a result.\"\n+            ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)\n     except OllamaError as exc:\n         ai_enabled = False\n         ai_error = str(exc)\n@@ -212,7 +256,12 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = \"\") -> Ana\n         ai_error = f\"Unexpected error running the agent pipeline: {exc}\"\n         ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)\n \n-    report = _build_report(pr, heuristic_result, ai_result, rag_context, state, repo_loaded_ms, repo_context_ms)\n+    total_duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)\n+    report = _build_report(\n+        pr, heuristic_result, ai_result, rag_context, state,\n+        repo_loaded_ms, repo_context_ms, ai_enabled, judge_result,\n+        total_duration_ms,\n+    )\n     response = AnalyzeResponse(\n         pr=pr,\n         heuristics=heuristic_result,"
+      },
+      {
+        "filename": "backend/engine/tests/test_category_classifier.py",
+        "status": "added",
+        "additions": 170,
+        "deletions": 0,
+        "changes": 170,
+        "patch": "@@ -0,0 +1,170 @@\n+\ufefffrom __future__ import annotations\n+\n+import pytest\n+from engine.categories import (\n+    _confidence_label,\n+    _is_persistence_layer_file,\n+    classify_files,\n+)\n+from engine.agent_routing import files_for_domain\n+from engine.models import ChangedFile\n+\n+\n+def test_domain_model_not_database():\n+    \"\"\"Verify that backend/engine/models.py (a Pydantic model file) is categorized\n+    under 'Application/Core Logic' and NOT 'Data Layer'.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"backend/engine/models.py\",\n+            status=\"modified\",\n+            additions=64,\n+            deletions=5,\n+            changes=69,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"backend/engine/models.py\" in [f.filename for f in buckets[\"Application/Core Logic\"]]\n+    assert \"backend/engine/models.py\" not in [f.filename for f in buckets[\"Data Layer\"]]\n+\n+\n+def test_pydantic_models_not_database():\n+    \"\"\"Verify that app/models.py is categorized under Application/Core Logic and not Data Layer.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"app/models.py\",\n+            status=\"modified\",\n+            additions=10,\n+            deletions=2,\n+            changes=12,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"app/models.py\" in [f.filename for f in buckets[\"Application/Core Logic\"]]\n+    assert \"app/models.py\" not in [f.filename for f in buckets[\"Data Layer\"]]\n+\n+\n+def test_alembic_migration_is_database():\n+    \"\"\"Verify that actual migration files are categorized under Data Layer.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"alembic/versions/0001_add_users.py\",\n+            status=\"added\",\n+            additions=45,\n+            deletions=0,\n+            changes=45,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"alembic/versions/0001_add_users.py\" in [f.filename for f in buckets[\"Data Layer\"]]\n+\n+\n+def test_sql_file_is_database():\n+    \"\"\"Verify that raw SQL files are categorized under Data Layer.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"db/schema.sql\",\n+            status=\"modified\",\n+            additions=20,\n+            deletions=5,\n+            changes=25,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"db/schema.sql\" in [f.filename for f in buckets[\"Data Layer\"]]\n+\n+\n+def test_prisma_schema_is_database():\n+    \"\"\"Verify that Prisma schemas are categorized under Data Layer.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"prisma/schema.prisma\",\n+            status=\"modified\",\n+            additions=15,\n+            deletions=2,\n+            changes=17,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"prisma/schema.prisma\" in [f.filename for f in buckets[\"Data Layer\"]]\n+\n+\n+def test_workflow_is_cicd():\n+    \"\"\"Verify that GitHub Actions workflows are categorized under CI/CD.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\".github/workflows/pr-sentinel.yml\",\n+            status=\"modified\",\n+            additions=5,\n+            deletions=5,\n+            changes=10,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \".github/workflows/pr-sentinel.yml\" in [f.filename for f in buckets[\"CI/CD\"]]\n+\n+\n+def test_auth_file_is_authentication():\n+    \"\"\"Verify that auth files are categorized under Authentication.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"backend/auth/tokens.py\",\n+            status=\"modified\",\n+            additions=30,\n+            deletions=10,\n+            changes=40,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"backend/auth/tokens.py\" in [f.filename for f in buckets[\"Authentication\"]]\n+\n+\n+def test_readme_is_documentation():\n+    \"\"\"Verify that README files are categorized under Documentation.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"README.md\",\n+            status=\"modified\",\n+            additions=12,\n+            deletions=4,\n+            changes=16,\n+        )\n+    ]\n+    buckets = classify_files(files)\n+    assert \"README.md\" in [f.filename for f in buckets[\"Documentation\"]]\n+\n+\n+def test_confidence_label_bands():\n+    \"\"\"Verify confidence integer scores translate correctly to High/Medium/Low tiers.\"\"\"\n+    assert _confidence_label(85) == \"High\"\n+    assert _confidence_label(75) == \"High\"\n+    assert _confidence_label(60) == \"Medium\"\n+    assert _confidence_label(50) == \"Medium\"\n+    assert _confidence_label(40) == \"Low\"\n+    assert _confidence_label(10) == \"Low\"\n+\n+\n+def test_agent_routing_no_false_positive():\n+    \"\"\"Verify that agent_routing does not send backend/engine/models.py to the database specialist agent.\"\"\"\n+    files = [\n+        ChangedFile(\n+            filename=\"backend/engine/models.py\",\n+            status=\"modified\",\n+            additions=60,\n+            deletions=5,\n+            changes=65,\n+        )\n+    ]\n+    db_files = files_for_domain(files, \"database\")\n+    assert len(db_files) == 0\n+\n+    migration_files = [\n+        ChangedFile(\n+            filename=\"migrations/versions/001_init.py\",\n+            status=\"added\",\n+            additions=50,\n+            deletions=0,\n+            changes=50,\n+        )\n+    ]\n+    db_files_real = files_for_domain(migration_files, \"database\")\n+    assert len(db_files_real) == 1"
+      },
+      {
+        "filename": "backend/reports/report.json",
+        "status": "modified",
+        "additions": 671,
+        "deletions": 145,
+        "changes": 816,
+        "patch": null
+      },
+      {
+        "filename": "backend/reports/report.md",
+        "status": "modified",
+        "additions": 372,
+        "deletions": 14,
+        "changes": 386,
+        "patch": "@@ -1,23 +1,381 @@\n-## PR Sentinel Report\n+# PR Sentinel \u2014 Release Risk Assessment\n \n-Overall Risk: RiskLevel.LOW\n+**Generated:** 2026-08-06 12:29:37 UTC  \u00b7  **Repository:** [PrateekaBhat/pr-sentinel](https://github.com/PrateekaBhat/pr-sentinel/pull/2)  \u00b7  **PR:** #2\n \n-Decision: ALLOW\n+### \u2705 ALLOW \u2014 MEDIUM risk (score 50/100)\n \n-Risk Score: 0 / 100\n+## Executive Summary\n \n-Confidence: 55%\n+Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 3 risk signal(s) triggered across 23 changed file(s). This is a deterministic, rule-based assessment only \u2014 no LLM synthesis, specialist agent review, or repository context was available for this run.\n \n-Top Findings\n+| | |\n+|---|---|\n+| **Decision** | `ALLOW` |\n+| **Overall Risk** | `MEDIUM` |\n+| **Risk Score** | 50 / 100 |\n+| **Confidence** | Medium (55% \u2014 partial evidence) |\n+| **Recommended Deployment** | Canary |\n \n-\u2022 frontend/editor/src/core/platform/openExternalTab.test.ts\n-\u2022 frontend/editor/src/core/utils/externalUrl.test.ts\n-\u2022 frontend/editor/src/desktop/platform/openExternalTab.test.ts\n-\u2022 frontend/editor/src/core/utils/externalUrl.ts\n-\u2022 frontend/editor/src/core/components/viewer/LinkLayer.tsx\n+## Pull Request\n \n-Recommended Deployment\n+- **Title:** Improve report\n+- **Author:** @PrateekaBhat\n+- **Branch:** `feature-refactor` \u2192 `main`\n+- **Language / Framework:** Python / Unknown\n+- **Files Changed:** 23 (+1225/-605)\n+- **Merge Status:** clean\n \n-Standard merge\n+## Architectural Impact\n \n-View Full Report\n+**Affected subsystems:** `CI/CD`, `Dependencies`, `Tests`, `Application/Core Logic`, `Documentation`\n+\n+Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment.\n+\n+## Risk Score Breakdown\n+\n+| Category | Status | Score | Evidence |\n+|---|---|---|---|\n+| Authentication | `LOW` | 0/100 | 0 item(s) |\n+| API | `LOW` | 0/100 | 0 item(s) |\n+| Data Layer | `LOW` | 0/100 | 0 item(s) |\n+| Infrastructure | `LOW` | 0/100 | 0 item(s) |\n+| CI/CD | `LOW` | 12/100 | 1 item(s) |\n+| Dependencies | `LOW` | 10/100 | 1 item(s) |\n+| Secrets | `LOW` | 0/100 | 0 item(s) |\n+| Tests | `MEDIUM` | 20/100 | 1 item(s) |\n+| Application/Core Logic | `HIGH` | 100/100 | 10 item(s) |\n+| Documentation | `LOW` | 5/100 | 1 item(s) |\n+\n+<details><summary><strong>CI/CD</strong> \u2014 LOW (12/100)</summary>\n+\n+1 file(s) touched in this category.\n+\n+- **`.github/workflows/pr-sentinel.yml`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This file defines the CI/CD pipeline (modified, +20/\u22121 lines). Changes here affect how automated tests, builds, and deployments are triggered.\n+  - _Evidence:_\n+    ```diff\n+    -      OLLAMA_MODEL: llama3.1\n+    +      # llama3.1 (8B) is too slow for a CPU-only GitHub-hosted runner (2 vCPU) \u2014\n+    +      # a single agent call can exceed its own timeout before it even finishes\n+    +      # loading the model. llama3.2 (3B) trades some analysis depth for something\n+    +      # that actually completes in CI; run a\n+    ```\n+  - _Recommended action:_ Dry-run the updated pipeline on a branch before merging to avoid breaking the main build.\n+\n+</details>\n+\n+<details><summary><strong>Dependencies</strong> \u2014 LOW (10/100)</summary>\n+\n+1 file(s) touched in this category.\n+\n+- **`frontend/package-lock.json`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This lock file was updated (modified, +0/\u221242 lines), indicating a dependency version change. Review the diff for removed packages or major version bumps that could introduce breaking changes or new vulnerabilities.\n+  - _Evidence:_\n+    ```diff\n+    -      \"libc\": [\n+    -        \"glibc\"\n+    -      ],\n+    -      \"libc\": [\n+    -        \"glibc\"\n+    -      ],\n+    ```\n+  - _Recommended action:_ Check the changelog/CVE feed for the bumped packages before approving.\n+\n+</details>\n+\n+<details><summary><strong>Tests</strong> \u2014 MEDIUM (20/100)</summary>\n+\n+No test files were touched by this PR.\n+\n+- **`(no test files touched)`** \u2014 MEDIUM severity (High confidence)\n+  - _Why it matters:_ This PR modifies implementation files but does not add or update any test files. Confirm whether the changed logic paths are covered by existing tests, or whether new tests are warranted.\n+  - _Recommended action:_ Add or restore coverage for the touched code paths before this ships.\n+\n+</details>\n+\n+<details><summary><strong>Application/Core Logic</strong> \u2014 HIGH (100/100)</summary>\n+\n+10 file(s) touched in this category.\n+\n+- **`backend/engine/agents/nodes.py`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +29/\u22122 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.\n+  - _Evidence:_\n+    ```diff\n+    +        confidence = int(data.get(\"confidence\", 60))\n+    +        confidence = 0\n+    +            confidence=confidence,\n+    -    data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)\n+    +    try:\n+    +        data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state),\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/agents/prompts.py`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +15/\u22127 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.\n+  - _Evidence:_\n+    ```diff\n+    -  \"risk_note\": \"<one sentence: does this domain add risk to this PR, and why>\"\n+    +  \"risk_note\": \"<one sentence: does this domain add risk to this PR, and why>\",\n+    +  \"confidence\": <integer 0-100, how confident you are in this assessment given what you were shown>\n+    -say so plainly in risk_note \u2014 do not invent a problem to \n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/agents/state.py`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This file is part of the LangGraph agent pipeline (modified, +1/\u22120 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.\n+  - _Evidence:_\n+    ```diff\n+    +    coordinator_error: str\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/ai_analyzer.py`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This is a core implementation file (modified, +14/\u22125 lines). Review the changed logic in `ai_analyzer.py` for correctness and test coverage.\n+  - _Evidence:_\n+    ```diff\n+    +            executive_summary=data.get(\"executive_summary\") or data.get(\"summary\", \"\"),\n+    +            affected_subsystems=[str(x) for x in (data.get(\"affected_subsystems\") or [])],\n+    -            rollout_strategy=data.get(\"rollout_strategy\", \"Standard merge\"),\n+    +            rollout_strategy=data.get(\"rollout_strategy\", \"S\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/categories.py`** \u2014 HIGH severity (High confidence)\n+  - _Why it matters:_ 276 additions / 0 deletions in this file.\n+  - _Evidence:_\n+    ```diff\n+    +from __future__ import annotations\n+    +\n+    +import re\n+    +from typing import Any\n+    +\n+    +from .models import (\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/demo_data.py`** \u2014 MEDIUM severity (High confidence)\n+  - _Why it matters:_ 136 additions / 30 deletions in this file.\n+  - _Evidence:_\n+    ```diff\n+    +from .categories import build_agent_decisions\n+    +    ArchitecturalImpact,\n+    +    ConfidenceExplanation,\n+    +    DeploymentRecommendation,\n+    +        report=RiskReport(\n+    +            decision=\"ALLOW\",\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/models.py`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This file defines internal domain or data-transfer models (modified, +64/\u22125 lines). No ORM base classes, Alembic migrations, or persistence-layer signals were detected in this path\u2014this is a Pydantic/dataclass domain model, not a database schema.\n+  - _Evidence:_\n+    ```diff\n+    +    confidence: int = 60  # 0-100, how confident this agent is in its own findings\n+    +\n+    +\n+    +class AgentDecision(BaseModel):\n+    +    \"\"\"Surfaces one node's execution inside the LangGraph pipeline: what it decided,\n+    +    why, how confident it was, and how long it took. This is what makes the multi-agent\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/report_renderer.py`** \u2014 HIGH severity (High confidence)\n+  - _Why it matters:_ 159 additions / 88 deletions in this file.\n+  - _Evidence:_\n+    ```diff\n+    +def _format_timestamp(raw: str) -> str:\n+    +    \"\"\"Render an ISO-8601 timestamp (often with microseconds, e.g.\n+    +    '2026-08-06T10:04:37.276438+00:00') as a short, human-readable UTC\n+    +    string, e.g. 'Aug 6, 2026, 10:04 UTC'. Falls back to the raw value\n+    +    (trimmed to whole seconds) if parsing fails.\"\"\"\n+    +    try:\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`backend/engine/service.py`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This file contains service-layer orchestration logic (modified, +67/\u221218 lines). Review for correctness of the changed business rules or data flow.\n+  - _Evidence:_\n+    ```diff\n+    +from .categories import (\n+    +    build_agent_decisions,\n+    +    build_architectural_impact,\n+    +    build_category_breakdown,\n+    +    build_confidence_explanation,\n+    +)\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+- **`frontend/src/types.ts`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This is a core implementation file (modified, +73/\u22120 lines). Review the changed logic in `types.ts` for correctness and test coverage.\n+  - _Evidence:_\n+    ```diff\n+    +  cache_hit: boolean;\n+    +  indexed_doc_paths: string[];\n+    +  confidence: number;\n+    +}\n+    +\n+    +/** Surfaces one node's execution inside the LangGraph pipeline. */\n+    ```\n+  - _Recommended action:_ Review the logic change for correctness; ensure the affected code paths have test coverage.\n+\n+</details>\n+\n+<details><summary><strong>Documentation</strong> \u2014 LOW (5/100)</summary>\n+\n+1 file(s) touched in this category.\n+\n+- **`backend/reports/report.md`** \u2014 LOW severity (Medium confidence)\n+  - _Why it matters:_ This documentation file was removed (removed, +0/\u221223 lines). No runtime or production code was changed by this file.\n+  - _Evidence:_\n+    ```diff\n+    -## PR Sentinel Report\n+    -\n+    -Overall Risk: RiskLevel.LOW\n+    -\n+    -Decision: ALLOW\n+    -\n+    ```\n+  - _Recommended action:_ No action required beyond a standard doc review.\n+\n+</details>\n+\n+## Agent Pipeline (LangGraph)\n+\n+Each specialist agent only reviews files in its own domain; the coordinator agent\n+synthesizes their output (below) into the executive summary and risk breakdown above.\n+\n+| Agent | Decision | Confidence | Time |\n+|---|---|---|---|\n+| Security | Skipped \u2014 no files in this agent\u2019s domain were touched | High | 0ms |\n+| Database | Skipped \u2014 no files in this agent\u2019s domain were touched | High | 0ms |\n+| API Compatibility | Skipped \u2014 no files in this agent\u2019s domain were touched | High | 0ms |\n+| Test Coverage | Skipped \u2014 no files in this agent\u2019s domain were touched | High | 0ms |\n+| Performance | Skipped \u2014 no files in this agent\u2019s domain were touched | High | 0ms |\n+\n+<details><summary><strong>Security</strong> reasoning</summary>\n+\n+No files in this domain were touched by this PR.\n+\n+</details>\n+\n+<details><summary><strong>Database</strong> reasoning</summary>\n+\n+No files in this domain were touched by this PR.\n+\n+</details>\n+\n+<details><summary><strong>API Compatibility</strong> reasoning</summary>\n+\n+No files in this domain were touched by this PR.\n+\n+</details>\n+\n+<details><summary><strong>Test Coverage</strong> reasoning</summary>\n+\n+No files in this domain were touched by this PR.\n+\n+</details>\n+\n+<details><summary><strong>Performance</strong> reasoning</summary>\n+\n+No files in this domain were touched by this PR.\n+\n+</details>\n+\n+## Repository Context (RAG)\n+\n+Indexed **1** repository document(s) into **6** chunk(s) from branch `main` (freshly indexed).\n+\n+**Top repository context retrieved:**\n+\n+#### `README.md`\n+**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.\n+```\n+# PR Sentinel\n+\n+**AI-assisted deployment risk assessment for pull requests.**\n+\n+Paste a public GitHub PR URL. PR Sentinel fetches the diff, scores it with deterministic\n+heuristics, retrieves relevant context from the repo's own docs (RAG), routes the changed\n+files to five specialist agents, and has a ...\n+```\n+\n+#### `README.md`\n+**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.\n+```\n+base agent never sees route handlers. If a PR touches no files\n+in an agent's domain, that agent **skips the LLM call entirely** and reports\n+`applicable: false`. This is what makes the multi-agent split real rather than\n+decorative: five agents on a docs-only PR cost one API call's worth of latency, n...\n+```\n+\n+#### `README.md`\n+**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.\n+```\n+y  Performance Database   API    Tests\n+  Agent      Agent      Agent    Agent   Agent\n+  (auth/,    (cache/,  (migrations/, (routes/, (*.test.*,\n+  payment/)  queue/)    schema/)     api/)     *.spec.*)\n+      \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n+                      \u2502\n+              Coordinator (LLM)...\n+```\n+\n+#### `README.md`\n+**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.\n+```\n+s deleted, migration\n+   added, diff size) *before* any model runs. The model explains and contextualizes that\n+   score; it doesn't set it.\n+2. **Retrieval grounds the analysis in this specific repo**, not general knowledge of\n+   what \"auth code\" usually looks like. If the repo's own docs say \"changes...\n+```\n+\n+#### `README.md`\n+**Why retrieved:** Describes the project architecture, component overview, and heuristic scoring pipeline.\n+```\n+\u2502\n+              FastAPI backend\n+                      \u2502\n+         \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n+         \u2502                         \u2502\n+   GitHub REST API          Repository RAG\n+ (PR metadata, diff,      (README/docs \u2192 chunks\n+  commits, repo tree)      \u2192 Ollama embeddings\n+         \u2502                  \u2192 Ch...\n+```\n+\n+## Deployment Recommendation\n+\n+**Chosen strategy: Canary**\n+\n+Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.\n+\n+**Alternatives considered and why they weren't chosen:**\n+- Standard (skipped \u2014 this touches a live code path)\n+- Blue/Green (more than this change warrants)\n+\n+**Rollback plan required:** No\n+\n+## Confidence\n+\n+**Medium** (55% score) \u2014 partial evidence\n+\n+Repository documentation was retrieved and used as context; the heuristic score and the LLM's risk assessment agree; the AI pipeline was unavailable; this is a deterministic heuristics-only assessment.\n+\n+- Repository context available: Yes\n+- LLM and heuristic analyses agree: Yes\n+\n+## Execution Metrics\n+\n+- **Total duration:** 11.9s\n+- Repository Loaded: 1.7s\n+- Repository Context Retrieved: 9.8s\n+- Security: 0ms\n+- Database: 0ms\n+- API Compatibility: 0ms\n+- Test Coverage: 0ms\n+- Performance: 0ms\n+- Final Decision: 346ms\n+\n+## Groundedness Check\n+\n+**Verdict:** Grounded\n+- _Coordinator produced no output to judge._\n+\n+> \u26a0\ufe0f **Note:** AI analysis unavailable \u2014 this report reflects deterministic heuristics only.\n+> Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`\n+\n+---\n+*Generated by [PR Sentinel](https://github.com) \u2014 AI-powered deployment risk analysis.*\n\\ No newline at end of file"
+      },
+      {
+        "filename": "backend/tmpchroma/chroma.sqlite3",
+        "status": "removed",
+        "additions": 0,
+        "deletions": 0,
+        "changes": 0,
+        "patch": null
+      },
+      {
+        "filename": "frontend/package-lock.json",
+        "status": "modified",
+        "additions": 0,
+        "deletions": 42,
+        "changes": 42,
+        "patch": "@@ -817,9 +817,6 @@\n         \"x64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -966,9 +963,6 @@\n         \"arm\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -983,9 +977,6 @@\n         \"arm\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"musl\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1000,9 +991,6 @@\n         \"arm64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1017,9 +1005,6 @@\n         \"arm64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"musl\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1034,9 +1019,6 @@\n         \"loong64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1051,9 +1033,6 @@\n         \"loong64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"musl\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1068,9 +1047,6 @@\n         \"ppc64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1085,9 +1061,6 @@\n         \"ppc64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"musl\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1102,9 +1075,6 @@\n         \"riscv64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1119,9 +1089,6 @@\n         \"riscv64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"musl\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1136,9 +1103,6 @@\n         \"s390x\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1153,9 +1117,6 @@\n         \"x64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"glibc\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": [\n@@ -1170,9 +1131,6 @@\n         \"x64\"\n       ],\n       \"dev\": true,\n-      \"libc\": [\n-        \"musl\"\n-      ],\n       \"license\": \"MIT\",\n       \"optional\": true,\n       \"os\": ["
+      },
+      {
+        "filename": "frontend/src/App.tsx",
+        "status": "modified",
+        "additions": 61,
+        "deletions": 27,
+        "changes": 88,
+        "patch": "@@ -1,17 +1,19 @@\n import { useEffect, useState } from \"react\";\n \n import { analyzePullRequest, ApiError, fetchDemo, fetchDemos } from \"./api/client\";\n-import AgentFindingsPanel from \"./components/AgentFindingsPanel\";\n+import AgentPipelinePanel from \"./components/AgentPipelinePanel\";\n+import ArchitecturalImpactCard from \"./components/ArchitecturalImpactCard\";\n import Card from \"./components/Card\";\n+import CategoryBreakdown from \"./components/CategoryBreakdown\";\n import CitationsList from \"./components/CitationsList\";\n+import ConfidenceCard from \"./components/ConfidenceCard\";\n import DemoGallery from \"./components/DemoGallery\";\n import EmptyState from \"./components/EmptyState\";\n import FileRiskList from \"./components/FileRiskList\";\n import Header from \"./components/Header\";\n import JudgeBadge from \"./components/JudgeBadge\";\n import LoadingState from \"./components/LoadingState\";\n import RepoInput from \"./components/RepoInput\";\n-import RiskFactorGrid from \"./components/RiskFactorGrid\";\n import RiskGauge from \"./components/RiskGauge\";\n import RolloutCard from \"./components/RolloutCard\";\n import TestAreasCard from \"./components/TestAreasCard\";\n@@ -88,6 +90,15 @@ export default function App() {\n                 </h2>\n               </div>\n               <div className=\"flex items-center gap-2\">\n+                <span\n+                  className={`rounded-full px-2.5 py-1 font-mono text-[11px] font-semibold ${\n+                    result.report.decision === \"BLOCK\"\n+                      ? \"bg-risk-high/15 text-risk-high\"\n+                      : \"bg-risk-low/15 text-risk-low\"\n+                  }`}\n+                >\n+                  {result.report.decision}\n+                </span>\n                 <JudgeBadge judge={result.judge} />\n                 {!result.ai_enabled && (\n                   <span\n@@ -100,19 +111,39 @@ export default function App() {\n               </div>\n             </div>\n \n+            <Card title=\"Executive summary\" eyebrow=\"Coordinator agent synthesis\">\n+              <p className=\"text-sm leading-relaxed text-paper\">\n+                {result.report.executive_summary || result.ai.summary}\n+              </p>\n+            </Card>\n+\n             <div className=\"grid grid-cols-1 gap-6 lg:grid-cols-3\">\n               <Card title=\"Overall risk\" eyebrow=\"Sentinel assessment\" className=\"flex flex-col items-center justify-center lg:col-span-1\">\n-                <RiskGauge risk={result.ai.overall_risk} confidence={result.ai.confidence} />\n-                <p className=\"mt-3 text-center text-sm text-fog\">{result.ai.summary}</p>\n+                <RiskGauge risk={result.ai.overall_risk} confidence={result.report.confidence} />\n+                <p className=\"mt-3 text-center text-sm text-fog\">Risk score: {result.report.risk_score}/100</p>\n               </Card>\n \n-              <Card title=\"Risk factors\" eyebrow=\"Category scan\" className=\"lg:col-span-2\">\n-                <RiskFactorGrid factors={result.ai.risk_factors} />\n+              <Card title=\"Risk score breakdown\" eyebrow=\"By category\" className=\"lg:col-span-2\">\n+                <CategoryBreakdown categories={result.report.risk_categories} />\n               </Card>\n             </div>\n \n-            <Card title=\"Specialist agent findings\" eyebrow=\"Multi-agent analysis\">\n-              <AgentFindingsPanel agents={result.ai.agent_findings} />\n+            <Card title=\"Architectural impact\" eyebrow=\"Affected subsystems\">\n+              <ArchitecturalImpactCard impact={result.report.architectural_impact} />\n+              {result.ai.operational_risks.length > 0 && (\n+                <ul className=\"mt-3 flex flex-col gap-1.5 border-t border-steel pt-3\">\n+                  {result.ai.operational_risks.map((risk) => (\n+                    <li key={risk} className=\"flex items-start gap-2 text-sm text-fog\">\n+                      <span className=\"mt-0.5 text-amber\">\u25b2</span>\n+                      {risk}\n+                    </li>\n+                  ))}\n+                </ul>\n+              )}\n+            </Card>\n+\n+            <Card title=\"Agent pipeline\" eyebrow=\"LangGraph execution\">\n+              <AgentPipelinePanel decisions={result.report.agent_decisions} />\n             </Card>\n \n             <div className=\"grid grid-cols-1 gap-6 lg:grid-cols-2\">\n@@ -121,12 +152,21 @@ export default function App() {\n               </Card>\n \n               <div className=\"flex flex-col gap-6\">\n-                <Card title=\"Rollout recommendation\" eyebrow=\"Deployment strategy\">\n-                  <RolloutCard\n-                    strategy={result.ai.rollout_strategy}\n-                    reason={result.ai.rollout_reason}\n-                    rollbackRequired={result.ai.rollback_required}\n-                  />\n+                <Card title=\"Deployment recommendation\" eyebrow=\"Rollout strategy\">\n+                  {result.report.deployment_recommendation ? (\n+                    <RolloutCard\n+                      strategy={result.report.deployment_recommendation.strategy}\n+                      reason={result.report.deployment_recommendation.reason}\n+                      rollbackRequired={result.report.deployment_recommendation.rollback_required}\n+                      alternativesConsidered={result.report.deployment_recommendation.alternatives_considered}\n+                    />\n+                  ) : (\n+                    <RolloutCard\n+                      strategy={result.ai.rollout_strategy}\n+                      reason={result.ai.rollout_reason}\n+                      rollbackRequired={result.ai.rollback_required}\n+                    />\n+                  )}\n                 </Card>\n                 <Card title=\"Suggested test areas\" eyebrow=\"Before you merge\">\n                   <TestAreasCard\n@@ -137,22 +177,16 @@ export default function App() {\n               </div>\n             </div>\n \n-            <Card title=\"Repository context\" eyebrow=\"Retrieved via RAG\">\n+            <Card title=\"Repository context (RAG)\" eyebrow=\"Retrieved documents & snippets\">\n               <CitationsList rag={result.rag} />\n             </Card>\n \n-            <Card title=\"Architectural impact & operational risks\" eyebrow=\"Wider context\">\n-              <p className=\"mb-3 text-sm leading-relaxed text-paper\">\n-                {result.ai.architectural_impact}\n-              </p>\n-              <ul className=\"flex flex-col gap-1.5\">\n-                {result.ai.operational_risks.map((risk) => (\n-                  <li key={risk} className=\"flex items-start gap-2 text-sm text-fog\">\n-                    <span className=\"mt-0.5 text-amber\">\u25b2</span>\n-                    {risk}\n-                  </li>\n-                ))}\n-              </ul>\n+            <Card title=\"Confidence\" eyebrow=\"Evidence-backed explanation\">\n+              {result.report.confidence_explanation ? (\n+                <ConfidenceCard confidence={result.report.confidence_explanation} />\n+              ) : (\n+                <p className=\"text-sm text-fog\">{result.report.confidence}% confidence.</p>\n+              )}\n             </Card>\n           </div>\n         )}"
+      },
+      {
+        "filename": "frontend/src/components/AgentPipelinePanel.tsx",
+        "status": "added",
+        "additions": 48,
+        "deletions": 0,
+        "changes": 48,
+        "patch": "@@ -0,0 +1,48 @@\n+import Collapsible from \"./Collapsible\";\n+import type { AgentDecision } from \"../types\";\n+\n+const AGENT_ICON: Record<string, string> = {\n+  security: \"\ud83d\udd12\",\n+  performance: \"\u26a1\",\n+  database: \"\ud83d\uddc4\",\n+  api: \"\ud83d\udd0c\",\n+  tests: \"\u2705\",\n+};\n+\n+function decisionColor(decision: string): string {\n+  if (decision.startsWith(\"Concerns\")) return \"text-risk-medium\";\n+  if (decision.startsWith(\"Skipped\")) return \"text-fog\";\n+  return \"text-risk-low\";\n+}\n+\n+export default function AgentPipelinePanel({ decisions }: { decisions: AgentDecision[] }) {\n+  if (decisions.length === 0) {\n+    return <p className=\"text-sm text-fog\">No agent execution data available for this analysis.</p>;\n+  }\n+\n+  return (\n+    <div className=\"flex flex-col gap-2\">\n+      <p className=\"text-xs text-fog\">\n+        Each specialist agent only reviews files in its own domain. The coordinator agent then\n+        synthesizes their output into the executive summary and risk breakdown above.\n+      </p>\n+      {decisions.map((d) => {\n+        const header = (\n+          <div className=\"flex flex-wrap items-center gap-3\">\n+            <span className=\"text-sm\">{AGENT_ICON[d.agent] ?? \"\u2022\"}</span>\n+            <span className=\"min-w-[7rem] font-display text-sm font-semibold text-paper\">{d.label}</span>\n+            <span className={`font-mono text-xs font-semibold ${decisionColor(d.decision)}`}>{d.decision}</span>\n+            <span className=\"ml-auto font-mono text-[11px] text-fog\">\n+              {d.confidence}% conf. \u00b7 {d.execution_time_ms}ms\n+            </span>\n+          </div>\n+        );\n+        return (\n+          <Collapsible key={d.agent} header={header}>\n+            <p className=\"text-xs leading-relaxed text-fog\">{d.reasoning || \"No further reasoning recorded.\"}</p>\n+          </Collapsible>\n+        );\n+      })}\n+    </div>\n+  );\n+}"
+      },
+      {
+        "filename": "frontend/src/components/ArchitecturalImpactCard.tsx",
+        "status": "added",
+        "additions": 23,
+        "deletions": 0,
+        "changes": 23,
+        "patch": "@@ -0,0 +1,23 @@\n+import type { ArchitecturalImpact } from \"../types\";\n+\n+export default function ArchitecturalImpactCard({ impact }: { impact: ArchitecturalImpact }) {\n+  return (\n+    <div className=\"flex flex-col gap-3\">\n+      {impact.affected_subsystems.length > 0 && (\n+        <div className=\"flex flex-wrap gap-1.5\">\n+          {impact.affected_subsystems.map((s) => (\n+            <span\n+              key={s}\n+              className=\"rounded-full border border-steel bg-raised px-2.5 py-1 font-mono text-[11px] text-paper\"\n+            >\n+              {s}\n+            </span>\n+          ))}\n+        </div>\n+      )}\n+      <p className=\"text-sm leading-relaxed text-fog\">\n+        {impact.narrative || \"No clearly affected subsystems were detected.\"}\n+      </p>\n+    </div>\n+  );\n+}"
+      },
+      {
+        "filename": "frontend/src/components/CategoryBreakdown.tsx",
+        "status": "added",
+        "additions": 92,
+        "deletions": 0,
+        "changes": 92,
+        "patch": "@@ -0,0 +1,92 @@\n+import Collapsible from \"./Collapsible\";\n+import type { EvidenceItem, RiskCategory, RiskLevel } from \"../types\";\n+\n+const STATUS_COLOR: Record<RiskLevel, string> = {\n+  LOW: \"text-risk-low\",\n+  MEDIUM: \"text-risk-medium\",\n+  HIGH: \"text-risk-high\",\n+};\n+\n+const STATUS_BAR: Record<RiskLevel, string> = {\n+  LOW: \"bg-risk-low\",\n+  MEDIUM: \"bg-risk-medium\",\n+  HIGH: \"bg-risk-high\",\n+};\n+\n+const BADGE_BG: Record<RiskLevel, string> = {\n+  LOW: \"bg-risk-low/15 text-risk-low\",\n+  MEDIUM: \"bg-risk-medium/15 text-risk-medium\",\n+  HIGH: \"bg-risk-high/15 text-risk-high\",\n+};\n+\n+function EvidenceRow({ item }: { item: EvidenceItem }) {\n+  return (\n+    <div className=\"rounded-md border border-steel/70 bg-panel px-3 py-2.5\">\n+      <div className=\"mb-1 flex flex-wrap items-center justify-between gap-2\">\n+        <code className=\"truncate font-mono text-xs text-paper\">{item.file_path}</code>\n+        <div className=\"flex shrink-0 items-center gap-1.5\">\n+          <span className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ${BADGE_BG[item.severity]}`}>\n+            {item.severity}\n+          </span>\n+          <span className=\"font-mono text-[10px] text-fog\">{item.confidence}% conf.</span>\n+        </div>\n+      </div>\n+      <p className=\"text-xs leading-relaxed text-fog\">{item.explanation}</p>\n+      {item.snippet && (\n+        <pre className=\"mt-1.5 overflow-x-auto rounded bg-ink px-2 py-1.5 font-mono text-[11px] text-fog\">\n+          {item.snippet}\n+        </pre>\n+      )}\n+      <p className=\"mt-1.5 text-xs text-amber\">\u21b3 {item.recommended_action}</p>\n+    </div>\n+  );\n+}\n+\n+function CategoryRow({ category }: { category: RiskCategory }) {\n+  const header = (\n+    <div className=\"flex flex-wrap items-center gap-3\">\n+      <span className=\"min-w-[9rem] font-display text-sm font-semibold text-paper\">{category.category}</span>\n+      <div className=\"h-1.5 w-24 overflow-hidden rounded-full bg-steel/60\">\n+        <div\n+          className={`h-full rounded-full ${STATUS_BAR[category.status]}`}\n+          style={{ width: `${Math.max(4, category.score)}%` }}\n+        />\n+      </div>\n+      <span className={`font-mono text-xs font-semibold ${STATUS_COLOR[category.status]}`}>\n+        {category.status} \u00b7 {category.score}/100\n+      </span>\n+      <span className=\"ml-auto font-mono text-[11px] text-fog\">\n+        {category.evidence.length} evidence item{category.evidence.length === 1 ? \"\" : \"s\"}\n+      </span>\n+    </div>\n+  );\n+\n+  return (\n+    <Collapsible header={header}>\n+      <p className=\"mb-2 text-xs text-fog\">{category.summary}</p>\n+      {category.evidence.length === 0 ? (\n+        <p className=\"text-xs text-fog\">No evidence in this category.</p>\n+      ) : (\n+        <div className=\"flex flex-col gap-2\">\n+          {category.evidence.map((item, i) => (\n+            <EvidenceRow key={i} item={item} />\n+          ))}\n+        </div>\n+      )}\n+    </Collapsible>\n+  );\n+}\n+\n+export default function CategoryBreakdown({ categories }: { categories: RiskCategory[] }) {\n+  if (categories.length === 0) {\n+    return <p className=\"text-sm text-fog\">No category breakdown available for this analysis.</p>;\n+  }\n+\n+  return (\n+    <div className=\"flex flex-col gap-2\">\n+      {categories.map((c) => (\n+        <CategoryRow key={c.category} category={c} />\n+      ))}\n+    </div>\n+  );\n+}"
+      },
+      {
+        "filename": "frontend/src/components/CitationsList.tsx",
+        "status": "modified",
+        "additions": 39,
+        "deletions": 15,
+        "changes": 54,
+        "patch": "@@ -18,29 +18,53 @@ export default function CitationsList({ rag }: { rag: RAGContext }) {\n   if (!rag.scanned) {\n     return (\n       <p className=\"text-sm text-fog\">\n-        Repository documentation wasn't indexed{rag.skip_reason ? ` \u2014 ${rag.skip_reason}` : \".\"}\n-      </p>\n-    );\n-  }\n-\n-  if (rag.retrieved.length === 0) {\n-    return (\n-      <p className=\"text-sm text-fog\">\n-        Indexed {rag.indexed_files} doc file(s) from this repo, but nothing closely matched\n-        this PR's files.\n+        Repository documentation wasn't indexed{rag.skip_reason ? ` \u2014 ${rag.skip_reason}` : \"\"}.\n       </p>\n     );\n   }\n \n   return (\n-    <div className=\"flex flex-col gap-2\">\n+    <div className=\"flex flex-col gap-3\">\n       <p className=\"text-xs text-fog\">\n-        Retrieved from {rag.indexed_files} indexed doc file(s) ({rag.chunks_indexed} chunks) on{\" \"}\n+        Indexed {rag.indexed_files} doc file(s) into {rag.chunks_indexed} chunk(s) from{\" \"}\n         <span className=\"font-mono text-paper\">{rag.default_branch}</span>\n+        {rag.cache_hit ? \" (cache hit)\" : \" (freshly indexed)\"}.\n       </p>\n-      {rag.retrieved.map((chunk, i) => (\n-        <CitationRow key={i} chunk={chunk} />\n-      ))}\n+\n+      {rag.indexed_doc_paths.length > 0 && (\n+        <div>\n+          <p className=\"mb-1.5 font-mono text-[11px] uppercase tracking-wider text-fog\">\n+            Retrieved documents\n+          </p>\n+          <div className=\"flex flex-wrap gap-1.5\">\n+            {rag.indexed_doc_paths.map((p) => (\n+              <code\n+                key={p}\n+                className=\"rounded border border-steel bg-raised px-2 py-1 font-mono text-[11px] text-paper\"\n+              >\n+                {p}\n+              </code>\n+            ))}\n+          </div>\n+        </div>\n+      )}\n+\n+      {rag.retrieved.length > 0 ? (\n+        <div>\n+          <p className=\"mb-1.5 font-mono text-[11px] uppercase tracking-wider text-fog\">\n+            Top context snippets used in this analysis\n+          </p>\n+          <div className=\"flex flex-col gap-2\">\n+            {rag.retrieved.map((chunk, i) => (\n+              <CitationRow key={i} chunk={chunk} />\n+            ))}\n+          </div>\n+        </div>\n+      ) : (\n+        <p className=\"text-sm text-fog\">\n+          Nothing closely matched this PR's files, so no snippet was used as supporting context.\n+        </p>\n+      )}\n     </div>\n   );\n }"
+      },
+      {
+        "filename": "frontend/src/components/Collapsible.tsx",
+        "status": "added",
+        "additions": 33,
+        "deletions": 0,
+        "changes": 33,
+        "patch": "@@ -0,0 +1,33 @@\n+import { useState, type ReactNode } from \"react\";\n+\n+interface Props {\n+  header: ReactNode;\n+  children: ReactNode;\n+  defaultOpen?: boolean;\n+  className?: string;\n+}\n+\n+/** A single collapsible engineering-report row: click the header to expand the\n+ * evidence/reasoning underneath it. Used throughout the risk dashboard so a dense\n+ * report stays scannable while still exposing full detail on demand. */\n+export default function Collapsible({ header, children, defaultOpen = false, className = \"\" }: Props) {\n+  const [open, setOpen] = useState(defaultOpen);\n+\n+  return (\n+    <div className={`rounded-md border border-steel bg-raised ${className}`}>\n+      <button\n+        type=\"button\"\n+        onClick={() => setOpen((o) => !o)}\n+        className=\"flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left\"\n+      >\n+        <div className=\"min-w-0 flex-1\">{header}</div>\n+        <span\n+          className={`shrink-0 font-mono text-xs text-fog transition-transform ${open ? \"rotate-90\" : \"\"}`}\n+        >\n+          \u25b6\n+        </span>\n+      </button>\n+      {open && <div className=\"border-t border-steel px-3 py-3\">{children}</div>}\n+    </div>\n+  );\n+}"
+      },
+      {
+        "filename": "frontend/src/components/ConfidenceCard.tsx",
+        "status": "added",
+        "additions": 34,
+        "deletions": 0,
+        "changes": 34,
+        "patch": "@@ -0,0 +1,34 @@\n+import type { ConfidenceExplanation } from \"../types\";\n+\n+function CheckRow({ ok, label }: { ok: boolean; label: string }) {\n+  return (\n+    <div className=\"flex items-center gap-2\">\n+      <span className={`font-mono text-sm ${ok ? \"text-risk-low\" : \"text-risk-high\"}`}>{ok ? \"\u2713\" : \"\u2717\"}</span>\n+      <span className=\"text-xs text-fog\">{label}</span>\n+    </div>\n+  );\n+}\n+\n+export default function ConfidenceCard({ confidence }: { confidence: ConfidenceExplanation }) {\n+  return (\n+    <div className=\"flex flex-col gap-3\">\n+      <div className=\"flex items-baseline gap-2\">\n+        <span className=\"font-display text-2xl font-semibold text-paper\">{confidence.score}%</span>\n+        <span\n+          className={`rounded px-2 py-0.5 font-mono text-[11px] font-semibold ${\n+            confidence.evidence_completeness === \"complete\"\n+              ? \"bg-risk-low/15 text-risk-low\"\n+              : \"bg-risk-medium/15 text-risk-medium\"\n+          }`}\n+        >\n+          {confidence.evidence_completeness} evidence\n+        </span>\n+      </div>\n+      <p className=\"text-sm leading-relaxed text-fog\">{confidence.narrative}</p>\n+      <div className=\"flex flex-col gap-1.5 border-t border-steel pt-3\">\n+        <CheckRow ok={confidence.repository_context_available} label=\"Repository context (RAG) was available\" />\n+        <CheckRow ok={confidence.llm_heuristic_agreement} label=\"LLM and heuristic analyses agree\" />\n+      </div>\n+    </div>\n+  );\n+}"
+      },
+      {
+        "filename": "frontend/src/components/RolloutCard.tsx",
+        "status": "modified",
+        "additions": 41,
+        "deletions": 2,
+        "changes": 43,
+        "patch": "@@ -1,14 +1,26 @@\n+import type { DeploymentRecommendation } from \"../types\";\n+\n+const STRATEGY_COLOR: Record<string, string> = {\n+  Standard: \"text-risk-low\",\n+  Canary: \"text-risk-medium\",\n+  \"Blue/Green\": \"text-risk-medium\",\n+  \"Manual Approval\": \"text-risk-high\",\n+};\n+\n interface Props {\n   strategy: string;\n   reason: string;\n   rollbackRequired: boolean;\n+  alternativesConsidered?: string[];\n }\n \n-export default function RolloutCard({ strategy, reason, rollbackRequired }: Props) {\n+export default function RolloutCard({ strategy, reason, rollbackRequired, alternativesConsidered = [] }: Props) {\n   return (\n     <div className=\"flex flex-col gap-3\">\n       <div className=\"flex items-center justify-between\">\n-        <span className=\"font-display text-xl font-semibold text-paper\">{strategy}</span>\n+        <span className={`font-display text-xl font-semibold ${STRATEGY_COLOR[strategy] ?? \"text-paper\"}`}>\n+          {strategy}\n+        </span>\n         <span\n           className={`rounded-full px-2.5 py-1 font-mono text-[11px] font-semibold ${\n             rollbackRequired\n@@ -20,6 +32,33 @@ export default function RolloutCard({ strategy, reason, rollbackRequired }: Prop\n         </span>\n       </div>\n       <p className=\"text-sm leading-relaxed text-fog\">{reason}</p>\n+\n+      {alternativesConsidered.length > 0 && (\n+        <div className=\"border-t border-steel pt-3\">\n+          <p className=\"mb-1.5 font-mono text-[11px] uppercase tracking-wider text-fog\">\n+            Alternatives considered\n+          </p>\n+          <ul className=\"flex flex-col gap-1\">\n+            {alternativesConsidered.map((alt) => (\n+              <li key={alt} className=\"flex items-start gap-1.5 text-xs text-fog\">\n+                <span className=\"mt-0.5 text-steel\">\u2013</span>\n+                {alt}\n+              </li>\n+            ))}\n+          </ul>\n+        </div>\n+      )}\n     </div>\n   );\n }\n+\n+export function DeploymentRecommendationCard({ recommendation }: { recommendation: DeploymentRecommendation }) {\n+  return (\n+    <RolloutCard\n+      strategy={recommendation.strategy}\n+      reason={recommendation.reason}\n+      rollbackRequired={recommendation.rollback_required}\n+      alternativesConsidered={recommendation.alternatives_considered}\n+    />\n+  );\n+}"
+      },
+      {
+        "filename": "frontend/src/types.ts",
+        "status": "modified",
+        "additions": 73,
+        "deletions": 0,
+        "changes": 73,
+        "patch": "@@ -66,6 +66,8 @@ export interface RAGContext {\n   chunks_indexed: number;\n   skip_reason?: string | null;\n   retrieved: RAGChunk[];\n+  cache_hit: boolean;\n+  indexed_doc_paths: string[];\n }\n \n export type AgentDomain = \"security\" | \"performance\" | \"database\" | \"api\" | \"tests\";\n@@ -77,6 +79,17 @@ export interface AgentFinding {\n   files_reviewed: string[];\n   findings: string[];\n   risk_note: string;\n+  confidence: number;\n+}\n+\n+/** Surfaces one node's execution inside the LangGraph pipeline. */\n+export interface AgentDecision {\n+  agent: string;\n+  label: string;\n+  decision: string;\n+  reasoning: string;\n+  confidence: number;\n+  execution_time_ms: number;\n }\n \n export interface JudgeVerdict {\n@@ -104,24 +117,84 @@ export interface RepositoryMetadata {\n   files_changed_count: number;\n }\n \n+/** One structured piece of evidence: exactly what changed, why it matters, how\n+ * confident we are, how severe it is, and what to do about it. */\n+export interface EvidenceItem {\n+  file_path: string;\n+  snippet?: string | null;\n+  explanation: string;\n+  confidence: number;\n+  severity: RiskLevel;\n+  recommended_action: string;\n+}\n+\n+/** One row of the fixed risk-category taxonomy (Authentication, API, Database, ...). */\n+export interface RiskCategory {\n+  category: string;\n+  score: number;\n+  status: RiskLevel;\n+  summary: string;\n+  evidence: EvidenceItem[];\n+  reasons: string[];\n+  evidence_files: string[];\n+}\n+\n+export interface ArchitecturalImpact {\n+  affected_subsystems: string[];\n+  narrative: string;\n+}\n+\n+export interface ConfidenceExplanation {\n+  score: number;\n+  repository_context_available: boolean;\n+  llm_heuristic_agreement: boolean;\n+  evidence_completeness: \"complete\" | \"partial\";\n+  narrative: string;\n+}\n+\n+export interface DeploymentRecommendation {\n+  strategy: \"Standard\" | \"Canary\" | \"Blue/Green\" | \"Manual Approval\" | string;\n+  reason: string;\n+  alternatives_considered: string[];\n+  rollback_required: boolean;\n+}\n+\n+export interface ExecutionMetrics {\n+  generated_at: string;\n+  total_duration_ms: number;\n+  ai_enabled: boolean;\n+  rag_cache_hit: boolean;\n+}\n+\n export interface RiskReport {\n   decision: string;\n   risk_score: number;\n   confidence: number;\n   deployment_strategy: string;\n   risk_breakdown: Record<string, number>;\n+  risk_categories: RiskCategory[];\n   findings: string[];\n   evidence: string[];\n   timeline: TimelineStage[];\n   agent_statuses: AgentStatus[];\n+  agent_decisions: AgentDecision[];\n   repository_metadata: RepositoryMetadata;\n+  execution_metrics?: ExecutionMetrics | null;\n+  summary: string;\n+  executive_summary: string;\n+  high_risk_files: string[];\n+  architectural_impact: ArchitecturalImpact;\n+  confidence_explanation?: ConfidenceExplanation | null;\n+  deployment_recommendation?: DeploymentRecommendation | null;\n }\n \n export interface AIAnalysis {\n   overall_risk: RiskLevel;\n   confidence: number;\n   summary: string;\n+  executive_summary: string;\n   architectural_impact: string;\n+  affected_subsystems: string[];\n   operational_risks: string[];\n   rollout_strategy: string;\n   rollout_reason: string;"
+      }
+    ],
+    "repository": {
+      "owner": "PrateekaBhat",
+      "name": "pr-sentinel",
+      "full_name": "PrateekaBhat/pr-sentinel",
+      "description": null,
+      "primary_language": "Python",
+      "stars": 0,
+      "topics": [],
+      "default_branch": "main",
+      "framework": null,
+      "size_kb": 150
+    },
+    "head_branch": "feature-refactor",
+    "base_branch": "main"
+  },
+  "heuristics": {
+    "score": 40,
+    "factors": [
+      {
+        "key": "auth",
+        "label": "Authentication logic touched",
+        "triggered": false,
+        "weight": 40,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "payment",
+        "label": "Payment / billing logic touched",
+        "triggered": false,
+        "weight": 45,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "config",
+        "label": "Configuration files changed",
+        "triggered": false,
+        "weight": 30,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "infra",
+        "label": "Infrastructure / deployment files changed",
+        "triggered": true,
+        "weight": 20,
+        "reason": "Matched in .github/workflows/pr-sentinel.yml"
+      },
+      {
+        "key": "migration",
+        "label": "Database migration detected",
+        "triggered": false,
+        "weight": 35,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "api_contract",
+        "label": "Public API contract changed",
+        "triggered": false,
+        "weight": 25,
+        "reason": "No matching files in this diff."
+      },
+      {
+        "key": "large_diff",
+        "label": "Large diff (800+ line changes)",
+        "triggered": true,
+        "weight": 20,
+        "reason": "3221 lines changed across 27 files."
+      }
+    ],
+    "score_math": [
+      {
+        "factor": "Base Risk",
+        "points": 0,
+        "reason": "Clean starting baseline"
+      },
+      {
+        "factor": "Infrastructure / deployment files changed",
+        "points": 20,
+        "reason": "Matched in .github/workflows/pr-sentinel.yml"
+      },
+      {
+        "factor": "Large diff (800+ line changes)",
+        "points": 20,
+        "reason": "3221 lines changed across 27 files."
+      }
+    ],
+    "tests_touched": true,
+    "tests_deleted": false,
+    "migration_touched": false
+  },
+  "ai": {
+    "overall_risk": "MEDIUM",
+    "confidence": 55,
+    "summary": "Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 2 risk signal(s) triggered across 27 changed file(s).",
+    "executive_summary": "Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 2 risk signal(s) triggered across 27 changed file(s). This is a deterministic, rule-based assessment only \u2014 no LLM synthesis, specialist agent review, or repository context was available for this run.",
+    "architectural_impact": "Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment.",
+    "affected_subsystems": [
+      "Infrastructure / deployment files changed",
+      "Large diff (800+ line changes)"
+    ],
+    "operational_risks": [
+      "Infrastructure / deployment files changed",
+      "Large diff (800+ line changes)"
+    ],
+    "rollout_strategy": "Canary",
+    "rollout_reason": "Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.",
+    "rollback_required": false,
+    "test_coverage_estimate_pct": null,
+    "suggested_test_areas": [
+      "Regression"
+    ],
+    "risk_factors": [
+      {
+        "key": "auth",
+        "label": "Authentication logic touched",
+        "passed": true
+      },
+      {
+        "key": "payment",
+        "label": "Payment / billing logic touched",
+        "passed": true
+      },
+      {
+        "key": "config",
+        "label": "Configuration files changed",
+        "passed": true
+      },
+      {
+        "key": "infra",
+        "label": "Infrastructure / deployment files changed",
+        "passed": false
+      },
+      {
+        "key": "migration",
+        "label": "Database migration detected",
+        "passed": true
+      },
+      {
+        "key": "api_contract",
+        "label": "Public API contract changed",
+        "passed": true
+      },
+      {
+        "key": "large_diff",
+        "label": "Large diff (800+ line changes)",
+        "passed": false
+      }
+    ],
+    "file_risks": [
+      {
+        "filename": "backend/reports/report.json",
+        "risk": "HIGH",
+        "reason": "671 additions / 145 deletions in this file."
+      },
+      {
+        "filename": "backend/engine/categories.py",
+        "risk": "HIGH",
+        "reason": "549 additions / 0 deletions in this file."
+      },
+      {
+        "filename": "backend/reports/report.md",
+        "risk": "HIGH",
+        "reason": "372 additions / 14 deletions in this file."
+      },
+      {
+        "filename": "backend/engine/report_renderer.py",
+        "risk": "HIGH",
+        "reason": "166 additions / 88 deletions in this file."
+      },
+      {
+        "filename": "backend/engine/tests/test_category_classifier.py",
+        "risk": "MEDIUM",
+        "reason": "170 additions / 0 deletions in this file."
+      }
+    ],
+    "agent_findings": [],
+    "citations": []
+  },
+  "report": {
+    "decision": "ALLOW",
+    "risk_score": 40,
+    "confidence": 55,
+    "review_effort_minutes": 120,
+    "review_effort_label": "2 hours",
+    "deployment_strategy": "Canary",
+    "score_math": [
+      {
+        "factor": "Base Risk",
+        "points": 0,
+        "reason": "Clean starting baseline"
+      },
+      {
+        "factor": "Infrastructure / deployment files changed",
+        "points": 20,
+        "reason": "Matched in .github/workflows/pr-sentinel.yml"
+      },
+      {
+        "factor": "Large diff (800+ line changes)",
+        "points": 20,
+        "reason": "3221 lines changed across 27 files."
+      }
+    ],
+    "risk_breakdown": {
+      "Infrastructure": 20,
+      "Diff size": 20
+    },
+    "risk_categories": [
+      {
+        "category": "Authentication",
+        "score": 0,
+        "status": "LOW",
+        "summary": "No files in this category were changed.",
+        "evidence": [],
+        "reasons": [],
+        "evidence_files": []
+      },
+      {
+        "category": "API",
+        "score": 0,
+        "status": "LOW",
+        "summary": "No files in this category were changed.",
+        "evidence": [],
+        "reasons": [],
+        "evidence_files": []
+      },
+      {
+        "category": "Data Layer",
+        "score": 0,
+        "status": "LOW",
+        "summary": "No files in this category were changed.",
+        "evidence": [],
+        "reasons": [],
+        "evidence_files": []
+      },
+      {
+        "category": "Infrastructure",
+        "score": 0,
+        "status": "LOW",
+        "summary": "No files in this category were changed.",
+        "evidence": [],
+        "reasons": [],
+        "evidence_files": []
+      },
+      {
+        "category": "CI/CD",
+        "score": 12,
+        "status": "LOW",
+        "summary": "1 file(s) touched in this category.",
+        "evidence": [
+          {
+            "file_path": ".github/workflows/pr-sentinel.yml",
+            "snippet": "-      OLLAMA_MODEL: llama3.1\n+      # llama3.1 (8B) is too slow for a CPU-only GitHub-hosted runner (2 vCPU) \u2014\n+      # a single agent call can exceed its own timeout before it even finishes\n+      # loading the model. llama3.2 (3B) trades some analysis depth for something\n+      # that actually completes in CI; run a",
+            "explanation": "This file defines the CI/CD pipeline (modified, +20/\u22121 lines). Changes here affect how automated tests, builds, and deployments are triggered.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Dry-run the updated pipeline on a branch before merging to avoid breaking the main build."
+          }
+        ],
+        "reasons": [
+          "This file defines the CI/CD pipeline (modified, +20/\u22121 lines). Changes here affect how automated tests, builds, and deployments are triggered."
+        ],
+        "evidence_files": [
+          ".github/workflows/pr-sentinel.yml"
+        ]
+      },
+      {
+        "category": "Dependencies",
+        "score": 10,
+        "status": "LOW",
+        "summary": "1 file(s) touched in this category.",
+        "evidence": [
+          {
+            "file_path": "frontend/package-lock.json",
+            "snippet": "-      \"libc\": [\n-        \"glibc\"\n-      ],\n-      \"libc\": [\n-        \"glibc\"\n-      ],",
+            "explanation": "This lock file was updated (modified, +0/\u221242 lines), indicating a dependency version change. Review the diff for removed packages or major version bumps that could introduce breaking changes or new vulnerabilities.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Check the changelog/CVE feed for the bumped packages before approving."
+          }
+        ],
+        "reasons": [
+          "This lock file was updated (modified, +0/\u221242 lines), indicating a dependency version change. Review the diff for removed packages or major version bumps that could introduce breaking changes or new vulnerabilities."
+        ],
+        "evidence_files": [
+          "frontend/package-lock.json"
+        ]
+      },
+      {
+        "category": "Secrets",
+        "score": 0,
+        "status": "LOW",
+        "summary": "No files in this category were changed.",
+        "evidence": [],
+        "reasons": [],
+        "evidence_files": []
+      },
+      {
+        "category": "Tests",
+        "score": 20,
+        "status": "MEDIUM",
+        "summary": "1 file(s) touched in this category.",
+        "evidence": [
+          {
+            "file_path": "backend/engine/tests/test_category_classifier.py",
+            "snippet": "+\ufefffrom __future__ import annotations\n+\n+import pytest\n+from engine.categories import (\n+    _confidence_label,\n+    _is_persistence_layer_file,",
+            "explanation": "170 additions / 0 deletions in this file.",
+            "confidence": 75,
+            "severity": "MEDIUM",
+            "recommended_action": "Add or restore coverage for the touched code paths before this ships."
+          }
+        ],
+        "reasons": [
+          "170 additions / 0 deletions in this file."
+        ],
+        "evidence_files": [
+          "backend/engine/tests/test_category_classifier.py"
+        ]
+      },
+      {
+        "category": "Application/Core Logic",
+        "score": 100,
+        "status": "HIGH",
+        "summary": "13 file(s) touched in this category.",
+        "evidence": [
+          {
+            "file_path": "backend/engine/agent_routing.py",
+            "snippet": "-    \"database\": re.compile(r\"(^|/)(migrations?|schema|models?|entity|repository)(/|\\.)|\\.sql$\", re.I),\n+    # Database agent: only files with clear persistence-layer signals.\n+    # A plain models.py in engine/, app/, or backend/ is a Pydantic/domain model,\n+    # NOT a database model \u2014 it must not route to this agent",
+            "explanation": "This file is part of the LangGraph agent pipeline (modified, +19/\u22121 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/agents/nodes.py",
+            "snippet": "+        confidence = int(data.get(\"confidence\", 60))\n+        confidence = 0\n+            confidence=confidence,\n-    data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)\n+    try:\n+        data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state),",
+            "explanation": "This file is part of the LangGraph agent pipeline (modified, +29/\u22122 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/agents/prompts.py",
+            "snippet": "-  \"risk_note\": \"<one sentence: does this domain add risk to this PR, and why>\"\n+  \"risk_note\": \"<one sentence: does this domain add risk to this PR, and why>\",\n+  \"confidence\": <integer 0-100, how confident you are in this assessment given what you were shown>\n-say so plainly in risk_note \u2014 do not invent a problem to ",
+            "explanation": "This file is part of the LangGraph agent pipeline (modified, +38/\u221211 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/agents/state.py",
+            "snippet": "+    coordinator_error: str",
+            "explanation": "This file is part of the LangGraph agent pipeline (modified, +1/\u22120 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/ai_analyzer.py",
+            "snippet": "+            executive_summary=data.get(\"executive_summary\") or data.get(\"summary\", \"\"),\n+            affected_subsystems=[str(x) for x in (data.get(\"affected_subsystems\") or [])],\n-            rollout_strategy=data.get(\"rollout_strategy\", \"Standard merge\"),\n+            rollout_strategy=data.get(\"rollout_strategy\", \"S",
+            "explanation": "This is a core implementation file (modified, +14/\u22125 lines). Review the changed logic in `ai_analyzer.py` for correctness and test coverage.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/categories.py",
+            "snippet": "+\ufefffrom __future__ import annotations\n+\n+import re\n+from typing import Any\n+\n+from .models import (",
+            "explanation": "549 additions / 0 deletions in this file.",
+            "confidence": 75,
+            "severity": "HIGH",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/demo_data.py",
+            "snippet": "+from .categories import build_agent_decisions\n+    ArchitecturalImpact,\n+    ConfidenceExplanation,\n+    DeploymentRecommendation,\n+        report=RiskReport(\n+            decision=\"ALLOW\",",
+            "explanation": "This is a core implementation file (modified, +136/\u221230 lines). Review the changed logic in `demo_data.py` for correctness and test coverage.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/heuristics.py",
+            "snippet": "-    (\"infra\", \"Infrastructure / deployment files changed\", 30, re.compile(r\"(^|/)(terraform|infra|deploy|docker|ci|\\.github/workflows)(/|\\.)\", re.I)),\n+    # Reduced from 30 \u2192 20: a CI/CD workflow change is lower risk than a genuine\n+    # IaC or deployment change (Terraform, Kubernetes, Docker). The workflow\n+    # h",
+            "explanation": "This is a core implementation file (modified, +9/\u22123 lines). Review the changed logic in `heuristics.py` for correctness and test coverage.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/models.py",
+            "snippet": "-    score: float = 0.0  # similarity score, higher = more relevant\n+    score: float = 0.0  # cosine similarity score; positive = more relevant\n+    retrieval_reason: str = \"\"  # human-readable explanation of why this chunk was retrieved\n+    confidence: int = 60  # 0-100, how confident this agent is in its own findin",
+            "explanation": "This file defines internal domain or data-transfer models (modified, +67/\u22126 lines). No ORM base classes, Alembic migrations, or persistence-layer signals were detected in this path\u2014this is a Pydantic/dataclass domain model, not a database schema.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/rag/retriever.py",
+            "snippet": "+def _infer_retrieval_reason(path: str, snippet: str) -> str:\n+    \"\"\"Generate a human-readable explanation of why a document chunk was retrieved,\n+    based on its source path and a brief look at the snippet content.\"\"\"\n+    path_lower = path.lower()\n+    if \"readme\" in path_lower:\n+        return \"Describes the proje",
+            "explanation": "This is a core implementation file (modified, +37/\u22122 lines). Review the changed logic in `retriever.py` for correctness and test coverage.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/report_renderer.py",
+            "snippet": "+def _format_timestamp(raw: str) -> str:\n+    \"\"\"Render an ISO-8601 timestamp (often with microseconds, e.g.\n+    '2026-08-06T10:04:37.276438+00:00') as a short, human-readable UTC\n+    string, e.g. 'Aug 6, 2026, 10:04 UTC'. Falls back to the raw value\n+    (trimmed to whole seconds) if parsing fails.\"\"\"\n+    try:",
+            "explanation": "166 additions / 88 deletions in this file.",
+            "confidence": 75,
+            "severity": "HIGH",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "backend/engine/service.py",
+            "snippet": "+from .categories import (\n+    build_agent_decisions,\n+    build_architectural_impact,\n+    build_category_breakdown,\n+    build_confidence_explanation,\n+)",
+            "explanation": "This file contains service-layer orchestration logic (modified, +67/\u221218 lines). Review for correctness of the changed business rules or data flow.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          },
+          {
+            "file_path": "frontend/src/types.ts",
+            "snippet": "+  cache_hit: boolean;\n+  indexed_doc_paths: string[];\n+  confidence: number;\n+}\n+\n+/** Surfaces one node's execution inside the LangGraph pipeline. */",
+            "explanation": "This is a core implementation file (modified, +73/\u22120 lines). Review the changed logic in `types.ts` for correctness and test coverage.",
+            "confidence": 50,
+            "severity": "LOW",
+            "recommended_action": "Review the logic change for correctness; ensure the affected code paths have test coverage."
+          }
+        ],
+        "reasons": [
+          "This file is part of the LangGraph agent pipeline (modified, +19/\u22121 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+          "This file is part of the LangGraph agent pipeline (modified, +29/\u22122 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+          "This file is part of the LangGraph agent pipeline (modified, +38/\u221211 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+          "This file is part of the LangGraph agent pipeline (modified, +1/\u22120 lines). Changes here affect specialist-agent routing, prompts, or coordinator synthesis.",
+          "This is a core implementation file (modified, +14/\u22125 lines). Review the changed logic in `ai_analyzer.py` for correctness and test coverage."
+        ],
+        "evidence_files": [
+          "backend/engine/agent_routing.py",
+          "backend/engine/agents/nodes.py",
+          "backend/engine/agents/prompts.py",
+          "backend/engine/agents/state.py",
+          "backend/engine/ai_analyzer.py",
+          "backend/engine/categories.py",
+          "backend/engine/demo_data.py",
+          "backend/engine/heuristics.py",
+          "backend/engine/models.py",
+          "backend/engine/rag/retriever.py",
+          "backend/engine/report_renderer.py",
+          "backend/engine/service.py",
+          "frontend/src/types.ts"
+        ]
+      },
+      {
+        "category": "Documentation",
+        "score": 30,
+        "status": "HIGH",
+        "summary": "1 file(s) touched in this category.",
+        "evidence": [
+          {
+            "file_path": "backend/reports/report.md",
+            "snippet": "-## PR Sentinel Report\n+# PR Sentinel \u2014 Release Risk Assessment\n-Overall Risk: RiskLevel.LOW\n+**Generated:** 2026-08-06 12:29:37 UTC  \u00b7  **Repository:** [PrateekaBhat/pr-sentinel](https://github.com/PrateekaBhat/pr-sentinel/pull/2)  \u00b7  **PR:** #2\n-Decision: ALLOW\n+### \u2705 ALLOW \u2014 MEDIUM risk (score 50/100)",
+            "explanation": "372 additions / 14 deletions in this file.",
+            "confidence": 75,
+            "severity": "HIGH",
+            "recommended_action": "No action required beyond a standard doc review."
+          }
+        ],
+        "reasons": [
+          "372 additions / 14 deletions in this file."
+        ],
+        "evidence_files": [
+          "backend/reports/report.md"
+        ]
+      }
+    ],
+    "findings": [
+      "Infrastructure / deployment files changed",
+      "Large diff (800+ line changes)",
+      "backend/reports/report.json",
+      "backend/engine/categories.py",
+      "backend/reports/report.md"
+    ],
+    "evidence": [
+      "Infrastructure / deployment files changed: Matched in .github/workflows/pr-sentinel.yml",
+      "Large diff (800+ line changes): 3221 lines changed across 27 files.",
+      "backend/reports/report.json: 671 additions / 145 deletions in this file.",
+      "backend/engine/categories.py: 549 additions / 0 deletions in this file.",
+      "backend/reports/report.md: 372 additions / 14 deletions in this file."
+    ],
+    "evidence_items": [],
+    "timeline": [
+      {
+        "stage": "Repository Loaded",
+        "duration_ms": 1480
+      },
+      {
+        "stage": "Repository Context Retrieved",
+        "duration_ms": 1227
+      },
+      {
+        "stage": "Security",
+        "duration_ms": 0
+      },
+      {
+        "stage": "Database",
+        "duration_ms": 0
+      },
+      {
+        "stage": "API Compatibility",
+        "duration_ms": 0
+      },
+      {
+        "stage": "Test Coverage",
+        "duration_ms": 285
+      },
+      {
+        "stage": "Performance",
+        "duration_ms": 0
+      },
+      {
+        "stage": "Final Decision",
+        "duration_ms": 275
+      }
+    ],
+    "agent_statuses": [
+      {
+        "agent": "security",
+        "label": "Security",
+        "status": "Skipped",
+        "files_reviewed": 0,
+        "duration_ms": 0
+      },
+      {
+        "agent": "database",
+        "label": "Database",
+        "status": "Skipped",
+        "files_reviewed": 0,
+        "duration_ms": 0
+      },
+      {
+        "agent": "api",
+        "label": "API Compatibility",
+        "status": "Skipped",
+        "files_reviewed": 0,
+        "duration_ms": 0
+      },
+      {
+        "agent": "tests",
+        "label": "Test Coverage",
+        "status": "Completed",
+        "files_reviewed": 1,
+        "duration_ms": 285
+      },
+      {
+        "agent": "performance",
+        "label": "Performance",
+        "status": "Skipped",
+        "files_reviewed": 0,
+        "duration_ms": 0
+      }
+    ],
+    "agent_decisions": [
+      {
+        "agent": "security",
+        "label": "Security",
+        "decision": "Skipped \u2014 no files in this agent\u2019s domain were touched",
+        "reasoning": "No files in this domain were touched by this PR.",
+        "confidence": 100,
+        "execution_time_ms": 0
+      },
+      {
+        "agent": "database",
+        "label": "Database",
+        "decision": "Skipped \u2014 no files in this agent\u2019s domain were touched",
+        "reasoning": "No files in this domain were touched by this PR.",
+        "confidence": 100,
+        "execution_time_ms": 0
+      },
+      {
+        "agent": "api",
+        "label": "API Compatibility",
+        "decision": "Skipped \u2014 no files in this agent\u2019s domain were touched",
+        "reasoning": "No files in this domain were touched by this PR.",
+        "confidence": 100,
+        "execution_time_ms": 0
+      },
+      {
+        "agent": "tests",
+        "label": "Test Coverage",
+        "decision": "No concerns raised",
+        "reasoning": "Agent call failed (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`); files were not analyzed by AI for this domain.",
+        "confidence": 0,
+        "execution_time_ms": 285
+      },
+      {
+        "agent": "performance",
+        "label": "Performance",
+        "decision": "Skipped \u2014 no files in this agent\u2019s domain were touched",
+        "reasoning": "No files in this domain were touched by this PR.",
+        "confidence": 100,
+        "execution_time_ms": 0
+      }
+    ],
+    "repository_metadata": {
+      "default_branch": "main",
+      "technologies": [
+        "Python",
+        "TypeScript"
+      ],
+      "files_changed_count": 27
+    },
+    "repository_intelligence": {
+      "primary_language": null,
+      "framework": null,
+      "containerization": null,
+      "ci_provider": null,
+      "infrastructure": [],
+      "estimated_size": "unknown",
+      "default_branch": null
+    },
+    "execution_metrics": {
+      "generated_at": "2026-08-06T13:21:00.004841+00:00",
+      "total_duration_ms": 3317,
+      "ai_enabled": false,
+      "rag_cache_hit": false
+    },
+    "summary": "Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 2 risk signal(s) triggered across 27 changed file(s).",
+    "executive_summary": "Heuristic-only analysis (Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`): 2 risk signal(s) triggered across 27 changed file(s). This is a deterministic, rule-based assessment only \u2014 no LLM synthesis, specialist agent review, or repository context was available for this run.",
+    "high_risk_files": [],
+    "architectural_impact": {
+      "affected_subsystems": [
+        "CI/CD",
+        "Dependencies",
+        "Tests",
+        "Application/Core Logic",
+        "Documentation"
+      ],
+      "narrative": "Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment."
+    },
+    "confidence_explanation": {
+      "score": 55,
+      "level": "Medium",
+      "repository_context_available": true,
+      "llm_heuristic_agreement": true,
+      "evidence_completeness": "partial",
+      "narrative": "Repository documentation was retrieved and used as context; the heuristic score and the LLM's risk assessment agree; the AI pipeline was unavailable; this is a deterministic heuristics-only assessment."
+    },
+    "deployment_recommendation": {
+      "strategy": "Canary",
+      "reason": "Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.",
+      "monitoring_focus": "Monitor CI pipeline step completion, runner resource usage, and error rate during early deployment.",
+      "rollback_trigger": "Immediate rollback on any pipeline failure or unexpected workflow runner exit code.",
+      "approval_level": "Platform / DevOps Lead",
+      "alternatives_considered": [
+        "Standard (skipped \u2014 this touches a live code path)",
+        "Blue/Green (more than this change warrants)"
+      ],
+      "rollback_required": false
+    }
+  },
+  "ai_enabled": false,
+  "ai_error": "Model 'llama3.1' isn't pulled yet. Run: `ollama pull llama3.1`",
+  "rag": {
+    "scanned": true,
+    "default_branch": "main",
+    "indexed_files": 0,
+    "chunks_indexed": 5,
+    "skip_reason": null,
+    "retrieved": [
+      {
+        "path": "README.md",
+        "snippet": "base agent never sees route handlers. If a PR touches no files\nin an agent's domain, that agent **skips the LLM call entirely** and reports\n`applicable: false`. This is what makes the multi-agent split real rather than\ndecorative: five agents on a docs-only PR cost one API call's worth of latency, not five.\n\n## Why this design\n\nAn earlier version of this project was a single prompt: \"here's the diff, tell me the\nrisk.\" That's an AI wrapper around GitHub \u2014 anyone could paste the same diff into\nCh",
+        "score": 0.0,
+        "retrieval_reason": "Describes the project architecture, component overview, and heuristic scoring pipeline."
+      },
+      {
+        "path": "README.md",
+        "snippet": "# PR Sentinel\n\n**AI-assisted deployment risk assessment for pull requests.**\n\nPaste a public GitHub PR URL. PR Sentinel fetches the diff, scores it with deterministic\nheuristics, retrieves relevant context from the repo's own docs (RAG), routes the changed\nfiles to five specialist agents, and has a coordinator synthesize everything into one\nreport \u2014 overall risk, rollout recommendation, and testing gaps \u2014 with a judge pass that\nchecks the report's claims are actually grounded in evidence.\n\nRuns ",
+        "score": 0.0,
+        "retrieval_reason": "Describes the project architecture, component overview, and heuristic scoring pipeline."
+      },
+      {
+        "path": "README.md",
+        "snippet": "y  Performance Database   API    Tests\n  Agent      Agent      Agent    Agent   Agent\n  (auth/,    (cache/,  (migrations/, (routes/, (*.test.*,\n  payment/)  queue/)    schema/)     api/)     *.spec.*)\n      \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n                      \u2502\n              Coordinator (LLM)\n        synthesizes heuristics + agent\n       findings + RAG citations \u2192 report\n                      \u2502\n              Judge (LLM-as-judge)\n        checks every claim in the report\n         traces bac",
+        "score": 0.0,
+        "retrieval_reason": "Describes the project architecture, component overview, and heuristic scoring pipeline."
+      },
+      {
+        "path": "README.md",
+        "snippet": "s deleted, migration\n   added, diff size) *before* any model runs. The model explains and contextualizes that\n   score; it doesn't set it.\n2. **Retrieval grounds the analysis in this specific repo**, not general knowledge of\n   what \"auth code\" usually looks like. If the repo's own docs say \"changes to `auth/`\n   require a canary rollout,\" the coordinator can cite that \u2014 a generic LLM call never\n   could.\n3. **Different risk domains get different context and different agents.** Security,\n   data",
+        "score": 0.0,
+        "retrieval_reason": "Describes the project architecture, component overview, and heuristic scoring pipeline."
+      },
+      {
+        "path": "README.md",
+        "snippet": "\u2502\n              FastAPI backend\n                      \u2502\n         \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n         \u2502                         \u2502\n   GitHub REST API          Repository RAG\n (PR metadata, diff,      (README/docs \u2192 chunks\n  commits, repo tree)      \u2192 Ollama embeddings\n         \u2502                  \u2192 ChromaDB \u2192 top-k)\n         \u2502                         \u2502\n         \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n                      \u2502\n         Deterministic risk heuristics\n     (auth/, payment/, config/, migrations,\n   ",
+        "score": 0.0,
+        "retrieval_reason": "Describes the project architecture, component overview, and heuristic scoring pipeline."
+      }
+    ],
+    "cache_hit": false,
+    "indexed_doc_paths": []
+  },
+  "judge": {
+    "grounded": true,
+    "issues": [],
+    "notes": "Coordinator produced no output to judge."
+  },
+  "source": "live"
+}
