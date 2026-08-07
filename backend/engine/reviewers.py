@@ -56,11 +56,11 @@ def build_suggested_reviewers(
             merged_paths = sorted(set(existing.matched_paths) | set(matched_paths))
             existing.matched_paths = merged_paths
             existing.required = existing.required or required
-            existing.reason = _reason_for(existing.matched_paths, existing.required, role)
+            existing.reason = _reason_for(existing.matched_paths)
         else:
             reviewer = SuggestedReviewer(
                 role=role,
-                reason=_reason_for(matched_paths, required, role),
+                reason=_reason_for(matched_paths),
                 matched_paths=matched_paths,
                 required=required,
             )
@@ -74,7 +74,7 @@ def build_suggested_reviewers(
         reviewers.append(
             SuggestedReviewer(
                 role="Frontend Reviewer",
-                reason=_reason_for(frontend_paths, False, "Frontend Reviewer"),
+                reason=_reason_for(frontend_paths),
                 matched_paths=frontend_paths,
                 required=False,
             )
@@ -86,9 +86,8 @@ def build_suggested_reviewers(
     return reviewers
 
 
-def _reason_for(matched_paths: list[str], required: bool, role: str) -> str:
+def _reason_for(matched_paths: list[str]) -> str:
     shown = matched_paths[:3]
     remainder = len(matched_paths) - len(shown)
     files_desc = ", ".join(shown) + (f" (+{remainder} more)" if remainder > 0 else "")
-    qualifier = "Required sign-off" if required else "Recommended"
-    return f"{qualifier} -- changes touch: {files_desc}"
+    return f"Changes touch: {files_desc}"
