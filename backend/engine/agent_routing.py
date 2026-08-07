@@ -12,7 +12,25 @@ DOMAIN_PATTERNS: dict[str, re.Pattern] = {
         r"(^|/)(auth|authn|authz|login|session|jwt|oauth|security|payment|billing|checkout|stripe)(/|\.)",
         re.I,
     ),
-    "database": re.compile(r"(^|/)(migrations?|schema|models?|entity|repository)(/|\.)|\.sql$", re.I),
+    # Database agent: only files with clear persistence-layer signals.
+    # A plain models.py in engine/, app/, or backend/ is a Pydantic/domain model,
+    # NOT a database model — it must not route to this agent.
+    "database": re.compile(
+        r"""
+        (^|/)alembic(/|\.)            # Alembic migration directories
+        | (^|/)migrations?(/|\.)      # Django / SQLAlchemy migrations
+        | (^|/)flyway(/|\.)           # Flyway migrations
+        | (^|/)liquibase(/|\.)        # Liquibase migrations
+        | (^|/)prisma(/|\.)           # Prisma schema directory
+        | schema\.prisma$             # Prisma schema file
+        | \.sql$                      # Raw SQL files
+        | (^|/)db/models?(/|\.)       # models under explicit db/ prefix
+        | (^|/)database/models?(/|\.) # models under explicit database/ prefix
+        | (^|/)entity(/|\.)           # JPA / TypeORM entity classes
+        | (^|/)repository(/|\.)       # Repository / DAO pattern
+        """,
+        re.I | re.VERBOSE,
+    ),
     "performance": re.compile(r"(^|/)(cache|redis|queue|worker|perf|benchmark|index)(/|\.)", re.I),
     "api": re.compile(r"(^|/)(routes?|controllers?|api|graphql|endpoints?)(/|\.)", re.I),
     "tests": re.compile(r"(^|/)(tests?|__tests__|spec)(/|\.)|\.(test|spec)\.", re.I),

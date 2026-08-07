@@ -1,21 +1,30 @@
 import { useEffect, useState } from "react";
 
-import { analyzePullRequest, ApiError, fetchDemo, fetchDemos } from "./api/client";
-import AgentFindingsPanel from "./components/AgentFindingsPanel";
+import { analyzePullRequest, ApiError, fetchDemo, fetchDemos, fetchRepositoryHealth } from "./api/client";
+import AgentPipelinePanel from "./components/AgentPipelinePanel";
+import ArchitecturalImpactCard from "./components/ArchitecturalImpactCard";
 import Card from "./components/Card";
+import CategoryBreakdown from "./components/CategoryBreakdown";
 import CitationsList from "./components/CitationsList";
+import ConfidenceCard from "./components/ConfidenceCard";
 import DemoGallery from "./components/DemoGallery";
 import EmptyState from "./components/EmptyState";
+import EngineeringMetricsCard from "./components/EngineeringMetricsCard";
 import FileRiskList from "./components/FileRiskList";
 import Header from "./components/Header";
 import JudgeBadge from "./components/JudgeBadge";
 import LoadingState from "./components/LoadingState";
+import OperationalChecklistCard from "./components/OperationalChecklistCard";
+import SuggestedReviewersCard from "./components/SuggestedReviewersCard";
+import PositiveSignalsCard from "./components/PositiveSignalsCard";
+import UncertaintyCard from "./components/UncertaintyCard";
+import ProductionReadinessGauge from "./components/ProductionReadinessGauge";
 import RepoInput from "./components/RepoInput";
-import RiskFactorGrid from "./components/RiskFactorGrid";
+import RepositoryHealthPanel from "./components/RepositoryHealthPanel";
 import RiskGauge from "./components/RiskGauge";
 import RolloutCard from "./components/RolloutCard";
 import TestAreasCard from "./components/TestAreasCard";
-import type { AnalyzeResponse, DemoSummary } from "./types";
+import type { AnalyzeResponse, DemoSummary, RepositoryHealth } from "./types";
 
 export default function App() {
   const [demos, setDemos] = useState<DemoSummary[]>([]);
@@ -23,10 +32,21 @@ export default function App() {
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [repoHealth, setRepoHealth] = useState<RepositoryHealth | null>(null);
 
   useEffect(() => {
     fetchDemos().then(setDemos).catch(() => setDemos([]));
   }, []);
+
+  useEffect(() => {
+    if (!result) {
+      setRepoHealth(null);
+      return;
+    }
+    fetchRepositoryHealth({ repository: `${result.pr.owner}/${result.pr.repo}` })
+      .then(setRepoHealth)
+      .catch(() => setRepoHealth(null));
+  }, [result]);
 
   async function handleAnalyze(prUrl: string) {
     setLoading(true);
@@ -88,6 +108,15 @@ export default function App() {
                 </h2>
               </div>
               <div className="flex items-center gap-2">
+                <span
+                  className={`rounded-full px-2.5 py-1 font-mono text-[11px] font-semibold ${
+                    result.report.decision === "BLOCK"
+                      ? "bg-risk-high/15 text-risk-high"
+                      : "bg-risk-low/15 text-risk-low"
+                  }`}
+                >
+                  {result.report.decision}
+                </span>
                 <JudgeBadge judge={result.judge} />
                 {!result.ai_enabled && (
                   <span
@@ -100,19 +129,57 @@ export default function App() {
               </div>
             </div>
 
+            <Card title="Executive summary" eyebrow="Coordinator agent synthesis">
+              <p className="text-sm leading-relaxed text-paper">
+                {result.report.executive_summary || result.ai.summary}
+              </p>
+            </Card>
+
+            {repoHealth && repoHealth.analyses_count > 0 && (
+              <Card title="Repository health" eyebrow={`${result.pr.owner}/${result.pr.repo}`}>
+                <RepositoryHealthPanel health={repoHealth} />
+              </Card>
+            )}
+
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
               <Card title="Overall risk" eyebrow="Sentinel assessment" className="flex flex-col items-center justify-center lg:col-span-1">
-                <RiskGauge risk={result.ai.overall_risk} confidence={result.ai.confidence} />
-                <p className="mt-3 text-center text-sm text-fog">{result.ai.summary}</p>
+                <RiskGauge risk={result.ai.overall_risk} confidence={result.report.confidence} />
+                <p className="mt-3 text-center text-sm text-fog">Risk score: {result.report.risk_score}/100</p>
               </Card>
 
-              <Card title="Risk factors" eyebrow="Category scan" className="lg:col-span-2">
-                <RiskFactorGrid factors={result.ai.risk_factors} />
+              <Card title="Risk score breakdown" eyebrow="By category" className="lg:col-span-2">
+                <CategoryBreakdown categories={result.report.risk_categories} />
               </Card>
             </div>
 
-            <Card title="Specialist agent findings" eyebrow="Multi-agent analysis">
-              <AgentFindingsPanel agents={result.ai.agent_findings} />
+            {result.report.production_readiness && (
+              <Card title="Production readiness" eyebrow="Derived score">
+                <ProductionReadinessGauge readiness={result.report.production_readiness} />
+              </Card>
+            )}
+
+            <Card title="Architectural impact" eyebrow="Affected subsystems">
+              <ArchitecturalImpactCard impact={result.report.architectural_impact} />
+              {result.ai.operational_risks.length > 0 && (
+                <ul className="mt-3 flex flex-col gap-1.5 border-t border-steel pt-3">
+                  {result.ai.operational_risks.map((risk) => (
+                    <li key={risk} className="flex items-start gap-2 text-sm text-fog">
+                      <span className="mt-0.5 text-amber">▲</span>
+                      {risk}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+
+            {result.report.engineering_metrics && (
+              <Card title="Engineering change summary" eyebrow="Deterministic metrics">
+                <EngineeringMetricsCard metrics={result.report.engineering_metrics} />
+              </Card>
+            )}
+
+            <Card title="Agent pipeline" eyebrow="LangGraph execution">
+              <AgentPipelinePanel decisions={result.report.agent_decisions} />
             </Card>
 
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -121,12 +188,21 @@ export default function App() {
               </Card>
 
               <div className="flex flex-col gap-6">
-                <Card title="Rollout recommendation" eyebrow="Deployment strategy">
-                  <RolloutCard
-                    strategy={result.ai.rollout_strategy}
-                    reason={result.ai.rollout_reason}
-                    rollbackRequired={result.ai.rollback_required}
-                  />
+                <Card title="Deployment recommendation" eyebrow="Rollout strategy">
+                  {result.report.deployment_recommendation ? (
+                    <RolloutCard
+                      strategy={result.report.deployment_recommendation.strategy}
+                      reason={result.report.deployment_recommendation.reason}
+                      rollbackRequired={result.report.deployment_recommendation.rollback_required}
+                      alternativesConsidered={result.report.deployment_recommendation.alternatives_considered}
+                    />
+                  ) : (
+                    <RolloutCard
+                      strategy={result.ai.rollout_strategy}
+                      reason={result.ai.rollout_reason}
+                      rollbackRequired={result.ai.rollback_required}
+                    />
+                  )}
                 </Card>
                 <Card title="Suggested test areas" eyebrow="Before you merge">
                   <TestAreasCard
@@ -134,25 +210,39 @@ export default function App() {
                     coveragePct={result.ai.test_coverage_estimate_pct}
                   />
                 </Card>
+                {result.report.operational_checklist.length > 0 && (
+                  <Card title="Operational checklist" eyebrow="Before merge">
+                    <OperationalChecklistCard items={result.report.operational_checklist} />
+                  </Card>
+                )}
+                {result.report.suggested_reviewers.length > 0 && (
+                  <Card title="Suggested reviewers" eyebrow="Who should sign off">
+                    <SuggestedReviewersCard reviewers={result.report.suggested_reviewers} />
+                  </Card>
+                )}
+                {result.report.positive_signals.length > 0 && (
+                  <Card title="Why this isn't rated higher" eyebrow="Positive evidence">
+                    <PositiveSignalsCard signals={result.report.positive_signals} />
+                  </Card>
+                )}
+                {result.report.uncertainties.length > 0 && (
+                  <Card title="What we couldn't determine" eyebrow="Known gaps in this analysis">
+                    <UncertaintyCard items={result.report.uncertainties} />
+                  </Card>
+                )}
               </div>
             </div>
 
-            <Card title="Repository context" eyebrow="Retrieved via RAG">
+            <Card title="Repository context (RAG)" eyebrow="Retrieved documents & snippets">
               <CitationsList rag={result.rag} />
             </Card>
 
-            <Card title="Architectural impact & operational risks" eyebrow="Wider context">
-              <p className="mb-3 text-sm leading-relaxed text-paper">
-                {result.ai.architectural_impact}
-              </p>
-              <ul className="flex flex-col gap-1.5">
-                {result.ai.operational_risks.map((risk) => (
-                  <li key={risk} className="flex items-start gap-2 text-sm text-fog">
-                    <span className="mt-0.5 text-amber">▲</span>
-                    {risk}
-                  </li>
-                ))}
-              </ul>
+            <Card title="Confidence" eyebrow="Evidence-backed explanation">
+              {result.report.confidence_explanation ? (
+                <ConfidenceCard confidence={result.report.confidence_explanation} />
+              ) : (
+                <p className="text-sm text-fog">{result.report.confidence}% confidence.</p>
+              )}
             </Card>
           </div>
         )}

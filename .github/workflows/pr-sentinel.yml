@@ -9,7 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OLLAMA_BASE_URL: http://localhost:11434
-      OLLAMA_MODEL: llama3.1
+      # llama3.1 (8B) is too slow for a CPU-only GitHub-hosted runner (2 vCPU) —
+      # a single agent call can exceed its own timeout before it even finishes
+      # loading the model. llama3.2 (3B) trades some analysis depth for something
+      # that actually completes in CI; run a bigger model on self-hosted runners.
+      OLLAMA_MODEL: llama3.2
       OLLAMA_EMBED_MODEL: nomic-embed-text
       CHROMA_PERSIST_DIR: ./backend/tmpchroma
     steps:
@@ -41,6 +45,21 @@ jobs:
           echo "Ollama did not start in time"
           exit 1
 
+      - name: Pull Ollama models
+        run: |
+          docker exec pr-sentinel-ollama ollama pull "${OLLAMA_MODEL}"
+          docker exec pr-sentinel-ollama ollama pull "${OLLAMA_EMBED_MODEL}"
+
+      - name: Warm up Ollama models
+        run: |
+          # Loading model weights into memory on first inference can itself take
+          # a while — do that here, outside the per-request timeouts the app
+          # uses, so the actual analysis run isn't racing a cold start.
+          curl -sS http://localhost:11434/api/generate \
+            -d "{\"model\": \"${OLLAMA_MODEL}\", \"prompt\": \"hi\", \"stream\": false}" > /dev/null
+          curl -sS http://localhost:11434/api/embeddings \
+            -d "{\"model\": \"${OLLAMA_EMBED_MODEL}\", \"prompt\": \"hi\"}" > /dev/null
+
       - name: Analyze pull request
         id: analyze
         continue-on-error: true
@@ -54,6 +73,18 @@ jobs:
             --token "${{ secrets.GITHUB_TOKEN }}"
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
+      - name: Read report markdown
+        id: report
+        if: always()
+        run: |
+          echo "report_body<<EOF" >> "$GITHUB_OUTPUT"
+          if [ -f reports/report.md ]; then
+            cat reports/report.md
+          else
+            echo "No report generated."
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
       - name: Upload report artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -62,7 +93,7 @@ jobs:
           path: reports
 
       - name: Comment PR summary
-        if: always() && github.event_name == 'pull_request' && hashFiles('reports/report.md') != ''
+        if: always() && github.event_name == 'pull_request'
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

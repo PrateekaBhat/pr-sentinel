@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import re
 
-from .models import HeuristicFactor, HeuristicResult, PullRequestData
+from .models import HeuristicFactor, HeuristicResult, PullRequestData, ScoreMathFactor
 
 # Each rule: (key, label, weight, path/content pattern)
 PATH_RULES: list[tuple[str, str, int, re.Pattern]] = [
     ("auth", "Authentication logic touched", 40, re.compile(r"(^|/)(auth|authn|authz|login|session)(/|\.)", re.I)),
     ("payment", "Payment / billing logic touched", 45, re.compile(r"(^|/)(payment|billing|checkout|stripe|invoice)(/|\.)", re.I)),
     ("config", "Configuration files changed", 30, re.compile(r"(^|/)(config|settings|\.env|helm|k8s|kubernetes)(/|\.)", re.I)),
-    ("infra", "Infrastructure / deployment files changed", 30, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
+    # Reduced from 30 → 20: a CI/CD workflow change is lower risk than a genuine
+    # IaC or deployment change (Terraform, Kubernetes, Docker). The workflow
+    # heuristic fires frequently on routine PRs and was over-inflating scores.
+    ("infra", "Infrastructure / deployment files changed", 20, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
     ("migration", "Database migration detected", 35, re.compile(r"(^|/)(migrations?|schema)(/|\.).*\.(sql|py|ts|js)$|alembic", re.I)),
     ("api_contract", "Public API contract changed", 25, re.compile(r"(^|/)(routes?|controllers?|api|graphql|schema\.graphql|openapi)(/|\.)", re.I)),
 ]
@@ -49,13 +52,16 @@ def analyze(pr: PullRequestData) -> HeuristicResult:
 
     non_test_files = [f for f in pr.files if not TEST_PATH_RE.search(f.filename)]
     if non_test_files and not tests_touched:
-        score += 15
+        # Reduced from 15 → 10: missing tests is a signal worth noting, but a
+        # documentation-heavy or report-generation PR should not score 15 pts
+        # just because it touches no test files.
+        score += 10
         factors.append(
             HeuristicFactor(
                 key="no_tests",
                 label="No test files touched",
                 triggered=True,
-                weight=15,
+                weight=10,
                 reason="This PR changes code but doesn't add or modify any tests.",
             )
         )
@@ -85,12 +91,55 @@ def analyze(pr: PullRequestData) -> HeuristicResult:
             )
         )
 
+    score_math: list[ScoreMathFactor] = [
+        ScoreMathFactor(factor="Base Risk", points=0, reason="Clean starting baseline")
+    ]
+    for factor in factors:
+        if factor.triggered:
+            score_math.append(
+                ScoreMathFactor(factor=factor.label, points=factor.weight, reason=factor.reason)
+            )
+
     score = min(score, 100)
 
     return HeuristicResult(
         score=score,
         factors=factors,
+        score_math=score_math,
         tests_touched=tests_touched,
         tests_deleted=tests_deleted,
         migration_touched="migration" in matched_keys,
     )
+
+
+def calculate_review_effort(pr: PullRequestData, heuristics: HeuristicResult) -> tuple[int, str]:
+    """Deterministically estimates the time required for a thorough human code review."""
+    total_changes = pr.additions + pr.deletions
+    subsystems_count = pr.changed_files_count
+
+    # Base estimate from change size
+    if total_changes < 50 and subsystems_count <= 2:
+        minutes = 5
+    elif total_changes < 200:
+        minutes = 15
+    elif total_changes < 600:
+        minutes = 30
+    elif total_changes < 1200:
+        minutes = 60
+    else:
+        minutes = 120
+
+    # Risk adjustments
+    if heuristics.score >= 70:
+        minutes = max(minutes, 60)
+    elif heuristics.score >= 40:
+        minutes = max(minutes, 30)
+
+    if minutes < 60:
+        label = f"{minutes} minutes"
+    elif minutes == 60:
+        label = "1 hour"
+    else:
+        label = f"{minutes // 60} hours {minutes % 60} minutes" if minutes % 60 else f"{minutes // 60} hours"
+
+    return minutes, label

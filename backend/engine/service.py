@@ -3,17 +3,33 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import github_client, heuristics
+from . import github_client
+from . import heuristics as heuristics_mod
 from .agents.graph import run_pipeline
 from .ai_analyzer import analyze_with_heuristics_only
+from .categories import (
+    build_agent_decisions,
+    build_architectural_impact,
+    build_category_breakdown,
+    build_confidence_explanation,
+)
 from .config import get_settings
 from .github_client import GitHubError
+from . import history
+from .metrics import build_engineering_metrics, build_operational_checklist, derive_production_readiness_score
+from .reviewers import build_suggested_reviewers
+from .evidence_gaps import build_positive_signals, build_uncertainties
+from datetime import datetime, timezone
+
 from .models import (
     AIAnalysis,
     AnalyzeResponse,
     AnalyzeRequest,
     AgentStatus,
+    DeploymentRecommendation,
+    ExecutionMetrics,
     HeuristicResult,
+    JudgeVerdict,
     PullRequestData,
     RAGContext,
     RepositoryMetadata,
@@ -24,6 +40,7 @@ from .models import (
 )
 from .ollama_client import OllamaError
 from .rag.retriever import get_rag_context
+from .report_renderer import render_markdown
 
 
 def _infer_technologies(files: list[Any]) -> list[str]:
@@ -113,7 +130,9 @@ def _build_timeline(
         status = state.get(f"{domain}_status")
         if status is None:
             continue
-        timeline.append(TimelineStage(stage=status.label, duration_ms=status.duration_ms))
+        label = status["label"] if isinstance(status, dict) else status.label
+        duration = status["duration_ms"] if isinstance(status, dict) else status.duration_ms
+        timeline.append(TimelineStage(stage=label, duration_ms=duration))
     final_ms = 0
     if state.get("coordinator_duration_ms") is not None:
         final_ms += state["coordinator_duration_ms"]
@@ -132,6 +151,14 @@ def _infer_repository_metadata(pr: PullRequestData, rag: RAGContext) -> Reposito
     )
 
 
+_DEPLOYMENT_ALTERNATIVES = {
+    "Standard": ["Canary (unnecessary — low measured risk)", "Manual Approval (unnecessary overhead for this change)"],
+    "Canary": ["Standard (skipped — this touches a live code path)", "Blue/Green (more than this change warrants)"],
+    "Blue/Green": ["Canary (insufficient isolation for an infra/schema change)", "Standard (too risky to ship all-at-once)"],
+    "Manual Approval": ["Canary (not sufficient given the sensitivity of what changed)", "Standard (too risky without human sign-off)"],
+}
+
+
 def _build_report(
     pr: PullRequestData,
     heuristics: HeuristicResult,
@@ -140,37 +167,96 @@ def _build_report(
     state: dict[str, Any],
     repo_loaded_ms: int,
     repo_context_ms: int,
+    ai_enabled: bool,
+    judge: JudgeVerdict | None,
+    total_duration_ms: int,
 ) -> RiskReport:
     decision = "BLOCK" if ai.overall_risk == RiskLevel.HIGH else "ALLOW"
+    category_breakdown = build_category_breakdown(pr, heuristics, ai)
+    architectural_impact = build_architectural_impact(pr, category_breakdown, ai)
+    confidence_explanation = build_confidence_explanation(
+        heuristics, ai, rag, ai_enabled, judge.grounded if judge else None
+    )
+    effort_minutes, effort_label = heuristics_mod.calculate_review_effort(pr, heuristics)
+
+    # Rollout metadata mapping per strategy
+    monitoring_map = {
+        "Canary": "Monitor CI pipeline step completion, runner resource usage, and error rate during early deployment.",
+        "Standard": "Standard telemetry monitoring; verify post-merge automated build checks.",
+        "Blue/Green": "Monitor database connection pools, migration lock times, and API error rates on green environment.",
+        "Manual Approval": "Verify staging environment end-to-end integration tests before manual production promotion.",
+    }
+    rollback_map = {
+        "Canary": "Immediate rollback on any pipeline failure or unexpected workflow runner exit code.",
+        "Standard": "Standard git revert if post-merge production regression is detected.",
+        "Blue/Green": "Instant traffic switch back to blue environment if green telemetry degrades.",
+        "Manual Approval": "Revert commit and restore database snapshot if schema migration fails.",
+    }
+    approval_map = {
+        "Canary": "Platform / DevOps Lead",
+        "Standard": "Peer Code Reviewer",
+        "Blue/Green": "Lead Backend & SRE Engineer",
+        "Manual Approval": "Staff Security & Infrastructure Code Owner",
+    }
+
+    deployment_recommendation = DeploymentRecommendation(
+        strategy=ai.rollout_strategy,
+        reason=ai.rollout_reason,
+        monitoring_focus=monitoring_map.get(ai.rollout_strategy, "Monitor error rates and service latency post-merge."),
+        rollback_trigger=rollback_map.get(ai.rollout_strategy, "Revert pull request if production telemetry degrades."),
+        approval_level=approval_map.get(ai.rollout_strategy, "Standard Peer Review"),
+        alternatives_considered=_DEPLOYMENT_ALTERNATIVES.get(ai.rollout_strategy, []),
+        rollback_required=ai.rollback_required,
+    )
+
+    engineering_metrics = build_engineering_metrics(pr, category_breakdown)
+    operational_checklist = build_operational_checklist(category_breakdown, heuristics, engineering_metrics)
+    production_readiness = derive_production_readiness_score(
+        heuristics, category_breakdown, confidence_explanation.score, engineering_metrics
+    )
+    suggested_reviewers = build_suggested_reviewers(pr, category_breakdown)
+    positive_signals = build_positive_signals(heuristics)
+    uncertainties = build_uncertainties(pr, heuristics, ai, rag, category_breakdown)
+
     return RiskReport(
         decision=decision,
         risk_score=heuristics.score,
-        confidence=ai.confidence,
+        confidence=confidence_explanation.score,
+        review_effort_minutes=effort_minutes,
+        review_effort_label=effort_label,
         deployment_strategy=ai.rollout_strategy,
+        score_math=heuristics.score_math,
         risk_breakdown=_build_risk_breakdown(heuristics),
+        risk_categories=category_breakdown,
         findings=_build_findings(heuristics, ai),
         evidence=_build_evidence(heuristics, ai),
         timeline=_build_timeline(repo_loaded_ms, repo_context_ms, state),
         agent_statuses=_build_agent_statuses(state),
+        agent_decisions=build_agent_decisions(state),
         repository_metadata=_infer_repository_metadata(pr, rag),
+        summary=ai.summary,
+        executive_summary=ai.executive_summary or ai.summary,
+        architectural_impact=architectural_impact,
+        confidence_explanation=confidence_explanation,
+        deployment_recommendation=deployment_recommendation,
+        engineering_metrics=engineering_metrics,
+        operational_checklist=operational_checklist,
+        production_readiness=production_readiness,
+        suggested_reviewers=suggested_reviewers,
+        positive_signals=positive_signals,
+        uncertainties=uncertainties,
+        execution_metrics=ExecutionMetrics(
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            total_duration_ms=total_duration_ms,
+            ai_enabled=ai_enabled,
+            rag_cache_hit=rag.cache_hit,
+        ),
     )
 
 
 def render_comment(response: AnalyzeResponse) -> str:
-    findings = response.report.findings or [response.ai.summary]
-    details = "\n".join(f"• {item}" for item in findings[:5])
-    return (
-        "## PR Sentinel Report\n\n"
-        f"Overall Risk: {response.ai.overall_risk}\n\n"
-        f"Decision: {response.report.decision}\n\n"
-        f"Risk Score: {response.report.risk_score} / 100\n\n"
-        f"Confidence: {response.ai.confidence}%\n\n"
-        "Top Findings\n\n"
-        f"{details}\n\n"
-        "Recommended Deployment\n\n"
-        f"{response.ai.rollout_strategy}\n\n"
-        "View Full Report\n"
-    )
+    """Polished Markdown suitable for posting as a GitHub PR comment."""
+    return render_markdown(response)
 
 
 async def analyze_pr_url(pr_url: str, token: str = "") -> AnalyzeResponse:
@@ -194,15 +280,21 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
 
     repo_context_ms = int((time.perf_counter_ns() - start) / 1_000_000) - repo_loaded_ms
 
-    heuristic_result = heuristics.analyze(pr)
+    heuristic_result = heuristics_mod.analyze(pr)
     ai_enabled = True
     ai_error: str | None = None
     judge_result = None
     state: dict[str, Any] = {}
     try:
         state = await run_pipeline(pr, heuristic_result, rag_context)
-        ai_result = state["coordinator_result"]
+        ai_result = state.get("coordinator_result")
         judge_result = state.get("judge_result")
+        if ai_result is None:
+            # Coordinator failed gracefully (see coordinator_node) — specialist agent
+            # findings/timing in `state` are still real and get reflected in the report.
+            ai_enabled = False
+            ai_error = state.get("coordinator_error") or "Coordinator did not produce a result."
+            ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
     except OllamaError as exc:
         ai_enabled = False
         ai_error = str(exc)
@@ -212,7 +304,12 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         ai_error = f"Unexpected error running the agent pipeline: {exc}"
         ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
 
-    report = _build_report(pr, heuristic_result, ai_result, rag_context, state, repo_loaded_ms, repo_context_ms)
+    total_duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+    report = _build_report(
+        pr, heuristic_result, ai_result, rag_context, state,
+        repo_loaded_ms, repo_context_ms, ai_enabled, judge_result,
+        total_duration_ms,
+    )
     response = AnalyzeResponse(
         pr=pr,
         heuristics=heuristic_result,
@@ -224,6 +321,10 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         judge=judge_result,
         source="live",
     )
+    try:
+        history.record_analysis(response)
+    except Exception:  # noqa: BLE001 — history is best-effort, never blocks the response
+        pass
     return response
 
 

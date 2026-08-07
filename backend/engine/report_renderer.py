@@ -15,79 +15,294 @@ def _decision_emoji(decision: str) -> str:
     return "🚫" if decision == "BLOCK" else "✅"
 
 
+def _format_timestamp(raw: str) -> str:
+    """Render an ISO-8601 timestamp (often with microseconds, e.g.
+    '2026-08-06T10:04:37.276438+00:00') as a short, human-readable UTC
+    string, e.g. 'Aug 6, 2026, 10:04 UTC'. Falls back to the raw value
+    (trimmed to whole seconds) if parsing fails."""
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return f"{dt.strftime('%b %-d, %Y, %H:%M')} UTC"
+    except (ValueError, TypeError):
+        return raw[:19].replace("T", " ") + " UTC" if len(raw) >= 19 else raw
+
+
+def _format_duration(ms: int | float) -> str:
+    """Render a millisecond duration as a compact, human-readable string.
+    Sub-second durations stay in ms (e.g. '820ms'); anything at or above
+    one second is shown in seconds (e.g. '4.5s'), and a minute or more
+    is shown as 'Xm Ys'."""
+    ms = round(ms)
+    if ms < 1000:
+        return f"{ms}ms"
+    seconds = ms / 1000
+    if seconds < 60:
+        text = f"{seconds:.1f}"
+        if text.endswith(".0"):
+            text = text[:-2]
+        return f"{text}s"
+    minutes, rem_seconds = divmod(seconds, 60)
+    return f"{int(minutes)}m {rem_seconds:.0f}s"
+
+
 def render_markdown(response: AnalyzeResponse) -> str:
-    """Generate a professional Markdown report suitable for GitHub PR comments and artifacts."""
+    """Generate a production engineering risk assessment, in Markdown, suitable for
+    GitHub PR comments: explainable (every score traces to evidence), auditable
+    (agent-by-agent and RAG-by-RAG breakdown), and free of raw heuristic-speak."""
     pr = response.pr
     report = response.report
     ai = response.ai
     rag = response.rag
     metrics = report.execution_metrics
-    generated = metrics.generated_at if metrics else datetime.now(timezone.utc).isoformat()
+    generated_raw = metrics.generated_at if metrics else datetime.now(timezone.utc).isoformat()
+    generated = _format_timestamp(generated_raw)
+
+    decision_emoji = _decision_emoji(report.decision)
 
     lines: list[str] = [
-        "# PR Sentinel — Deployment Risk Report",
+        "# PR Sentinel — Release Risk Assessment",
         "",
-        f"**Generated:** {generated}",
+        f"**Generated:** {generated}  ·  **Repository:** [{pr.repository.full_name}]({pr.url})  ·  **PR:** #{pr.number}",
         "",
-        "## Summary",
+        f"### {decision_emoji} {report.decision} — {_risk_label(ai.overall_risk)} risk (score {report.risk_score}/100)",
         "",
-        report.summary or ai.summary,
+        "## Executive Summary",
         "",
-        f"| Field | Value |",
-        f"|-------|-------|",
+        report.executive_summary or report.summary or ai.summary,
+        "",
+        "| | |",
+        "|---|---|",
         f"| **Decision** | `{report.decision}` |",
         f"| **Overall Risk** | `{_risk_label(ai.overall_risk)}` |",
         f"| **Risk Score** | {report.risk_score} / 100 |",
-        f"| **Confidence** | {report.confidence}% |",
-        f"| **Deployment** | {report.deployment_strategy} |",
+        f"| **Confidence** | {report.confidence_explanation.level if report.confidence_explanation else 'Medium'} ({report.confidence}% — {report.confidence_explanation.evidence_completeness if report.confidence_explanation else 'n/a'} evidence) |",
+        f"| **Estimated Review Effort** | ⏱️ `{report.review_effort_label}` |",
+        f"| **Recommended Deployment** | `{report.deployment_strategy}` |",
         "",
-        "## Repository",
+        "## Pull Request",
         "",
-        f"- **Repository:** [{pr.repository.full_name}]({pr.url})",
-        f"- **PR:** #{pr.number} — {pr.title}",
+        f"- **Title:** {pr.title}",
         f"- **Author:** @{pr.author}",
         f"- **Branch:** `{pr.head_branch or 'unknown'}` → `{pr.base_branch or report.repository_intelligence.default_branch or 'main'}`",
-        f"- **Language:** {report.repository_intelligence.primary_language or pr.repository.primary_language or 'Unknown'}",
-        f"- **Framework:** {report.repository_intelligence.framework or pr.repository.framework or 'Unknown'}",
-        f"- **Stars:** {pr.repository.stars:,}",
+        f"- **Language / Framework:** {report.repository_intelligence.primary_language or pr.repository.primary_language or 'Unknown'} / "
+        f"{report.repository_intelligence.framework or pr.repository.framework or 'Unknown'}",
         f"- **Files Changed:** {pr.changed_files_count} (+{pr.additions}/-{pr.deletions})",
-        f"- **Commits:** {len(pr.commit_messages)}",
         f"- **Merge Status:** {pr.mergeable_state or 'unknown'}",
         "",
     ]
 
-    intel = report.repository_intelligence
-    if intel.containerization or intel.ci_provider or intel.infrastructure:
-        lines.extend(["## Repository Intelligence", ""])
-        if intel.containerization:
-            lines.append(f"- **Containerization:** {intel.containerization}")
-        if intel.ci_provider:
-            lines.append(f"- **CI Provider:** {intel.ci_provider}")
-        if intel.infrastructure:
-            lines.append(f"- **Infrastructure:** {', '.join(intel.infrastructure)}")
-        lines.append(f"- **Estimated Size:** {intel.estimated_size}")
-        lines.append(f"- **Default Branch:** `{intel.default_branch or 'main'}`")
+    # --- Architectural Impact -------------------------------------------------
+    impact = report.architectural_impact
+    lines.extend(["## Architectural Impact", ""])
+    if impact.affected_subsystems:
+        lines.append("**Affected subsystems:** " + ", ".join(f"`{s}`" for s in impact.affected_subsystems))
+        lines.append("")
+    lines.append(impact.narrative or "No clearly affected subsystems were detected.")
+    lines.append("")
+
+    # --- Engineering Change Summary (deterministic metrics) --------------------
+    em = report.engineering_metrics
+    if em:
+        lines.extend(["## Engineering Change Summary", ""])
+        lines.append("| Metric | Value |")
+        lines.append("|---|---|")
+        lines.append(f"| Public APIs / routes modified | {em.public_apis_modified} |")
+        lines.append(f"| API-layer files changed | {em.api_routes_changed} |")
+        lines.append(f"| Configuration files changed | {em.config_files_changed} |")
+        lines.append(f"| Workflow / CI files changed | {em.workflow_files_changed} |")
+        lines.append(f"| Documentation files changed | {em.documentation_files_changed} ({em.documentation_coverage_pct}% of diff) |")
+        lines.append(f"| Test files touched | {em.test_files_touched} |")
+        lines.append(f"| Dependency manifests updated | {em.dependency_updates} |")
+        lines.append(f"| Lines added / removed | +{em.lines_added} / -{em.lines_removed} |")
+        lines.append(f"| Files deleted | {em.deleted_files} |")
+        lines.append(f"| Largest file touched | `{em.largest_file}` ({em.largest_file_changes} changes) |")
+        lines.append(f"| Most impacted subsystem | {em.most_impacted_subsystem} |")
+        lines.append(f"| Risk density (score / files changed) | {em.risk_density} |")
+        lines.append(f"| Critical file ratio | {em.critical_file_ratio} |")
+        lines.append(f"| Test ratio (test files / code files) | {em.test_ratio} |")
+        lines.append(f"| Documentation ratio | {em.documentation_ratio} |")
+        lines.append(f"| Average file diff size | {em.average_file_diff_size} lines |")
+        lines.append(f"| Hotspot concentration | {em.hotspot_concentration_pct}% of diff in largest file |")
         lines.append("")
 
+    # --- Score Calculation Math ------------------------------------------------
+    if report.score_math:
+        lines.extend(["## Score Calculation Math", ""])
+        lines.append("The overall risk score is calculated deterministically from triggered rule weights:")
+        lines.append("")
+        lines.append("| Factor | Points | Rule / Evidence |")
+        lines.append("|---|---|---|")
+        for item in report.score_math:
+            pts = f"+{item.points}" if item.points > 0 else f"{item.points}"
+            lines.append(f"| {item.factor} | `{pts}` | {item.reason} |")
+        lines.append(f"| **Total Calculated Score** | **`{report.risk_score}`** | |")
+        lines.append("")
+
+    # --- Score breakdown by category -------------------------------------------
     if report.risk_categories:
-        lines.extend(["## Risk Breakdown", ""])
+        lines.extend(["## Risk Score Breakdown", ""])
+        lines.append("| Category | Status | Score | Evidence |")
+        lines.append("|---|---|---|---|")
         for cat in report.risk_categories:
-            lines.append(f"### {cat.category} — `{_risk_label(cat.status)}` (score: {cat.score})")
-            for reason in cat.reasons:
-                lines.append(f"- {reason}")
-            if cat.evidence_files:
-                files = ", ".join(f"`{f}`" for f in cat.evidence_files[:5])
-                lines.append(f"- **Evidence files:** {files}")
+            lines.append(f"| {cat.category} | `{_risk_label(cat.status)}` | {cat.score}/100 | {len(cat.evidence)} item(s) |")
+        lines.append("")
+
+        for cat in report.risk_categories:
+            if not cat.evidence:
+                continue
+            lines.append(f"<details><summary><strong>{cat.category}</strong> — {_risk_label(cat.status)} ({cat.score}/100)</summary>")
+            lines.append("")
+            lines.append(cat.summary)
+            lines.append("")
+            for item in cat.evidence:
+                conf_lbl = "High" if item.confidence >= 75 else ("Medium" if item.confidence >= 50 else "Low")
+                lines.append(f"- **`{item.file_path}`** — {_risk_label(item.severity)} severity ({conf_lbl} confidence)")
+                lines.append(f"  - _Why it matters:_ {item.explanation}")
+                if item.snippet:
+                    lines.append("  - _Evidence:_")
+                    lines.append("    ```diff")
+                    for l in item.snippet.splitlines():
+                        lines.append(f"    {l}")
+                    lines.append("    ```")
+                lines.append(f"  - _Recommended action:_ {item.recommended_action}")
+            lines.append("")
+            lines.append("</details>")
             lines.append("")
 
-    if report.evidence_items:
-        lines.extend(["## Evidence", ""])
-        for item in report.evidence_items:
-            lines.append(f"### {item.category}")
-            if item.files:
-                lines.append(f"**Detected from:** {', '.join(f'`{f}`' for f in item.files)}")
-            lines.append(f"**Reason:** {item.reason}")
+    # --- LangGraph agent pipeline ------------------------------------------------
+    if report.agent_decisions:
+        lines.extend(["## Agent Pipeline (LangGraph)", ""])
+        lines.append("Each specialist agent only reviews files in its own domain; the coordinator agent")
+        lines.append("synthesizes their output (below) into the executive summary and risk breakdown above.")
+        lines.append("")
+        lines.append("| Agent | Decision | Confidence | Time |")
+        lines.append("|---|---|---|---|")
+        for d in report.agent_decisions:
+            conf_lbl = "High" if d.confidence >= 75 else ("Medium" if d.confidence >= 50 else "Low")
+            lines.append(f"| {d.label} | {d.decision} | {conf_lbl} | {_format_duration(d.execution_time_ms)} |")
+        lines.append("")
+        for d in report.agent_decisions:
+            lines.append(f"<details><summary><strong>{d.label}</strong> reasoning</summary>")
             lines.append("")
+            lines.append(d.reasoning or "_No further reasoning recorded._")
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
+
+    # --- RAG pipeline ------------------------------------------------------------
+    lines.extend(["## Repository Context (RAG)", ""])
+    if rag.scanned:
+        cache_label = "cache hit" if rag.cache_hit else "freshly indexed"
+        lines.append(
+            f"Indexed **{rag.indexed_files}** repository document(s) into **{rag.chunks_indexed}** chunk(s) "
+            f"from branch `{rag.default_branch}` ({cache_label})."
+        )
+        lines.append("")
+        if rag.indexed_doc_paths:
+            lines.append("**Documents retrieved:**")
+            for path in rag.indexed_doc_paths:
+                lines.append(f"- `{path}`")
+            lines.append("")
+        if rag.retrieved:
+            lines.append("**Top repository context retrieved:**")
+            lines.append("")
+            for chunk in rag.retrieved[:5]:
+                lines.append(f"#### `{chunk.path}`")
+                if chunk.retrieval_reason:
+                    lines.append(f"**Why retrieved:** {chunk.retrieval_reason}")
+                lines.append(f"```")
+                lines.append(f"{chunk.snippet[:300]}{'...' if len(chunk.snippet) > 300 else ''}")
+                lines.append(f"```")
+                lines.append("")
+        else:
+            lines.append("No chunk was similar enough to the diff to be surfaced as supporting context.")
+            lines.append("")
+    else:
+        lines.append(f"Repository context was not retrieved for this run ({rag.skip_reason or 'not available'}).")
+        lines.append("")
+
+    # --- Operational Checklist --------------------------------------------------
+    if report.operational_checklist:
+        lines.extend(["## Operational Checklist", "", "**Before Merge**", ""])
+        for item in report.operational_checklist:
+            lines.append(f"- [ ] {item.task} — _{item.reason}_")
+        lines.append("")
+
+    # --- Suggested Reviewers -----------------------------------------------------
+    if report.suggested_reviewers:
+        lines.extend(["## Suggested Reviewers", ""])
+        for reviewer in report.suggested_reviewers:
+            tag = "🔒 Required" if reviewer.required else "Recommended"
+            lines.append(f"- **{reviewer.role}** ({tag}) — {reviewer.reason}")
+        lines.append("")
+
+    # --- Why this isn't rated higher ----------------------------------------------
+    if report.positive_signals:
+        lines.extend(["## Why This Isn't Rated Higher", ""])
+        for signal in report.positive_signals:
+            lines.append(f"- ✅ {signal.label} — _{signal.reason}_")
+        lines.append("")
+
+    # --- What we couldn't determine ------------------------------------------------
+    if report.uncertainties:
+        lines.extend(["## What We Couldn't Determine", ""])
+        for item in report.uncertainties:
+            lines.append(f"- ⚠️ **{item.area}** — {item.reason}")
+        lines.append("")
+
+    # --- Deployment Recommendation ------------------------------------------------
+    rec = report.deployment_recommendation
+    lines.extend(["## Deployment Recommendation", ""])
+    if rec:
+        lines.append(f"**Chosen strategy: `{rec.strategy}`**")
+        lines.append("")
+        lines.append(rec.reason or ai.rollout_reason)
+        lines.append("")
+        if rec.monitoring_focus:
+            lines.append(f"- **Monitoring focus:** {rec.monitoring_focus}")
+        if rec.rollback_trigger:
+            lines.append(f"- **Rollback trigger:** {rec.rollback_trigger}")
+        if rec.approval_level:
+            lines.append(f"- **Required approval:** `{rec.approval_level}`")
+        lines.append(f"- **Rollback plan required:** {'Yes' if rec.rollback_required else 'No'}")
+        lines.append("")
+        if rec.alternatives_considered:
+            lines.append("**Alternatives considered:**")
+            for alt in rec.alternatives_considered:
+                lines.append(f"- {alt}")
+            lines.append("")
+
+    # --- Confidence explanation ------------------------------------------------
+    conf = report.confidence_explanation
+    if conf:
+        lines.extend(["## Confidence", ""])
+        lines.append(f"**{conf.level}** ({conf.score}% score) — {conf.evidence_completeness} evidence")
+        lines.append("")
+        lines.append(conf.narrative)
+        lines.append("")
+        if conf.checks:
+            for check in conf.checks:
+                lines.append(f"- {'✓' if check.passed else '✗'} {check.label}")
+        else:
+            lines.append(f"- Repository context available: {'Yes' if conf.repository_context_available else 'No'}")
+            lines.append(f"- LLM and heuristic analyses agree: {'Yes' if conf.llm_heuristic_agreement else 'No'}")
+        lines.append("")
+
+    # --- Production Readiness Score ---------------------------------------------
+    readiness = report.production_readiness
+    if readiness:
+        lines.extend(["## Production Readiness", ""])
+        lines.append(f"**{readiness.score}/100 — {readiness.label}**")
+        lines.append("")
+        if readiness.deductions:
+            for d in readiness.deductions:
+                lines.append(f"- {d}")
+        else:
+            lines.append("No readiness deductions — this change is scored at full readiness.")
+        lines.append("")
 
     if report.high_risk_files:
         lines.extend(["## Changed High-Risk Files", ""])
@@ -95,58 +310,12 @@ def render_markdown(response: AnalyzeResponse) -> str:
             lines.append(f"- `{f}`")
         lines.append("")
 
-    lines.extend([
-        "## Deployment Recommendation",
-        "",
-        f"**Strategy:** {ai.rollout_strategy}",
-        "",
-        f"**Reason:** {ai.rollout_reason}",
-        "",
-        f"**Confidence:** {ai.confidence}%",
-        "",
-        f"**Rollback Required:** {'Yes' if ai.rollback_required else 'No'}",
-        "",
-    ])
-
-    if report.agent_statuses:
-        lines.extend(["## Agent Pipeline", ""])
-        lines.append("| Agent | Status | Files | Duration |")
-        lines.append("|-------|--------|-------|----------|")
-        for status in report.agent_statuses:
-            dur = f"{status.duration_ms}ms" if status.duration_ms else "—"
-            lines.append(
-                f"| {status.label} | {status.status} | {status.files_reviewed} | {dur} |"
-            )
-        lines.append("")
-
-    if rag.scanned:
-        cache_label = "Repository context cache hit" if rag.cache_hit else "Repository indexed"
-        lines.extend([
-            "## Repository Context (RAG)",
-            "",
-            f"**Status:** {cache_label}",
-            f"**Branch:** `{rag.default_branch}`",
-            f"**Indexed documents:** {rag.indexed_files} file(s), {rag.chunks_indexed} chunk(s)",
-            "",
-        ])
-        if rag.indexed_doc_paths:
-            lines.append("**Documents retrieved:**")
-            for path in rag.indexed_doc_paths:
-                lines.append(f"- `{path}`")
-            lines.append("")
-        if rag.retrieved:
-            lines.append("**Top retrieved chunks:**")
-            for chunk in rag.retrieved[:5]:
-                lines.append(f"- `[{chunk.path}]` (score: {chunk.score:.2f})")
-                lines.append(f"  > {chunk.snippet[:200]}...")
-            lines.append("")
-
     if report.timeline:
         lines.extend(["## Execution Metrics", ""])
         total = metrics.total_duration_ms if metrics else sum(t.duration_ms for t in report.timeline)
-        lines.append(f"- **Total duration:** {total:,}ms")
+        lines.append(f"- **Total duration:** {_format_duration(total)}")
         for stage in report.timeline:
-            lines.append(f"- {stage.stage}: {stage.duration_ms:,}ms")
+            lines.append(f"- {stage.stage}: {_format_duration(stage.duration_ms)}")
         lines.append("")
 
     if response.judge:
@@ -164,7 +333,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
 
     if not response.ai_enabled:
         lines.extend([
-            "> ⚠️ **Note:** AI analysis unavailable — report based on deterministic heuristics only.",
+            "> ⚠️ **Note:** AI analysis unavailable — this report reflects deterministic heuristics only.",
             f"> {response.ai_error or 'Ollama unavailable'}",
             "",
         ])
@@ -262,7 +431,7 @@ def render_console(response: AnalyzeResponse) -> str:
                 "Failed": _RED,
                 "Running": _YELLOW,
             }.get(status.status, _DIM)
-            dur = f" ({status.duration_ms}ms)" if status.duration_ms else ""
+            dur = f" ({_format_duration(status.duration_ms)})" if status.duration_ms else ""
             lines.append(
                 f"  {_color('●', status_color)} {status.label}: "
                 f"{_color(status.status, status_color)}{dur}"
@@ -287,8 +456,8 @@ def render_console(response: AnalyzeResponse) -> str:
     metrics = report.execution_metrics
     if metrics:
         lines.append(
-            f"  {_color('Duration:', _DIM)} {metrics.total_duration_ms:,}ms "
-            f"{_color('|', _DIM)} {_color('Generated:', _DIM)} {metrics.generated_at[:19]}"
+            f"  {_color('Duration:', _DIM)} {_format_duration(metrics.total_duration_ms)} "
+            f"{_color('|', _DIM)} {_color('Generated:', _DIM)} {_format_timestamp(metrics.generated_at)}"
         )
         lines.append("")
 

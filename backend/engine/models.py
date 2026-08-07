@@ -69,9 +69,16 @@ class HeuristicFactor(BaseModel):
     reason: str
 
 
+class ScoreMathFactor(BaseModel):
+    factor: str
+    points: int
+    reason: str
+
+
 class HeuristicResult(BaseModel):
     score: int  # 0-100
     factors: list[HeuristicFactor]
+    score_math: list[ScoreMathFactor] = Field(default_factory=list)
     tests_touched: bool
     tests_deleted: bool
     migration_touched: bool
@@ -94,7 +101,8 @@ class RAGChunk(BaseModel):
 
     path: str
     snippet: str
-    score: float = 0.0  # similarity score, higher = more relevant
+    score: float = 0.0  # cosine similarity score; positive = more relevant
+    retrieval_reason: str = ""  # human-readable explanation of why this chunk was retrieved
 
 
 class RAGContext(BaseModel):
@@ -119,6 +127,20 @@ class AgentFinding(BaseModel):
     files_reviewed: list[str] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     risk_note: str = ""
+    confidence: int = 60  # 0-100, how confident this agent is in its own findings
+
+
+class AgentDecision(BaseModel):
+    """Surfaces one node's execution inside the LangGraph pipeline: what it decided,
+    why, how confident it was, and how long it took. This is what makes the multi-agent
+    graph auditable rather than a black box."""
+
+    agent: str
+    label: str
+    decision: str  # e.g. "Skipped — no files in domain" | "No concerns raised" | "Concerns raised"
+    reasoning: str
+    confidence: int  # 0-100
+    execution_time_ms: int
 
 
 class JudgeVerdict(BaseModel):
@@ -149,18 +171,61 @@ class RepositoryMetadata(BaseModel):
     files_changed_count: int
 
 
+class EvidenceItem(BaseModel):
+    """A single, structured piece of evidence backing a finding: exactly what file,
+    what changed, why it matters, how confident we are, how severe it is, and what to
+    do about it. This is the atomic unit auditors trace claims back to."""
+
+    file_path: str
+    snippet: Optional[str] = None  # code / diff excerpt or retrieved RAG context
+    explanation: str
+    confidence: int  # 0-100
+    severity: RiskLevel
+    recommended_action: str
+
+
 class RiskCategory(BaseModel):
+    """One row of the risk score breakdown, e.g. 'Authentication' or 'CI/CD'."""
+
     category: str
-    score: int
+    score: int  # 0-100
     status: RiskLevel
+    summary: str = ""
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    # legacy fields kept for renderer / frontend backward compatibility
     reasons: list[str] = Field(default_factory=list)
     evidence_files: list[str] = Field(default_factory=list)
 
 
-class EvidenceItem(BaseModel):
-    category: str
-    files: list[str] = Field(default_factory=list)
-    reason: str
+class ArchitecturalImpact(BaseModel):
+    """Which subsystems this PR touches and how they relate, in plain English."""
+
+    affected_subsystems: list[str] = Field(default_factory=list)
+    narrative: str = ""
+
+
+class ConfidenceExplanation(BaseModel):
+    """Explains *why* the model is as confident as it is, instead of a bare number."""
+
+    score: int  # 0-100
+    level: str = "Medium"  # "High" | "Medium" | "Low" — human-readable tier derived from score
+    repository_context_available: bool
+    llm_heuristic_agreement: bool
+    evidence_completeness: str  # "complete" | "partial"
+    narrative: str = ""
+    checks: list[RiskFactorFlag] = Field(default_factory=list)  # ✓/✗ explainability checklist
+
+
+class DeploymentRecommendation(BaseModel):
+    """The chosen rollout strategy plus reasoning, monitoring, rollback, and approval rules."""
+
+    strategy: str  # "Standard" | "Canary" | "Blue/Green" | "Manual Approval"
+    reason: str = ""
+    monitoring_focus: str = ""
+    rollback_trigger: str = ""
+    approval_level: str = ""
+    alternatives_considered: list[str] = Field(default_factory=list)
+    rollback_required: bool = False
 
 
 class RepositoryIntelligence(BaseModel):
@@ -171,6 +236,86 @@ class RepositoryIntelligence(BaseModel):
     infrastructure: list[str] = Field(default_factory=list)
     estimated_size: str = "unknown"
     default_branch: Optional[str] = None
+
+
+class EngineeringMetrics(BaseModel):
+    """Deterministic counts describing the shape of the change — an expansion of
+    'files changed' into what an engineer wants to know before reviewing."""
+
+    public_apis_modified: int = 0
+    api_routes_changed: int = 0
+    config_files_changed: int = 0
+    workflow_files_changed: int = 0
+    documentation_files_changed: int = 0
+    documentation_coverage_pct: int = 0
+    test_files_touched: int = 0
+    test_coverage_delta_files: int = 0
+    dependency_updates: int = 0
+    lines_added: int = 0
+    lines_removed: int = 0
+    deleted_files: int = 0
+    largest_file: str = "n/a"
+    largest_file_changes: int = 0
+    most_impacted_subsystem: str = "None"
+    # Ratio metrics
+    risk_density: float = 0.0            # risk score / files changed
+    critical_file_ratio: float = 0.0     # critical files / total files
+    test_ratio: float = 0.0              # test files touched / code files touched
+    dependency_churn: int = 0            # alias of dependency_updates, kept explicit per spec
+    documentation_ratio: float = 0.0     # doc files / total files
+    average_file_diff_size: float = 0.0  # (additions+deletions) / files changed
+    hotspot_concentration_pct: int = 0   # largest file's share of total diff churn
+
+
+class ProductionReadinessScore(BaseModel):
+    """A single 0-100 'is this ready to ship' score, derived deterministically
+    from risk, confidence, tests, deployment complexity, docs, secrets, and
+    dependency churn — every point deducted is explained in `deductions`."""
+
+    score: int
+    label: str  # "Ready" | "Needs attention" | "Not ready"
+    deductions: list[str] = Field(default_factory=list)
+
+
+class ChecklistItem(BaseModel):
+    """One actionable pre-merge task, generated from a detected risk rather
+    than a static template."""
+
+    task: str
+    reason: str
+
+
+class PositiveSignal(BaseModel):
+    """A reassuring, evidence-backed fact -- the mirror image of a triggered risk
+    factor. Every risk report explains what's dangerous; this explains what
+    ISN'T, so a LOW-risk verdict is backed by explicit absence-of-risk evidence
+    rather than just a lack of alarms."""
+
+    label: str
+    reason: str
+
+
+class UncertaintyItem(BaseModel):
+    """An area PR Sentinel could NOT assess, and why -- explicit admission of a
+    gap rather than silently omitting it or guessing. Distinct from a
+    PositiveSignal: this isn't 'no risk found', it's 'insufficient evidence to
+    make a determination either way'."""
+
+    area: str
+    reason: str
+
+
+class SuggestedReviewer(BaseModel):
+    """A reviewer role/team recommendation derived from which subsystems this PR
+    touches -- a lightweight, deterministic stand-in for a CODEOWNERS lookup.
+    Not a specific person: PR Sentinel doesn't have access to org membership,
+    so it recommends the *role* that owns the affected area and the evidence
+    (matched files) behind that recommendation."""
+
+    role: str
+    reason: str
+    matched_paths: list[str] = Field(default_factory=list)
+    required: bool = False  # True = should block merge without this reviewer's sign-off
 
 
 class ExecutionMetrics(BaseModel):
@@ -184,7 +329,10 @@ class RiskReport(BaseModel):
     decision: str
     risk_score: int
     confidence: int
+    review_effort_minutes: int = 15
+    review_effort_label: str = "15 minutes"
     deployment_strategy: str
+    score_math: list[ScoreMathFactor] = Field(default_factory=list)
     risk_breakdown: dict[str, int] = Field(default_factory=dict)
     risk_categories: list[RiskCategory] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
@@ -192,18 +340,31 @@ class RiskReport(BaseModel):
     evidence_items: list[EvidenceItem] = Field(default_factory=list)
     timeline: list[TimelineStage] = Field(default_factory=list)
     agent_statuses: list[AgentStatus] = Field(default_factory=list)
+    agent_decisions: list[AgentDecision] = Field(default_factory=list)
     repository_metadata: RepositoryMetadata
     repository_intelligence: RepositoryIntelligence = Field(default_factory=RepositoryIntelligence)
     execution_metrics: Optional[ExecutionMetrics] = None
     summary: str = ""
+    executive_summary: str = ""
     high_risk_files: list[str] = Field(default_factory=list)
+    architectural_impact: ArchitecturalImpact = Field(default_factory=ArchitecturalImpact)
+    confidence_explanation: Optional[ConfidenceExplanation] = None
+    deployment_recommendation: Optional[DeploymentRecommendation] = None
+    engineering_metrics: Optional[EngineeringMetrics] = None
+    operational_checklist: list[ChecklistItem] = Field(default_factory=list)
+    production_readiness: Optional[ProductionReadinessScore] = None
+    suggested_reviewers: list[SuggestedReviewer] = Field(default_factory=list)
+    positive_signals: list[PositiveSignal] = Field(default_factory=list)
+    uncertainties: list[UncertaintyItem] = Field(default_factory=list)
 
 
 class AIAnalysis(BaseModel):
     overall_risk: RiskLevel
     confidence: int  # 0-100
     summary: str
+    executive_summary: str = ""
     architectural_impact: str
+    affected_subsystems: list[str] = Field(default_factory=list)
     operational_risks: list[str] = Field(default_factory=list)
     rollout_strategy: str
     rollout_reason: str

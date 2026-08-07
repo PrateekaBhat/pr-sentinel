@@ -118,9 +118,11 @@ async def analyze_with_ai(pr: PullRequestData, heuristics: HeuristicResult) -> A
             overall_risk=overall_risk,
             confidence=int(data.get("confidence", 60)),
             summary=data.get("summary", ""),
+            executive_summary=data.get("executive_summary") or data.get("summary", ""),
             architectural_impact=data.get("architectural_impact", ""),
+            affected_subsystems=[str(x) for x in (data.get("affected_subsystems") or [])],
             operational_risks=data.get("operational_risks", []) or [],
-            rollout_strategy=data.get("rollout_strategy", "Standard merge"),
+            rollout_strategy=data.get("rollout_strategy", "Standard"),
             rollout_reason=data.get("rollout_reason", ""),
             rollback_required=bool(data.get("rollback_required", False)),
             test_coverage_estimate_pct=data.get("test_coverage_estimate_pct"),
@@ -147,17 +149,24 @@ def analyze_with_heuristics_only(
     top_files = sorted(pr.files, key=lambda f: f.changes, reverse=True)[:5]
 
     fallback_note = reason or "Ollama isn't configured."
+    summary_text = (
+        f"Heuristic-only analysis ({fallback_note}): "
+        f"{len(triggered)} risk signal(s) triggered across {pr.changed_files_count} changed file(s)."
+    )
 
     return AIAnalysis(
         overall_risk=risk,
         confidence=55,
-        summary=(
-            f"Heuristic-only analysis ({fallback_note}): "
-            f"{len(triggered)} risk signal(s) triggered across {pr.changed_files_count} changed file(s)."
+        summary=summary_text,
+        executive_summary=(
+            summary_text
+            + " This is a deterministic, rule-based assessment only — no LLM synthesis, specialist"
+            " agent review, or repository context was available for this run."
         ),
         architectural_impact="Start Ollama and pull a model (see backend/.env.example) for a full AI-generated assessment.",
+        affected_subsystems=sorted({f.label for f in triggered}),
         operational_risks=[f.label for f in triggered][:5],
-        rollout_strategy="Canary" if risk != RiskLevel.LOW else "Standard merge",
+        rollout_strategy="Manual Approval" if risk == RiskLevel.HIGH else ("Canary" if risk == RiskLevel.MEDIUM else "Standard"),
         rollout_reason="Based on deterministic rule score only; enable AI analysis for a reasoned recommendation.",
         rollback_required=risk == RiskLevel.HIGH,
         test_coverage_estimate_pct=None,

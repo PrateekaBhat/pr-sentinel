@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     rag_max_doc_chars: int = 4000
     rag_top_k: int = 5
 
+    # Analysis history (SQLite — no new database dependency)
+    history_db_path: str = "./pr_sentinel_history.db"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

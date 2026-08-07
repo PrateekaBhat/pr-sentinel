@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from engine import demo_data
 from engine.config import get_settings
 from engine.github_client import GitHubError
+from engine import history
 from engine.models import AnalyzeRequest, AnalyzeResponse, DemoSummary
 from engine.ollama_client import OllamaError
 from engine.service import analyze_request
@@ -65,4 +66,18 @@ async def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
     except OllamaError as exc:
         logger.warning("Ollama error in analysis endpoint: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/history")
+async def get_history(limit: int = 50, repository: str | None = None) -> list[dict]:
+    """Latest completed analyses, newest first. Optionally scoped to one
+    repository (e.g. ?repository=acme/widgets)."""
+    return history.get_history(limit=limit, repository=repository)
+
+
+@app.get("/api/repository-health")
+async def get_repository_health(repository: str | None = None, window: int = 100) -> dict:
+    """Aggregate risk/confidence/deployment stats over recent analyses —
+    powers the dashboard's Repository Health panel."""
+    return history.get_repository_health(repository=repository, window=window)
 

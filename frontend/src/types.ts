@@ -66,6 +66,8 @@ export interface RAGContext {
   chunks_indexed: number;
   skip_reason?: string | null;
   retrieved: RAGChunk[];
+  cache_hit: boolean;
+  indexed_doc_paths: string[];
 }
 
 export type AgentDomain = "security" | "performance" | "database" | "api" | "tests";
@@ -77,6 +79,17 @@ export interface AgentFinding {
   files_reviewed: string[];
   findings: string[];
   risk_note: string;
+  confidence: number;
+}
+
+/** Surfaces one node's execution inside the LangGraph pipeline. */
+export interface AgentDecision {
+  agent: string;
+  label: string;
+  decision: string;
+  reasoning: string;
+  confidence: number;
+  execution_time_ms: number;
 }
 
 export interface JudgeVerdict {
@@ -104,24 +117,205 @@ export interface RepositoryMetadata {
   files_changed_count: number;
 }
 
+/** One structured piece of evidence: exactly what changed, why it matters, how
+ * confident we are, how severe it is, and what to do about it. */
+export interface EvidenceItem {
+  file_path: string;
+  snippet?: string | null;
+  explanation: string;
+  confidence: number;
+  severity: RiskLevel;
+  recommended_action: string;
+}
+
+/** One row of the fixed risk-category taxonomy (Authentication, API, Database, ...). */
+export interface RiskCategory {
+  category: string;
+  score: number;
+  status: RiskLevel;
+  summary: string;
+  evidence: EvidenceItem[];
+  reasons: string[];
+  evidence_files: string[];
+}
+
+export interface ArchitecturalImpact {
+  affected_subsystems: string[];
+  narrative: string;
+}
+
+export interface ConfidenceExplanation {
+  score: number;
+  level?: string;
+  repository_context_available: boolean;
+  llm_heuristic_agreement: boolean;
+  evidence_completeness: "complete" | "partial";
+  narrative: string;
+  checks: RiskFactorFlag[];
+}
+
+export interface DeploymentRecommendation {
+  strategy: "Standard" | "Canary" | "Blue/Green" | "Manual Approval" | string;
+  reason: string;
+  alternatives_considered: string[];
+  rollback_required: boolean;
+}
+
+export interface ExecutionMetrics {
+  generated_at: string;
+  total_duration_ms: number;
+  ai_enabled: boolean;
+  rag_cache_hit: boolean;
+}
+
+/** Deterministic counts describing the shape of the change — an expansion of
+ * "files changed" into what an engineer wants to know before reviewing. */
+export interface EngineeringMetrics {
+  public_apis_modified: number;
+  api_routes_changed: number;
+  config_files_changed: number;
+  workflow_files_changed: number;
+  documentation_files_changed: number;
+  documentation_coverage_pct: number;
+  test_files_touched: number;
+  test_coverage_delta_files: number;
+  dependency_updates: number;
+  lines_added: number;
+  lines_removed: number;
+  deleted_files: number;
+  largest_file: string;
+  largest_file_changes: number;
+  most_impacted_subsystem: string;
+  risk_density: number;
+  critical_file_ratio: number;
+  test_ratio: number;
+  dependency_churn: number;
+  documentation_ratio: number;
+  average_file_diff_size: number;
+  hotspot_concentration_pct: number;
+}
+
+/** A single 0-100 "is this ready to ship" score, derived deterministically
+ * from risk, confidence, tests, deployment complexity, docs, secrets, and
+ * dependency churn. */
+export interface ProductionReadinessScore {
+  score: number;
+  label: "Ready" | "Needs attention" | "Not ready" | string;
+  deductions: string[];
+}
+
+/** One actionable pre-merge task, generated from a detected risk rather than
+ * a static template. */
+export interface ChecklistItem {
+  task: string;
+  reason: string;
+}
+
+/** A reassuring, evidence-backed fact -- the mirror image of a triggered risk
+ * factor. Explains why the score ISN'T higher, not just that it isn't. */
+export interface PositiveSignal {
+  label: string;
+  reason: string;
+}
+
+/** An area PR Sentinel could NOT assess, and why -- an explicit admission of
+ * a gap rather than a silent omission or an overconfident guess. */
+export interface UncertaintyItem {
+  area: string;
+  reason: string;
+}
+
+/** A reviewer role/team recommendation derived from which subsystems this PR
+ * touches -- a deterministic stand-in for a CODEOWNERS lookup. Not a specific
+ * person: recommends the role that owns the affected area, backed by the
+ * matched file paths. */
+export interface SuggestedReviewer {
+  role: string;
+  reason: string;
+  matched_paths: string[];
+  required: boolean;
+}
+
+/** A row from the /api/history endpoint: one persisted completed analysis. */
+export interface HistoryEntry {
+  id: number;
+  repository: string;
+  pr_number: number;
+  pr_title: string;
+  author: string;
+  analyzed_at: string;
+  decision: string;
+  overall_risk: string;
+  risk_score: number;
+  confidence: number;
+  deployment_recommendation: string;
+  total_duration_ms: number;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+  heuristic_score: number;
+  categories_triggered: string[];
+  agent_decisions: Array<{
+    agent: string;
+    label: string;
+    decision: string;
+    confidence: number;
+    execution_time_ms: number;
+  }>;
+  human_decision: string | null;
+  human_reason: string | null;
+}
+
+/** Aggregate stats from /api/repository-health, powering the dashboard's
+ * Repository Health panel. */
+export interface RepositoryHealth {
+  repository: string | null;
+  analyses_count: number;
+  average_risk_score: number;
+  average_confidence: number;
+  average_files_changed: number;
+  average_review_duration_ms: number;
+  deployment_distribution: Record<string, number>;
+  top_recurring_categories: Array<[string, number]>;
+  risk_trend: Array<{ analyzed_at: string; pr_number: number; risk_score: number }>;
+  decision_trend: Array<{ analyzed_at: string; pr_number: number; decision: string }>;
+}
+
 export interface RiskReport {
   decision: string;
   risk_score: number;
   confidence: number;
   deployment_strategy: string;
   risk_breakdown: Record<string, number>;
+  risk_categories: RiskCategory[];
   findings: string[];
   evidence: string[];
   timeline: TimelineStage[];
   agent_statuses: AgentStatus[];
+  agent_decisions: AgentDecision[];
   repository_metadata: RepositoryMetadata;
+  execution_metrics?: ExecutionMetrics | null;
+  summary: string;
+  executive_summary: string;
+  high_risk_files: string[];
+  architectural_impact: ArchitecturalImpact;
+  confidence_explanation?: ConfidenceExplanation | null;
+  deployment_recommendation?: DeploymentRecommendation | null;
+  engineering_metrics?: EngineeringMetrics | null;
+  operational_checklist: ChecklistItem[];
+  production_readiness?: ProductionReadinessScore | null;
+  suggested_reviewers: SuggestedReviewer[];
+  positive_signals: PositiveSignal[];
+  uncertainties: UncertaintyItem[];
 }
 
 export interface AIAnalysis {
   overall_risk: RiskLevel;
   confidence: number;
   summary: string;
+  executive_summary: string;
   architectural_impact: string;
+  affected_subsystems: string[];
   operational_risks: string[];
   rollout_strategy: string;
   rollout_reason: string;

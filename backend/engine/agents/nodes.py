@@ -76,10 +76,12 @@ async def run_agent(domain: str, state: AgentState) -> dict:
         data = await chat_json(system, user, timeout=120.0)
         findings = [str(x) for x in (data.get("findings") or [])][:4]
         risk_note = str(data.get("risk_note", ""))
+        confidence = int(data.get("confidence", 60))
     except OllamaError as exc:
         logger.warning("%s agent failed: %s", domain, exc)
         findings = []
         risk_note = f"Agent call failed ({exc}); files were not analyzed by AI for this domain."
+        confidence = 0
     duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
 
     return {
@@ -90,6 +92,7 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             files_reviewed=[f.filename for f in files],
             findings=findings,
             risk_note=risk_note,
+            confidence=confidence,
         ),
         f"{domain}_status": {
             "agent": domain,
@@ -163,7 +166,15 @@ async def coordinator_node(state: AgentState) -> dict:
     rag = state.get("rag")
 
     start = time.perf_counter_ns()
-    data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)
+    try:
+        data = await chat_json(COORDINATOR_SYSTEM_PROMPT, _build_coordinator_prompt(state), timeout=180.0)
+    except OllamaError as exc:
+        # Don't let a coordinator failure blow away the whole graph run: the specialist
+        # agents above may have already succeeded, and we want their findings/timing to
+        # survive so the fallback report is accurate rather than looking instantaneous.
+        duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+        logger.warning("Coordinator failed: %s", exc)
+        return {"coordinator_error": str(exc), "coordinator_duration_ms": duration_ms}
 
     risk_value = str(data.get("overall_risk", "MEDIUM")).upper()
     overall_risk = RiskLevel(risk_value) if risk_value in RiskLevel.__members__ else RiskLevel.MEDIUM
@@ -196,13 +207,29 @@ async def coordinator_node(state: AgentState) -> dict:
         for domain in ["security", "performance", "database", "api", "tests"]
     ]
 
+    strategy = str(data.get("rollout_strategy", "Standard")).strip()
+    valid_strategies = {"Standard", "Canary", "Blue/Green", "Manual Approval"}
+    if strategy not in valid_strategies:
+        # Best-effort normalization if the model drifted from the enum (e.g. "Standard merge").
+        lowered = strategy.lower()
+        if "canary" in lowered:
+            strategy = "Canary"
+        elif "blue" in lowered or "green" in lowered:
+            strategy = "Blue/Green"
+        elif "manual" in lowered or "approval" in lowered:
+            strategy = "Manual Approval"
+        else:
+            strategy = "Standard"
+
     result = AIAnalysis(
         overall_risk=overall_risk,
         confidence=int(data.get("confidence", 60)),
         summary=data.get("summary", ""),
+        executive_summary=data.get("executive_summary") or data.get("summary", ""),
         architectural_impact=data.get("architectural_impact", ""),
+        affected_subsystems=[str(x) for x in (data.get("affected_subsystems") or [])],
         operational_risks=data.get("operational_risks", []) or [],
-        rollout_strategy=data.get("rollout_strategy", "Standard merge"),
+        rollout_strategy=strategy,
         rollout_reason=data.get("rollout_reason", ""),
         rollback_required=bool(data.get("rollback_required", False)),
         test_coverage_estimate_pct=data.get("test_coverage_estimate_pct"),
