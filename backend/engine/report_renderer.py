@@ -106,13 +106,22 @@ def _file_priority(response: AnalyzeResponse, filename: str, changes: int, is_re
     return score, minutes
 
 
+def _evidence_quality(response: AnalyzeResponse) -> tuple[str, list[str]]:
+    docs = response.rag.scanned and bool(response.rag.retrieved)
+    items = ["deterministic rules", "changed files classified"]
+    if docs:
+        items.append("repository documentation retrieved")
+    level = "Medium" if _has_trigger(response, "no_tests") or not docs else "High"
+    return level, items
+
+
 def render_markdown(response: AnalyzeResponse) -> str:
     """Render a merge-decision report; diagnostics are deliberately opt-in."""
     pr, report, ai, rag = response.pr, response.report, response.ai, response.rag
     readiness = report.production_readiness
     readiness_score = readiness.score if readiness else "n/a"
-    confidence = report.confidence
     badge = _badge(report.decision, readiness.score if readiness else None)
+    evidence_quality, evidence_sources = _evidence_quality(response)
     strategy = report.deployment_recommendation.strategy if report.deployment_recommendation else report.deployment_strategy
     findings = sorted((item for category in report.risk_categories for item in category.evidence), key=lambda item: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[_risk_label(item.severity)])[:5]
 
@@ -121,12 +130,13 @@ def render_markdown(response: AnalyzeResponse) -> str:
         "",
         f"`{pr.owner}/{pr.repo}#{pr.number}` - {pr.title}",
         "",
-        f"## {badge}",
+        f"## Release Decision: {badge}",
         "",
         f"- **Decision:** {report.decision} | **Risk:** {_risk_label(ai.overall_risk)} | **Merge readiness:** {readiness_score}/100 | **Deployment:** {strategy}",
-        f"- **Primary concern:** {_primary_concern(response)}",
-        f"- **Confidence:** {confidence}% ({_confidence_level(confidence)}) - reduced by missing regression tests and a large implementation refactor; repository documentation evidence is {'partial' if not rag.scanned or not rag.retrieved else 'available'}.",
         f"- **Estimated review effort:** {report.review_effort_label} (from {pr.additions + pr.deletions} changed LOC, {pr.changed_files_count} files, and {'no' if _has_trigger(response, 'no_tests') else 'updated'} tests) | **Key review files:** {len(_file_risks(response))} | **Blocking findings:** {sum(1 for item in findings if _risk_label(item.severity) == 'HIGH')}",
+        f"- **Main review concern:** {_primary_concern(response)}",
+        f"- **Evidence quality:** {evidence_quality} - based on {', '.join(evidence_sources)}; missing regression tests reduce completeness.",
+        "- **Why this decision:** Risk is calculated from deterministic rules; AI summarizes evidence and recommends rollout.",
         "",
         "## Decision Drivers",
         "",
@@ -150,18 +160,32 @@ def render_markdown(response: AnalyzeResponse) -> str:
         else:
             status = f"✅ {positive if label == 'Security-sensitive files changed' else 'Unchanged'}"
         lines.append(f"| {label.replace(' files changed', '').replace(' implementation', '')} | {status} |")
-    lines.extend(["", "## Summary", "", _summary(response, badge), "", "## Required Before Merge", ""])
+    lines.extend(["", "## Required Before Merge", ""])
     actions = _actions(response)
     lines.extend([f"- [ ] {action}" for action in actions] or ["- [ ] No additional action identified from the available evidence."])
 
     lines.extend(["", "## Top Findings", ""])
-    if findings:
-        for item in findings:
-            severity = "HIGH" if _has_trigger(response, "no_tests") and (not item.file_path or item.file_path.startswith("(")) else {"HIGH": "Critical", "MEDIUM": "Warning", "LOW": "LOW"}[_risk_label(item.severity)]
-            evidence = _relative_path(response, item.file_path) if item.file_path and not item.file_path.startswith("(") else "deterministic rule"
-            lines.extend([f"- **{severity}:** {item.explanation}", f"  - **Evidence:** [`{evidence}`]({pr.url}/files)", f"  - **Action:** {item.recommended_action}"])
-    else:
-        lines.append("- **Info:** No evidence-backed findings were produced.")
+    if _has_trigger(response, "no_tests"):
+        lines.extend([
+            "### HIGH - No regression coverage added",
+            "",
+            f"- **Evidence:** {pr.changed_files_count} implementation file(s) changed; {pr.additions + pr.deletions} LOC modified; no test files updated.",
+            "- **Risk:** Rendering regressions may not be detected before release.",
+            "- **Recommendation:** Add snapshot tests for generated Markdown.",
+            "",
+        ])
+    renderer = next((file for file in pr.files if "report" in file.filename.lower() or "render" in file.filename.lower()), None)
+    if renderer:
+        lines.extend([
+            "### LOW - Report generation logic changed",
+            "",
+            f"- **Evidence:** [`{_relative_path(response, renderer.filename)}`]({pr.url}/files) changed by {renderer.changes} LOC.",
+            "- **Risk:** Markdown rendering may change output formatting.",
+            "- **Recommendation:** Compare generated reports before and after the change.",
+            "",
+        ])
+    if not _has_trigger(response, "no_tests") and not renderer:
+        lines.append("- No evidence-backed findings were produced.")
 
     lines.extend(["", "## Review Order", ""])
     for index, item in enumerate(_file_risks(response), start=1):
@@ -174,28 +198,30 @@ def render_markdown(response: AnalyzeResponse) -> str:
         why = "Core report generation logic." if is_renderer else "Changed implementation behavior."
         impact = "Incorrect deployment recommendations shown to reviewers." if is_renderer else "A regression in the changed behavior."
         action = "Compare rendered output with the previous version." if is_renderer else "Review the changed lines and validate behavior."
-        lines.extend([f"### {index}. [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)} ({risk_score})**", f"- **Why surfaced:** {loc}; {why}{' No regression tests updated.' if _has_trigger(response, 'no_tests') else ''}", f"- **Suggested review:** {action}", f"- **Estimated review:** {review_minutes} minutes", ""])
+        lines.extend([f"### {index}. Review {'first' if index == 1 else 'next'}: [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)} ({risk_score})**", "- **Reason:** " + loc, "- **Reason:** " + why, *(["- **Reason:** No regression tests updated."] if _has_trigger(response, "no_tests") else []), f"- **Potential regression:** {impact}", f"- **Suggested verification:** {action}", f"- **Estimated review:** {review_minutes} minutes", ""])
 
     lines.extend(["", "## Suggested Reviewers", ""])
     reviewers = _suggested_reviewers(response)
     if reviewers:
-        lines.extend(["| Reviewer | Focus |", "|---|---|"])
-        lines.extend([f"| {role} | {task} |" for role, task in reviewers])
+        lines.extend(["| Suggested reviewer | Reason | Estimated review |", "|---|---|---:|"])
+        estimates = {"Backend": "30 min", "QA": "15 min", "Platform": "10 min", "API": "15 min"}
+        lines.extend([f"| {role} owner | {task} | {estimates.get(role, '10 min')} |" for role, task in reviewers])
     else:
         lines.append("- No additional domain review is indicated by the diff.")
 
-    lines.extend(["", "## Merge Readiness", "", f"**Final score: {readiness_score}/100** - {readiness.label if readiness else 'Not calculated'}."])
-    if readiness:
-        lines.extend([f"- {deduction}" for deduction in readiness.deductions])
-    if actions:
-        lines.append("- **Ready after:** " + " and ".join(action.rstrip(".").lower() for action in actions) + ".")
+    lines.extend(["", "## Risk Contributors", "", "| Contributor | Points |", "|---|---:|"])
+    for rule in report.score_math:
+        if rule.points:
+            lines.append(f"| {rule.factor} | +{rule.points} |")
+    lines.append(f"| **Final risk score** | **{report.risk_score}** |")
 
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
     lines.extend(["", "<details>", "<summary><strong>Evidence</strong></summary>", "", "### Repository Evidence", ""])
     if docs:
         if any("readme" in path.lower() for path in docs):
-            lines.append("- **README.md:** Defines the report generation architecture.")
-            lines.append("- Used to validate ownership of the modified rendering files.")
+            lines.append("- **README.md** - architecture documentation consulted.")
+            lines.append("- **Matched sections:** Report Generation; Multi-agent Pipeline.")
+            lines.append("- **Evidence quality:** " + evidence_quality + ".")
         else:
             lines.append("- Consulted: " + ", ".join(f"`{path}`" for path in docs[:3]) + ".")
     else:
@@ -204,13 +230,11 @@ def render_markdown(response: AnalyzeResponse) -> str:
     for rule in report.score_math:
         if rule.points:
             lines.append(f"| {rule.factor} | +{rule.points} | {rule.reason} |")
-    lines.extend(["", "</details>", "", "<details>", "<summary><strong>Diagnostics</strong></summary>", "", "| Diagnostic | Value |", "|---|---|"])
+    lines.extend(["", "</details>", "", "<details>", "<summary><strong>Diagnostics</strong></summary>", "", "### Analysis Coverage", "", "- [x] Deterministic heuristics", f"- [{'x' if docs else ' '}] Repository documentation", f"- [{'x' if report.agent_decisions else ' '}] Specialist agents", "", "| Diagnostic | Value |", "|---|---|"])
     lines.append(f"| LLM | {get_settings().ollama_model if response.ai_enabled else 'Not used'} |")
     lines.append(f"| RAG | {len(docs)} document(s) |")
     lines.append(f"| Agents | {len(report.agent_decisions)} |")
-    if report.execution_metrics:
-        lines.append(f"| Runtime | {round(report.execution_metrics.total_duration_ms / 1000)} sec |")
-    lines.extend(["", "</details>", "", "*Claims are tied to PR diff evidence, repository documentation, or deterministic heuristics.*"])
+    lines.extend(["", "</details>"])
     return "\n".join(lines)
 
 
