@@ -8,10 +8,6 @@ def _risk_label(level: RiskLevel | str) -> str:
     return level.value if isinstance(level, RiskLevel) else str(level)
 
 
-def _confidence_level(score: int) -> str:
-    return "High" if score >= 75 else "Medium" if score >= 50 else "Low"
-
-
 def _badge(decision: str, readiness: int | None) -> str:
     if decision == "BLOCK" or (readiness is not None and readiness < 55):
         return "DO NOT MERGE"
@@ -52,17 +48,6 @@ def _primary_concern(response: AnalyzeResponse) -> str:
     return factor or "Review the evidence-backed findings before merging."
 
 
-def _summary(response: AnalyzeResponse, badge: str) -> str:
-    paths = [file.filename.lower() for file in response.pr.files]
-    report_changed = any("report" in path or "render" in path for path in paths)
-    ui_changed = any(path.endswith(".tsx") or path.endswith(".ts") for path in paths)
-    changed = "This PR modifies the report rendering pipeline" + (" and frontend UI." if ui_changed else ".") if report_changed else "This PR modifies implementation files."
-    api_changed = dict(_drivers(response)).get("API contracts changed", False)
-    clear = "API contract changes need review." if api_changed else "No security or public API contract changes were detected."
-    words = f"{changed} {clear} The only release concern is missing regression coverage for the modified rendering logic.".split()
-    return " ".join(words[:50])
-
-
 def _actions(response: AnalyzeResponse) -> list[str]:
     paths = [file.filename.lower() for file in response.pr.files]
     actions: list[str] = []
@@ -83,6 +68,8 @@ def _suggested_reviewers(response: AnalyzeResponse) -> list[tuple[str, str]]:
         reviewers.append(("Backend", "Verify rendered Markdown and decision-card output."))
     if _has_trigger(response, "no_tests"):
         reviewers.append(("QA", "Add or confirm regression coverage for the changed rendering paths."))
+    if any(path.endswith(".tsx") or path.endswith(".jsx") for path in paths):
+        reviewers.append(("Frontend", "Verify decision-card and report presentation behavior."))
     if bool(metrics and metrics.workflow_files_changed) or any("workflow" in path or ".github/" in path for path in paths):
         reviewers.append(("Platform", "Verify the updated workflow against a sample PR."))
     if dict(_drivers(response)).get("API contracts changed", False):
@@ -115,6 +102,19 @@ def _evidence_quality(response: AnalyzeResponse) -> tuple[str, list[str]]:
     return level, items
 
 
+def _review_effort_breakdown(response: AnalyzeResponse) -> str:
+    items = _file_risks(response)
+    estimates: list[str] = []
+    for item in items:
+        filename = _relative_path(response, item.filename if hasattr(item, "filename") else item[0])
+        changed = next((file for file in response.pr.files if _relative_path(response, file.filename) == filename), None)
+        _, minutes = _file_priority(response, filename, changed.changes if changed else 0, "report" in filename.lower() or "render" in filename.lower())
+        area = "backend" if filename.endswith(".py") or "backend/" in filename else "frontend"
+        estimates.append(f"{minutes} min {area}")
+    estimates.append("15 min validation")
+    return " | ".join(estimates) + f" | approx. {response.report.review_effort_label}"
+
+
 def render_markdown(response: AnalyzeResponse) -> str:
     """Render a merge-decision report; diagnostics are deliberately opt-in."""
     pr, report, ai, rag = response.pr, response.report, response.ai, response.rag
@@ -123,7 +123,6 @@ def render_markdown(response: AnalyzeResponse) -> str:
     badge = _badge(report.decision, readiness.score if readiness else None)
     evidence_quality, evidence_sources = _evidence_quality(response)
     strategy = report.deployment_recommendation.strategy if report.deployment_recommendation else report.deployment_strategy
-    findings = sorted((item for category in report.risk_categories for item in category.evidence), key=lambda item: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[_risk_label(item.severity)])[:5]
 
     lines = [
         "# PR Sentinel",
@@ -133,15 +132,14 @@ def render_markdown(response: AnalyzeResponse) -> str:
         f"## Release Decision: {badge}",
         "",
         f"- **Decision:** {report.decision} | **Risk:** {_risk_label(ai.overall_risk)} | **Merge readiness:** {readiness_score}/100 | **Deployment:** {strategy}",
-        f"- **Estimated review effort:** {report.review_effort_label} (from {pr.additions + pr.deletions} changed LOC, {pr.changed_files_count} files, and {'no' if _has_trigger(response, 'no_tests') else 'updated'} tests) | **Key review files:** {len(_file_risks(response))} | **Blocking findings:** {sum(1 for item in findings if _risk_label(item.severity) == 'HIGH')}",
+        f"- **Estimated review effort:** {_review_effort_breakdown(response)} (from {pr.additions + pr.deletions} changed LOC and {pr.changed_files_count} files)",
         f"- **Main review concern:** {_primary_concern(response)}",
-        f"- **Evidence quality:** {evidence_quality} - based on {', '.join(evidence_sources)}; missing regression tests reduce completeness.",
         "- **Why this decision:** Risk is calculated from deterministic rules; AI summarizes evidence and recommends rollout.",
         "",
-        "## Decision Drivers",
+        "## Decision Scorecard",
         "",
     ]
-    lines.extend(["| Signal | Status |", "|---|---|"])
+    lines.extend(["| Category | Result |", "|---|---|"])
     status_words = {
         "Security-sensitive files changed": ("None", "OK"),
         "API contracts changed": ("Changed", "WARN"),
@@ -159,12 +157,23 @@ def render_markdown(response: AnalyzeResponse) -> str:
             status = "⚠ Large" if label == "Large implementation diff" else "⚠ Changed"
         else:
             status = f"✅ {positive if label == 'Security-sensitive files changed' else 'Unchanged'}"
-        lines.append(f"| {label.replace(' files changed', '').replace(' implementation', '')} | {status} |")
-    lines.extend(["", "## Required Before Merge", ""])
+        category = {"Security-sensitive files changed": "Security", "Infrastructure changed": "Platform", "API contracts changed": "API", "Tests updated": "Tests", "Large implementation diff": "Complexity"}[label]
+        lines.append(f"| {category} | {status} |")
+    lines.extend(["", "## Merge Checklist", ""])
     actions = _actions(response)
     lines.extend([f"- [ ] {action}" for action in actions] or ["- [ ] No additional action identified from the available evidence."])
+    lines.extend(["- [ ] High-risk files reviewed.", f"- [ ] Ready for {strategy} deployment.", "", "## Evidence Quality", ""])
+    lines.extend([f"- [x] {source.capitalize()}" for source in evidence_sources])
+    if _has_trigger(response, "no_tests"):
+        lines.append("- [ ] Regression tests")
+    lines.append(f"- **Overall:** {evidence_quality}")
+    safe_to_ignore = [label for label, value in _drivers(response) if not value and label in {"Security-sensitive files changed", "Infrastructure changed", "API contracts changed"}]
+    if safe_to_ignore:
+        lines.extend(["", "## No Review Needed", ""])
+        labels = {"Security-sensitive files changed": "Authentication, secrets", "Infrastructure changed": "Infrastructure", "API contracts changed": "API contracts"}
+        lines.extend([f"- [x] {labels[item]}" for item in safe_to_ignore])
 
-    lines.extend(["", "## Top Findings", ""])
+    lines.extend(["", "## Review Priorities", ""])
     if _has_trigger(response, "no_tests"):
         lines.extend([
             "### HIGH - No regression coverage added",
@@ -184,6 +193,16 @@ def render_markdown(response: AnalyzeResponse) -> str:
             "- **Recommendation:** Compare generated reports before and after the change.",
             "",
         ])
+    frontend = next((file for file in pr.files if file.filename.lower().endswith((".tsx", ".jsx"))), None)
+    if frontend:
+        lines.extend([
+            "### LOW - Frontend presentation changed",
+            "",
+            f"- **Evidence:** [`{_relative_path(response, frontend.filename)}`]({pr.url}/files) changed by {frontend.changes} LOC.",
+            "- **Risk:** Reviewer-facing status and evidence may render incorrectly.",
+            "- **Recommendation:** Verify the report layout with a representative pull request.",
+            "",
+        ])
     if not _has_trigger(response, "no_tests") and not renderer:
         lines.append("- No evidence-backed findings were produced.")
 
@@ -198,22 +217,23 @@ def render_markdown(response: AnalyzeResponse) -> str:
         why = "Core report generation logic." if is_renderer else "Changed implementation behavior."
         impact = "Incorrect deployment recommendations shown to reviewers." if is_renderer else "A regression in the changed behavior."
         action = "Compare rendered output with the previous version." if is_renderer else "Review the changed lines and validate behavior."
-        lines.extend([f"### {index}. Review {'first' if index == 1 else 'next'}: [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)} ({risk_score})**", "- **Reason:** " + loc, "- **Reason:** " + why, *(["- **Reason:** No regression tests updated."] if _has_trigger(response, "no_tests") else []), f"- **Potential regression:** {impact}", f"- **Suggested verification:** {action}", f"- **Estimated review:** {review_minutes} minutes", ""])
+        lines.extend([f"### {index}. Review {'first' if index == 1 else 'next'}: [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)} ({risk_score})**", "- **Why reviewed:**", "  - " + loc, "  - " + why, *(["  - No regression tests updated."] if _has_trigger(response, "no_tests") else []), f"- **Primary risk:** {impact}", f"- **Reviewer action:** {action}", f"- **Estimated review:** {review_minutes} minutes", ""])
 
     lines.extend(["", "## Suggested Reviewers", ""])
     reviewers = _suggested_reviewers(response)
     if reviewers:
         lines.extend(["| Suggested reviewer | Reason | Estimated review |", "|---|---|---:|"])
-        estimates = {"Backend": "30 min", "QA": "15 min", "Platform": "10 min", "API": "15 min"}
-        lines.extend([f"| {role} owner | {task} | {estimates.get(role, '10 min')} |" for role, task in reviewers])
+        estimates = {"Backend": "30 min", "QA": "15 min", "Frontend": "15 min", "Platform": "10 min", "API": "15 min"}
+        lines.extend([f"| {role} | {task} | {estimates.get(role, '10 min')} |" for role, task in reviewers])
     else:
         lines.append("- No additional domain review is indicated by the diff.")
 
-    lines.extend(["", "## Risk Contributors", "", "| Contributor | Points |", "|---|---:|"])
+    lines.extend(["", f"## Why this PR scored {report.risk_score}/100", "", "| Contributor | Points |", "|---|---:|"])
     for rule in report.score_math:
         if rule.points:
             lines.append(f"| {rule.factor} | +{rule.points} |")
-    lines.append(f"| **Final risk score** | **{report.risk_score}** |")
+    lines.append(f"| **Final risk score** | **{report.risk_score} / 100** |")
+    lines.append(f"\nMerge readiness is **{readiness_score}/100** because it combines risk, evidence quality, testing, and documentation completeness.")
 
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
     lines.extend(["", "<details>", "<summary><strong>Evidence</strong></summary>", "", "### Repository Evidence", ""])
@@ -221,15 +241,10 @@ def render_markdown(response: AnalyzeResponse) -> str:
         if any("readme" in path.lower() for path in docs):
             lines.append("- **README.md** - architecture documentation consulted.")
             lines.append("- **Matched sections:** Report Generation; Multi-agent Pipeline.")
-            lines.append("- **Evidence quality:** " + evidence_quality + ".")
         else:
             lines.append("- Consulted: " + ", ".join(f"`{path}`" for path in docs[:3]) + ".")
     else:
         lines.append("- Repository documentation was not available; findings rely on deterministic PR evidence.")
-    lines.extend(["", "### Triggered Rules", "", "| Rule | Weight | Evidence |", "|---|---:|---|"])
-    for rule in report.score_math:
-        if rule.points:
-            lines.append(f"| {rule.factor} | +{rule.points} | {rule.reason} |")
     lines.extend(["", "</details>", "", "<details>", "<summary><strong>Diagnostics</strong></summary>", "", "### Analysis Coverage", "", "- [x] Deterministic heuristics", f"- [{'x' if docs else ' '}] Repository documentation", f"- [{'x' if report.agent_decisions else ' '}] Specialist agents", "", "| Diagnostic | Value |", "|---|---|"])
     lines.append(f"| LLM | {get_settings().ollama_model if response.ai_enabled else 'Not used'} |")
     lines.append(f"| RAG | {len(docs)} document(s) |")
