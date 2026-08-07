@@ -13,14 +13,11 @@ import Header from "./components/Header";
 import LoadingState from "./components/LoadingState";
 import ProductionReadinessGauge from "./components/ProductionReadinessGauge";
 import RepoInput from "./components/RepoInput";
-import type { AnalyzeResponse, DemoSummary, EvidenceItem, RiskLevel } from "./types";
+import type { AnalyzeResponse, DemoSummary, EvidenceItem, FileRisk, RiskLevel } from "./types";
 
 const severityRank: Record<RiskLevel, number> = { HIGH: 0, MEDIUM: 1, LOW: 2 };
 const confidenceLevel = (score: number) => score >= 75 ? "High" : score >= 50 ? "Medium" : "Low";
-const statusFor = (decision: string) => /concern|block|fail/i.test(decision) ? "WARN" : "PASS";
-const perspectiveFor: Record<string, string> = {
-  database: "Backend", security: "Security", tests: "QA", performance: "SRE", api: "API",
-};
+const isPlaceholderPath = (path: string) => !path || path.startsWith("/path/to/");
 const badgeFor = (result: AnalyzeResponse) => {
   const readiness = result.report.production_readiness?.score;
   if (result.report.decision === "BLOCK" || (readiness !== undefined && readiness < 55)) return "Do Not Merge";
@@ -41,8 +38,14 @@ export default function App() {
   useEffect(() => { fetchDemos().then(setDemos).catch(() => setDemos([])); }, []);
   const findings = useMemo(() => result ? result.report.risk_categories.flatMap((category) => category.evidence)
     .sort((a, b) => severityRank[a.severity] - severityRank[b.severity]).slice(0, 5) : [], [result]);
-  const fileRisks = useMemo(() => result ? [...result.ai.file_risks]
-    .sort((a, b) => severityRank[a.risk] - severityRank[b.risk]).slice(0, 3) : [], [result]);
+  const fileRisks = useMemo<FileRisk[]>(() => {
+    if (!result) return [];
+    const assessed = result.ai.file_risks.filter((file) => !isPlaceholderPath(file.filename));
+    if (assessed.length) return assessed.sort((a, b) => severityRank[a.risk] - severityRank[b.risk]).slice(0, 3);
+    return [...result.pr.files].sort((a, b) => b.changes - a.changes).slice(0, 3).map((file) => ({
+      filename: file.filename, risk: result.ai.overall_risk, reason: `${file.changes} changed lines in this implementation file.`,
+    }));
+  }, [result]);
 
   async function run(action: () => Promise<AnalyzeResponse>) {
     setLoading(true); setError(null);
@@ -66,16 +69,31 @@ export default function App() {
   </div>;
 }
 
-function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; findings: EvidenceItem[]; fileRisks: AnalyzeResponse["ai"]["file_risks"] }) {
+function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; findings: EvidenceItem[]; fileRisks: FileRisk[] }) {
   const { report, ai, pr } = result;
   const readiness = report.production_readiness;
   const confidence = report.confidence_explanation?.level || confidenceLevel(report.confidence);
   const deployment = report.deployment_recommendation?.strategy || report.deployment_strategy;
   const actionFor = (filename: string) => findings.find((item) => item.file_path === filename)?.recommended_action || "Review the changed lines and validate affected behavior.";
-  const perspectives = ["Backend", "Security", "QA", "SRE", "API"].map((name) => {
-    const decision = report.agent_decisions.find((item) => perspectiveFor[item.agent] === name);
-    return { name, status: decision ? statusFor(decision.decision) : "WARN", reason: decision?.reasoning || "No specialist evidence was available for this perspective." };
-  });
+  const paths = pr.files.map((file) => file.filename.toLowerCase());
+  const backendChanged = paths.some((path) => path.endsWith(".py") || path.includes("backend/"));
+  const workflowChanged = paths.some((path) => path.includes(".github/workflows/") || path.includes("workflow"));
+  const testsMissing = result.heuristics.factors.some((factor) => factor.key === "no_tests" && factor.triggered);
+  const primaryConcern = testsMissing ? "Implementation changed without corresponding test updates." : result.heuristics.factors.find((factor) => factor.triggered)?.reason || "Review the evidence-backed findings before merging.";
+  const apiChanged = Boolean(report.engineering_metrics?.public_apis_modified);
+  const sensitive = paths.some((path) => /auth|secret|credential|token/.test(path));
+  const requiredActions = [
+    ...(testsMissing ? ["Add regression tests for the changed implementation paths."] : []),
+    ...(paths.some((path) => path.includes("report") || path.includes("render")) ? ["Validate rendered Markdown output against a representative pull request."] : []),
+    ...(workflowChanged ? ["Dry-run the modified GitHub Actions workflow on a sample pull request."] : []),
+  ].slice(0, 3);
+  const perspectives = [
+    { name: "Backend", status: backendChanged ? "WARN" : "PASS", reason: backendChanged ? "Report rendering or backend implementation changed; review the generated Markdown output." : "No backend implementation files changed." },
+    { name: "Security", status: sensitive ? "WARN" : "PASS", reason: sensitive ? "Security-sensitive paths changed; verify the diff." : "No authentication, secrets, or credential paths changed." },
+    { name: "QA", status: testsMissing ? "WARN" : "PASS", reason: testsMissing ? "Implementation changed without test updates; add regression coverage." : "Test coverage was updated or no implementation path changed." },
+    { name: "SRE", status: workflowChanged ? "WARN" : "PASS", reason: workflowChanged ? "GitHub Actions workflow changed; dry-run it on a sample pull request." : "No CI/CD or deployment configuration changed." },
+    { name: "API", status: apiChanged ? "WARN" : "PASS", reason: apiChanged ? "Public API routes changed; verify contract compatibility." : "No public API interface changes were detected." },
+  ];
   return <div className="flex flex-col gap-6">
     <section className="rounded-lg border border-steel bg-panel p-5 shadow-panel">
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -85,6 +103,7 @@ function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; find
       <div className="mt-5 grid grid-cols-2 gap-3 border-t border-steel pt-4 sm:grid-cols-5">
         <Stat label="Decision" value={report.decision} /><Stat label="Risk" value={ai.overall_risk} /><Stat label="Confidence" value={confidence} /><Stat label="Readiness" value={`${readiness?.score ?? "n/a"}/100`} /><Stat label="Deployment" value={deployment} />
       </div>
+      <p className="mt-4 border-t border-steel pt-3 text-sm text-fog"><span className="font-semibold text-paper">Primary concern:</span> {primaryConcern}</p>
     </section>
 
     <Card title="Executive summary" eyebrow="What changed, main risk, merge decision">
@@ -102,7 +121,7 @@ function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; find
 
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
       <Card title="Required before merge" eyebrow="Actionable reviewer checklist">
-        {report.operational_checklist.length ? <ul className="flex flex-col gap-2">{report.operational_checklist.map((item) => <li key={item.task} className="flex gap-2 text-sm text-fog"><span className="text-paper">□</span>{item.task}</li>)}</ul> : <p className="text-sm text-fog">No additional mandatory action identified from available evidence.</p>}
+        {requiredActions.length ? <ul className="flex flex-col gap-2">{requiredActions.map((action) => <li key={action} className="flex gap-2 text-sm text-fog"><span className="text-paper">□</span>{action}</li>)}</ul> : <p className="text-sm text-fog">No additional mandatory action identified from available evidence.</p>}
       </Card>
       <Card title="Merge readiness" eyebrow="Risk + evidence + tests + documentation">
         {readiness ? <><ProductionReadinessGauge readiness={readiness} /><p className="mt-3 text-xs text-fog">Derived from risk, evidence quality, test coverage, and documentation completeness.</p></> : <p className="text-sm text-fog">Readiness could not be calculated from the available evidence.</p>}
