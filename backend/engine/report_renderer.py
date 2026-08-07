@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .models import AnalyzeResponse, RiskLevel
-from .config import get_settings
 
 
 def _risk_label(level: RiskLevel | str) -> str:
@@ -34,7 +33,7 @@ def _drivers(response: AnalyzeResponse) -> list[tuple[str, bool]]:
     )
     return [
         ("Security-sensitive files changed", any(any(word in path for word in ("auth", "secret", "credential", "token")) for path in paths)),
-        ("Infrastructure changed", bool(metrics and metrics.workflow_files_changed) or any("workflow" in path or "actions/" in path or "terraform" in path or "k8s/" in path for path in paths)),
+        ("Infrastructure changed", bool(metrics and metrics.workflow_files_changed) or any(marker in path for path in paths for marker in ("workflow", "actions/", "terraform", "k8s/", "kubernetes/", "helm/", "dockerfile", "docker-compose"))),
         ("API contracts changed", bool(metrics and metrics.public_apis_modified) and api_evidence),
         ("Tests updated", bool(metrics and metrics.test_files_touched)),
         ("Large implementation diff", _has_trigger(response, "large_diff", "medium_diff")),
@@ -102,19 +101,6 @@ def _evidence_quality(response: AnalyzeResponse) -> tuple[str, list[str]]:
     return level, items
 
 
-def _review_effort_breakdown(response: AnalyzeResponse) -> str:
-    items = _file_risks(response)
-    estimates: list[str] = []
-    for item in items:
-        filename = _relative_path(response, item.filename if hasattr(item, "filename") else item[0])
-        changed = next((file for file in response.pr.files if _relative_path(response, file.filename) == filename), None)
-        _, minutes = _file_priority(response, filename, changed.changes if changed else 0, "report" in filename.lower() or "render" in filename.lower())
-        area = "backend" if filename.endswith(".py") or "backend/" in filename else "frontend"
-        estimates.append(f"{minutes} min {area}")
-    estimates.append("15 min validation")
-    return " | ".join(estimates) + f" | approx. {response.report.review_effort_label}"
-
-
 def render_markdown(response: AnalyzeResponse) -> str:
     """Render a merge-decision report; diagnostics are deliberately opt-in."""
     pr, report, ai, rag = response.pr, response.report, response.ai, response.rag
@@ -132,7 +118,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
         f"## Release Decision: {badge}",
         "",
         f"- **Decision:** {report.decision} | **Risk:** {_risk_label(ai.overall_risk)} | **Merge readiness:** {readiness_score}/100 | **Deployment:** {strategy}",
-        f"- **Estimated review effort:** {_review_effort_breakdown(response)} (from {pr.additions + pr.deletions} changed LOC and {pr.changed_files_count} files)",
+        f"- **Estimated review effort:** approx. {report.review_effort_label}, derived from {pr.additions + pr.deletions} changed LOC and {pr.changed_files_count} files; see Review Order for the breakdown.",
         f"- **Main review concern:** {_primary_concern(response)}",
         "- **Why this decision:** Risk is calculated from deterministic rules; AI summarizes evidence and recommends rollout.",
         "",
@@ -169,7 +155,7 @@ def render_markdown(response: AnalyzeResponse) -> str:
     lines.append(f"- **Overall:** {evidence_quality}")
     safe_to_ignore = [label for label, value in _drivers(response) if not value and label in {"Security-sensitive files changed", "Infrastructure changed", "API contracts changed"}]
     if safe_to_ignore:
-        lines.extend(["", "## No Review Needed", ""])
+        lines.extend(["", "## Not Impacted", ""])
         labels = {"Security-sensitive files changed": "Authentication, secrets", "Infrastructure changed": "Infrastructure", "API contracts changed": "API contracts"}
         lines.extend([f"- [x] {labels[item]}" for item in safe_to_ignore])
 
@@ -178,7 +164,11 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.extend([
             "### HIGH - No regression coverage added",
             "",
-            f"- **Evidence:** {pr.changed_files_count} implementation file(s) changed; {pr.additions + pr.deletions} LOC modified; no test files updated.",
+            "- **Why HIGH:**",
+            f"  - {pr.changed_files_count} implementation file(s) changed",
+            f"  - {pr.additions + pr.deletions} LOC modified",
+            "  - No regression tests updated",
+            "  - Confidence: High (deterministic diff and test signals)",
             "- **Risk:** Rendering regressions may not be detected before release.",
             "- **Recommendation:** Add snapshot tests for generated Markdown.",
             "",
@@ -219,36 +209,43 @@ def render_markdown(response: AnalyzeResponse) -> str:
         action = "Compare rendered output with the previous version." if is_renderer else "Review the changed lines and validate behavior."
         lines.extend([f"### {index}. Review {'first' if index == 1 else 'next'}: [`{filename}`]({pr.url}/files)", "", f"**{_risk_label(risk)} ({risk_score})**", "- **Why reviewed:**", "  - " + loc, "  - " + why, *(["  - No regression tests updated."] if _has_trigger(response, "no_tests") else []), f"- **Primary risk:** {impact}", f"- **Reviewer action:** {action}", f"- **Estimated review:** {review_minutes} minutes", ""])
 
-    lines.extend(["", "## Suggested Reviewers", ""])
+    lines.extend(["", "## Suggested Expertise", ""])
     reviewers = _suggested_reviewers(response)
     if reviewers:
-        lines.extend(["| Suggested reviewer | Reason | Estimated review |", "|---|---|---:|"])
+        lines.extend(["| Review domain | Focus | Estimated review |", "|---|---|---:|"])
         estimates = {"Backend": "30 min", "QA": "15 min", "Frontend": "15 min", "Platform": "10 min", "API": "15 min"}
         lines.extend([f"| {role} | {task} | {estimates.get(role, '10 min')} |" for role, task in reviewers])
     else:
         lines.append("- No additional domain review is indicated by the diff.")
 
-    lines.extend(["", f"## Why this PR scored {report.risk_score}/100", "", "| Contributor | Points |", "|---|---:|"])
+    if reviewers:
+        lines.extend(["", "## Recommended Review Flow", ""])
+        flow_estimates = {"Backend": "30 min", "Frontend": "15 min", "QA": "15 min", "Platform": "10 min", "API": "15 min"}
+        for index, (role, task) in enumerate(reviewers, start=1):
+            lines.append(f"{index}. **{role}:** {task} ({flow_estimates.get(role, '10 min')})")
+        lines.append(f"{len(reviewers) + 1}. **Merge:** {strategy} deployment after checklist completion.")
+
+    triggered_points = sum(rule.points for rule in report.score_math if rule.points > 0)
+    lines.extend(["", f"## Why this PR scored {report.risk_score}/100", "", "| Contributor | Points | Share |", "|---|---:|---:|"])
     for rule in report.score_math:
         if rule.points:
-            lines.append(f"| {rule.factor} | +{rule.points} |")
-    lines.append(f"| **Final risk score** | **{report.risk_score} / 100** |")
+            share = round((rule.points / triggered_points) * 100) if triggered_points else 0
+            lines.append(f"| {rule.factor} | +{rule.points} | {share}% |")
+    lines.append(f"| **Final risk score** | **{report.risk_score} / 100** | **100%** |")
     lines.append(f"\nMerge readiness is **{readiness_score}/100** because it combines risk, evidence quality, testing, and documentation completeness.")
 
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
     lines.extend(["", "<details>", "<summary><strong>Evidence</strong></summary>", "", "### Repository Evidence", ""])
     if docs:
         if any("readme" in path.lower() for path in docs):
-            lines.append("- **README.md** - architecture documentation consulted.")
-            lines.append("- **Matched sections:** Report Generation; Multi-agent Pipeline.")
+            lines.append("- **Consulted:** `README.md`")
+            lines.append("- **Architecture matched:** [x] Report Generation; [x] Multi-agent Pipeline.")
+            lines.append(f"- **Repository confidence:** {evidence_quality}.")
         else:
             lines.append("- Consulted: " + ", ".join(f"`{path}`" for path in docs[:3]) + ".")
     else:
         lines.append("- Repository documentation was not available; findings rely on deterministic PR evidence.")
-    lines.extend(["", "</details>", "", "<details>", "<summary><strong>Diagnostics</strong></summary>", "", "### Analysis Coverage", "", "- [x] Deterministic heuristics", f"- [{'x' if docs else ' '}] Repository documentation", f"- [{'x' if report.agent_decisions else ' '}] Specialist agents", "", "| Diagnostic | Value |", "|---|---|"])
-    lines.append(f"| LLM | {get_settings().ollama_model if response.ai_enabled else 'Not used'} |")
-    lines.append(f"| RAG | {len(docs)} document(s) |")
-    lines.append(f"| Agents | {len(report.agent_decisions)} |")
+    lines.extend(["", "</details>", "", "<details>", "<summary><strong>Diagnostics</strong></summary>", "", "### Analysis Performed", "", "- [x] Rule Engine", f"- [{'x' if docs else ' '}] Repository Retrieval", f"- [{'x' if report.agent_decisions else ' '}] Specialist Review", f"- [{'x' if response.ai_enabled else ' '}] Coordinator Summary"])
     lines.extend(["", "</details>"])
     return "\n".join(lines)
 
