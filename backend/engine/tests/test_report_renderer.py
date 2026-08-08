@@ -167,7 +167,7 @@ def test_risk_breakdown_has_no_percentages():
     )
     markdown = render_markdown(response)
     assert "| Share |" not in markdown
-    assert "%" not in markdown.split("Why this PR scored")[1].split("Merge readiness")[0]
+    assert "%" not in markdown.split("Risk Contributors")[1].split("Merge Readiness")[0]
 
 
 def test_coordinator_synthesis_and_repository_coverage():
@@ -175,7 +175,7 @@ def test_coordinator_synthesis_and_repository_coverage():
         [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
     )
     markdown = render_markdown(response)
-    assert "Coordinator Synthesis" in markdown
+    assert "Final synthesis" in markdown
     assert "Coordinator Summary" not in markdown
     assert "Repository coverage:" in markdown
     assert "Repository confidence:" not in markdown
@@ -201,6 +201,6 @@ def test_review_queue_uses_priority_labels():
         no_tests=True,
     )
     markdown = render_markdown(response)
-    assert "### Priority 1" in markdown
+    assert "### 1." in markdown
     assert "Review first" not in markdown
     assert "Review next" not in markdown

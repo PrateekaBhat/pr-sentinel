@@ -320,6 +320,36 @@ def _render_header(response: AnalyzeResponse, ctx: dict) -> list[str]:
     ]
 
 
+def _render_tldr(response: AnalyzeResponse, ctx: dict) -> list[str]:
+    """Five-second summary for reviewers triaging many PRs."""
+    report = response.report
+    strategy = report.deployment_recommendation.strategy if report.deployment_recommendation else report.deployment_strategy
+    queue: list[ReviewQueueItem] = ctx["review_queue"]
+    driver_map = dict(_drivers(response))
+
+    bullets = [_diff_size_label(response)]
+    bullets.append("No security risk" if not driver_map.get("Security-sensitive files changed") else "Touches security-sensitive files")
+    bullets.append("Tests updated" if driver_map.get("Tests updated") else "No test updates")
+    bullets.append(f"{strategy} deployment")
+    if queue:
+        bullets.append(f"Review {queue[0].filename} first")
+
+    lines = ["## Summary", ""]
+    lines.extend(f"- {b}" for b in bullets)
+    lines.append("")
+    return lines
+
+
+def _diff_size_label(response: AnalyzeResponse) -> str:
+    pr = response.pr
+    total = pr.additions + pr.deletions
+    if total > 500:
+        return f"Large refactor ({total} lines changed across {len(pr.files)} files)."
+    if total > 150:
+        return f"Medium-sized change ({total} lines changed across {len(pr.files)} files)."
+    return f"Small change ({total} lines changed across {len(pr.files)} files)."
+
+
 def _render_decision(response: AnalyzeResponse, ctx: dict) -> list[str]:
     report = response.report
     readiness = report.production_readiness
@@ -337,6 +367,9 @@ def _render_decision(response: AnalyzeResponse, ctx: dict) -> list[str]:
         f"- **Main review concern:** {_primary_concern(response)}",
         "- **Why this decision:** Risk is calculated from deterministic rules; AI summarizes evidence and recommends rollout.",
     ]
+    if queue:
+        lines.extend(["", "**Suggested review order:**"])
+        lines.extend(f"{i}. `{item.filename}` ({item.minutes} min)" for i, item in enumerate(queue, start=1))
     return lines
 
 
@@ -428,15 +461,15 @@ def _render_review_queue(response: AnalyzeResponse, ctx: dict) -> list[str]:
     pr = response.pr
     lines = ["", "## Review Queue", ""]
     for index, item in enumerate(queue, start=1):
+        # why_reviewed[0] is always the LOC label; why_reviewed[-1] is the most
+        # specific reason, so collapse the redundant middle entries into one line.
+        reason = item.why_reviewed[-1] if item.why_reviewed else "Changed file."
         lines.extend([
-            f"### Priority {index} — **{item.severity}**: [`{item.filename}`]({pr.url}/files)",
+            f"### {index}. [`{item.filename}`]({pr.url}/files) — {item.minutes} min",
             "",
-            f"**{_risk_label(item.risk)} ({item.risk_score})**",
-            "- **Why reviewed:**",
-            *(f"  - {reason}" for reason in item.why_reviewed),
-            f"- **Primary risk:** {item.primary_risk}",
-            f"- **Reviewer action:** {item.reviewer_action}",
-            f"- **Estimated review:** {item.minutes} minutes",
+            f"- **Reason:** {reason} ({item.loc_label})",
+            f"- **Potential regression:** {item.primary_risk}",
+            f"- **Suggested validation:** {item.reviewer_action}",
             "",
         ])
     lines.append(f"**Total review effort:** {_format_effort(total)}")
@@ -472,7 +505,7 @@ def _render_risk_breakdown(response: AnalyzeResponse, ctx: dict) -> list[str]:
     readiness_score = readiness.score if readiness else "n/a"
     lines = [
         "",
-        f"## Why this PR scored {report.risk_score}/100",
+        f"## Risk Contributors ({report.risk_score}/100)",
         "",
         "| Contributor | Points |",
         "|---|---:|",
@@ -481,9 +514,14 @@ def _render_risk_breakdown(response: AnalyzeResponse, ctx: dict) -> list[str]:
         if rule.points:
             lines.append(f"| {rule.factor} | +{rule.points} |")
     lines.append(f"| **Final risk score** | **{report.risk_score} / 100** |")
-    lines.append(
-        f"\nMerge readiness is **{readiness_score}/100** because it combines risk, evidence quality, testing, and documentation completeness."
-    )
+
+    lines.extend(["", f"### Merge Readiness ({readiness_score}/100)", ""])
+    if readiness and readiness.deductions:
+        lines.append("Starts at 100, deducted for:")
+        lines.append("")
+        lines.extend(f"- {reason}" for reason in readiness.deductions)
+    else:
+        lines.append("No deductions — every readiness check passed.")
     return lines
 
 
@@ -505,13 +543,13 @@ def _render_repository_evidence(response: AnalyzeResponse, ctx: dict) -> list[st
     rag = response.rag
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
     level, _ = ctx["evidence_quality"]
-    lines = ["", "### Repository Evidence", ""]
+    lines = ["", "### Repository Context Used", ""]
     if docs:
         if any("readme" in path.lower() for path in docs):
-            lines.append("- **Consulted:** `README.md`")
-            lines.append("- **Architecture matched:** [x] Report Generation; [x] Multi-agent Pipeline.")
+            lines.append("- ✓ README.md")
+            lines.append("- ✓ Architecture documentation (Report Generation, Multi-agent Pipeline)")
         else:
-            lines.append("- **Consulted:** " + ", ".join(f"`{path}`" for path in docs[:3]))
+            lines.extend(f"- ✓ `{path}`" for path in docs[:3])
         lines.append(f"- **Repository coverage:** {level}.")
     else:
         lines.append("- Repository documentation was not available; findings rely on deterministic PR evidence.")
@@ -523,12 +561,13 @@ def _render_analysis_performed(response: AnalyzeResponse, ctx: dict) -> list[str
     report = response.report
     lines = [
         "",
-        "### Analysis Performed",
+        "### Analysis Coverage",
         "",
-        "- [x] Rule Engine",
-        f"- [{'x' if ctx['has_docs'] else ' '}] Repository Retrieval",
-        f"- [{'x' if scope['agents_executed'] else ' '}] Specialist Agents",
-        f"- [{'x' if response.ai_enabled else ' '}] Coordinator Synthesis",
+        "- [x] File classification",
+        "- [x] Deterministic risk scoring",
+        f"- [{'x' if ctx['has_docs'] else ' '}] Repository context retrieval",
+        f"- [{'x' if scope['agents_executed'] else ' '}] Specialist review",
+        f"- [{'x' if response.ai_enabled else ' '}] Final synthesis",
     ]
     return lines
 
@@ -552,6 +591,7 @@ def _render_diagnostics_details(response: AnalyzeResponse, ctx: dict) -> list[st
 
 REPORT_SECTIONS: list[ReportSection] = [
     ReportSection("header", _render_header),
+    ReportSection("tldr", _render_tldr),
     ReportSection("decision", _render_decision),
     ReportSection("why_not_block", _render_why_not_block, visible=lambda r, c: bool(c["why_not_block"])),
     ReportSection("scorecard", _render_scorecard),

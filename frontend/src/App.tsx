@@ -82,6 +82,8 @@ function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; find
   const primaryConcern = testsMissing ? "Implementation changed without corresponding test updates." : result.heuristics.factors.find((factor) => factor.triggered)?.reason || "Review the evidence-backed findings before merging.";
   const apiChanged = Boolean(report.engineering_metrics?.public_apis_modified);
   const sensitive = paths.some((path) => /auth|secret|credential|token/.test(path));
+  const estimatedReviewMinutes = fileRisks.length ? fileRisks.length * 10 + (testsMissing ? 5 : 0) : Math.max(5, pr.changed_files_count * 5);
+  const estimatedReviewLabel = estimatedReviewMinutes < 60 ? `~${estimatedReviewMinutes} min` : `~${(estimatedReviewMinutes / 60).toFixed(1)} hr`;
   const requiredActions = [
     ...(testsMissing ? ["Add regression tests for the changed implementation paths."] : []),
     ...(paths.some((path) => path.includes("report") || path.includes("render")) ? ["Validate rendered Markdown output against a representative pull request."] : []),
@@ -105,6 +107,15 @@ function Report({ result, findings, fileRisks }: { result: AnalyzeResponse; find
       </div>
       <p className="mt-4 border-t border-steel pt-3 text-sm text-fog"><span className="font-semibold text-paper">Primary concern:</span> {primaryConcern}</p>
     </section>
+
+    <Card title="Review scope" eyebrow="At a glance">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Files changed" value={String(pr.changed_files_count)} />
+        <Stat label="Critical files" value={String(fileRisks.filter((file) => file.risk === "HIGH").length)} />
+        <Stat label="Review order" value={String(fileRisks.length)} />
+        <Stat label="Estimated review" value={estimatedReviewLabel} />
+      </div>
+    </Card>
 
     <Card title="Executive summary" eyebrow="What changed, main risk, merge decision">
       <p className="text-sm leading-relaxed text-paper">{truncateWords(report.executive_summary || report.summary || ai.summary)}</p>
