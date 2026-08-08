@@ -233,7 +233,41 @@ def test_release_decision_and_status_are_distinct():
     assert "## Release Decision: READY" not in markdown
 
 
+def test_hallucinated_ai_filenames_are_ignored_in_favor_of_real_files():
+    """If the AI's file_risks reference filenames that don't exist in the
+    actual diff, the queue must still be built from the real changed files —
+    not silently replaced by phantom entries."""
+    files = [
+        ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673),
+        ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=200, deletions=136, changes=336),
+    ]
+    response = _sample_response(files, no_tests=True)
+    response.ai.file_risks = [
+        FileRisk(filename="github_actions.yml", risk=RiskLevel.MEDIUM, reason="Hallucinated file."),
+        FileRisk(filename="test_build_review_queue.py", risk=RiskLevel.LOW, reason="Hallucinated file."),
+    ]
+    queue = build_review_queue(response)
+    filenames = {item.filename for item in queue}
+    assert "github_actions.yml" not in filenames
+    assert "test_build_review_queue.py" not in filenames
+    assert "backend/engine/report_renderer.py" in filenames
+    assert "frontend/src/App.tsx" in filenames
+
+
+def test_total_effort_covers_files_beyond_the_displayed_queue():
+    files = [
+        ChangedFile(filename=f"backend/engine/file_{i}.py", status="modified", additions=100, deletions=0, changes=100)
+        for i in range(7)
+    ]
+    response = _sample_response(files)
+    markdown = render_markdown(response)
+    assert "not shown above" in markdown
+
+
 def test_review_queue_uses_priority_labels():
+
+
+
     response = _sample_response(
         [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673),
          ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=200, deletions=136, changes=336)],

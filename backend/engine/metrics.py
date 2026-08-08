@@ -23,9 +23,14 @@ from .models import (
     RiskLevel,
 )
 
-# A conservative regex for "this line looks like a new public function/route",
-# used only to produce a rough count — not a substitute for real AST parsing,
-# but good enough to say "5 new public functions" instead of nothing at all.
+# A conservative regex for "this line looks like a new public function/route".
+# _NEW_PUBLIC_FUNC_RE only counts as "public API surface" within files already
+# classified into the API category (routes/, openapi, graphql, etc.) — every
+# `def`/`export function` in the entire diff is not a public API change, and
+# counting them that way is exactly what makes "N public API changes" show up
+# on plain internal refactors with zero actual API surface touched.
+# _NEW_ROUTE_RE (an actual route/endpoint decorator) is checked diff-wide,
+# since a new route is API surface regardless of which file it lands in.
 _NEW_PUBLIC_FUNC_RE = re.compile(
     r"^\+\s*(def |export function |export async function |func |public [\w<>\[\]]+ \w+\()",
 )
@@ -84,9 +89,10 @@ def build_engineering_metrics(
     # a coverage tool this module deliberately does not have access to).
     test_coverage_delta_files = test_files_touched - (1 if non_test_files > 0 and test_files_touched == 0 else 0)
 
-    public_apis_modified = _count_pattern_in_patches(files, _NEW_PUBLIC_FUNC_RE) + _count_pattern_in_patches(
-        files, _NEW_ROUTE_RE
-    )
+    public_apis_modified = _count_pattern_in_patches(
+        [f for f in files if api_category and f.filename in set(api_category.evidence_files)],
+        _NEW_PUBLIC_FUNC_RE,
+    ) + _count_pattern_in_patches(files, _NEW_ROUTE_RE)
 
     deleted_files = sum(1 for f in files if f.status == "removed")
 

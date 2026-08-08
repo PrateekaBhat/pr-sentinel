@@ -244,21 +244,51 @@ class ReviewQueueItem:
 
 
 def _candidate_files(response: AnalyzeResponse) -> list[tuple[str, str, str]]:
-    """Return (filename, risk, reason) tuples for queue construction."""
-    assessed = [
-        item for item in response.ai.file_risks
-        if item.filename and not item.filename.startswith("/path/to/")
+    """Return (filename, risk, reason) tuples for queue construction.
+
+    Always seeded from the PR's real changed files — the ground truth from
+    the diff — then enriched with the AI's per-file risk assessment wherever
+    its filename actually matches one of those real files. An LLM-produced
+    filename that doesn't match anything in the diff (a hallucination, a
+    truncated path, a stale reference) is dropped rather than silently
+    standing in for a real changed file. Without this guard, a hallucinated
+    filename can end up as the *only* thing in the review queue, which
+    quietly drops real files, misclassifies the fake one (it matches no
+    infra/test/api path pattern), and collapses the effort estimate to
+    whatever a 0-line phantom file costs to "review."
+    """
+    real_files = {_relative_path(response, f.filename): f for f in response.pr.files}
+    if not real_files:
+        return []
+
+    ai_by_path = {}
+    for item in response.ai.file_risks:
+        if not item.filename or item.filename.startswith("/path/to/"):
+            continue
+        rel = _relative_path(response, item.filename)
+        if rel in real_files and rel not in ai_by_path:
+            ai_by_path[rel] = item
+
+    candidates = [
+        (rel, _risk_label(ai_by_path[rel].risk), ai_by_path[rel].reason)
+        if rel in ai_by_path
+        else (rel, _risk_label(response.ai.overall_risk), "Changed implementation file.")
+        for rel in real_files
     ]
-    if assessed:
-        return [(item.filename, _risk_label(item.risk), item.reason) for item in assessed]
-    return [
-        (file.filename, _risk_label(response.ai.overall_risk), "Changed implementation file.")
-        for file in sorted(response.pr.files, key=lambda item: item.changes, reverse=True)
-    ]
+    # AI-assessed files first (their ordering reflects the model's read of
+    # relative importance), then the rest by size, for a stable initial
+    # ordering before the priority-based sort in build_review_queue.
+    ai_order = {rel: i for i, rel in enumerate(ai_by_path)}
+    candidates.sort(key=lambda c: (ai_order.get(c[0], len(ai_order)), -real_files[c[0]].changes))
+    return candidates
 
 
-def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
-    """Build the unified review queue — single source of truth for effort estimates."""
+def _all_review_items(response: AnalyzeResponse) -> list[ReviewQueueItem]:
+    """Build a priority-ordered ReviewQueueItem for every real changed file —
+    unfiltered. This is the single source of truth for both total review
+    effort (which must reflect the whole diff, not just the handful of files
+    shown in the queue) and the displayed queue (a capped view of this list;
+    see build_review_queue)."""
     pr = response.pr
     items: list[ReviewQueueItem] = []
     seen: set[str] = set()
@@ -344,7 +374,18 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
             -next((file.changes for file in pr.files if _relative_path(response, file.filename) == item.filename), 0),
         )
     )
-    return items[:5]
+    return items
+
+
+_QUEUE_DISPLAY_LIMIT = 5
+
+
+def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
+    """The displayed review queue — the top-priority files a reviewer should
+    look at first. Capped for readability; use `_total_review_minutes` on
+    `_all_review_items` (see `_build_context`) for the true total effort
+    across every changed file, not just this capped view."""
+    return _all_review_items(response)[:_QUEUE_DISPLAY_LIMIT]
 
 
 def _total_review_minutes(queue: list[ReviewQueueItem]) -> int:
@@ -470,6 +511,22 @@ def _diff_size_label(response: AnalyzeResponse) -> str:
     return f"Small change ({total} lines changed across {len(pr.files)} files)."
 
 
+def _risk_model_note(response: AnalyzeResponse) -> str:
+    """Clarify that the overall risk level and individual finding severity are
+    different axes — a MEDIUM risk PR with zero high-severity findings isn't a
+    contradiction, it just means risk here reflects change-surface signals
+    (diff size, security/infra/API exposure, missing tests), not that any one
+    finding was scary on its own."""
+    driver_map = dict(_drivers(response))
+    surface_reasons = [
+        label for label in ("Large implementation diff", "Infrastructure changed", "API contracts changed", "Security-sensitive files changed")
+        if driver_map.get(label)
+    ]
+    if not surface_reasons:
+        return "Reflects change-surface signals; no individual finding was flagged as high-severity."
+    return f"Driven by change-surface signals ({', '.join(s.lower() for s in surface_reasons)}), not a high-severity finding."
+
+
 def _render_decision(response: AnalyzeResponse, ctx: dict) -> list[str]:
     report = response.report
     readiness = report.production_readiness
@@ -487,6 +544,7 @@ def _render_decision(response: AnalyzeResponse, ctx: dict) -> list[str]:
         f"- **Estimated review effort:** {effort_label} (see Review Queue for breakdown)",
         f"- **Main review concern:** {_primary_concern(response)}",
         "- **Why this decision:** Risk is calculated from deterministic rules; AI summarizes evidence and recommends rollout.",
+        f"- **Why this risk level:** {_risk_model_note(response)}",
     ]
     if queue:
         lines.extend(["", "**Suggested review order:**"])
@@ -554,6 +612,17 @@ def _render_evidence_quality(response: AnalyzeResponse, ctx: dict) -> list[str]:
     for ok, label in checks:
         lines.append(f"- [{'x' if ok else ' '}] {label}")
     lines.append(f"- **Overall:** {level}")
+
+    # Make the confidence number mechanically explainable instead of a bare
+    # score: show exactly which inputs it is, and isn't, based on. This is
+    # deliberately the same ConfidenceExplanation.checks used to derive the
+    # score itself, not a separate description of it, so it can't drift out
+    # of sync with the number it's explaining.
+    explanation = response.report.confidence_explanation
+    if explanation and explanation.checks:
+        lines.extend(["", "**Confidence basis:**", ""])
+        for check in explanation.checks:
+            lines.append(f"- {'✓' if check.passed else '✗'} {check.label}")
     return lines
 
 
@@ -601,6 +670,12 @@ def _render_review_queue(response: AnalyzeResponse, ctx: dict) -> list[str]:
             "",
         ])
     lines.append(f"**Total review effort:** {_format_effort(total)}")
+    remaining = ctx.get("remaining_files", 0)
+    if remaining:
+        plural = "file" if remaining == 1 else "files"
+        lines.append(
+            f"*Effort includes {remaining} additional lower-priority {plural} not shown above.*"
+        )
     return lines
 
 
@@ -758,8 +833,13 @@ REPORT_SECTIONS: list[ReportSection] = [
 def _build_context(response: AnalyzeResponse) -> dict:
     report = response.report
     readiness = report.production_readiness
-    review_queue = build_review_queue(response)
-    total_minutes = _total_review_minutes(review_queue)
+    all_items = _all_review_items(response)
+    review_queue = all_items[:_QUEUE_DISPLAY_LIMIT]
+    # Total effort is summed across every changed file, not just the capped
+    # queue shown to reviewers — a 7-file PR that only surfaces 2 files in
+    # the queue should still report an effort estimate for all 7.
+    total_minutes = _total_review_minutes(all_items)
+    remaining_files = max(0, len(all_items) - len(review_queue))
     evidence_quality = _report_evidence_quality(response)
     docs = response.rag.scanned and bool(response.rag.retrieved)
     safe_to_ignore = [
@@ -778,6 +858,7 @@ def _build_context(response: AnalyzeResponse) -> dict:
     return {
         "badge": _badge(report.decision, readiness.score if readiness else None),
         "review_queue": review_queue,
+        "remaining_files": remaining_files,
         "total_minutes": total_minutes,
         "evidence_quality": evidence_quality,
         "analysis_scope": _analysis_scope(response),
