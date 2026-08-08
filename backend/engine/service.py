@@ -233,11 +233,7 @@ def _build_report(
     engineering_metrics = build_engineering_metrics(pr, category_breakdown)
     operational_checklist = build_operational_checklist(category_breakdown, heuristics, engineering_metrics)
     production_readiness = derive_production_readiness_score(
-        heuristics,
-        category_breakdown,
-        confidence_explanation.score,
-        engineering_metrics,
-        evidence_complete=confidence_explanation.evidence_completeness == "complete",
+        heuristics, category_breakdown, confidence_explanation.score, engineering_metrics
     )
     suggested_reviewers = build_suggested_reviewers(pr, category_breakdown)
     positive_signals = build_positive_signals(heuristics)

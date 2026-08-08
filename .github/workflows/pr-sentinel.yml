@@ -77,13 +77,14 @@ jobs:
         id: report
         if: always()
         run: |
-          echo "report_body<<EOF" >> "$GITHUB_OUTPUT"
-          if [ -f reports/report.md ]; then
+          delimiter="EOF_$(openssl rand -hex 12)"
+          echo "report_body<<${delimiter}" >> "$GITHUB_OUTPUT"
+          if [ -s reports/report.md ]; then
             cat reports/report.md
           else
-            echo "No report generated."
+            echo "No report generated (analysis step failed or produced an empty report)."
           fi
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "${delimiter}" >> "$GITHUB_OUTPUT"
 
       - name: Upload report artifacts
         if: always()
@@ -99,7 +100,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           issue-number: ${{ github.event.pull_request.number }}
-          body: ${{ steps.report.outputs.report_body }}
+          body: ${{ steps.report.outputs.report_body || 'No report generated (analysis step failed or produced an empty report).' }}
 
       - name: Fail if blocked
         if: ${{ steps.analyze.outputs.exit_code == '1' }}
