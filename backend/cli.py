@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import os
+import sys
+import traceback
 from pathlib import Path
 
 from engine.service import analyze_pr, render_comment
@@ -34,12 +36,34 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _write_error_comment(comment_path: str, exc: BaseException) -> None:
+    """Best-effort diagnostic so a crash still surfaces something useful on the PR,
+    instead of leaving reports/report.md missing entirely."""
+    text = (
+        "# PR Sentinel\n\n"
+        "## ⚠️ Analysis failed to complete\n\n"
+        f"**Error:** `{type(exc).__name__}: {exc}`\n\n"
+        "The analysis run raised an unhandled exception before a report could be "
+        "generated. Check the workflow logs for the \"Analyze pull request\" step "
+        "for the full traceback.\n"
+    )
+    Path(comment_path).write_text(text, encoding="utf-8")
+
+
 async def _run_analyze(args: argparse.Namespace) -> int:
     token = args.token or os.environ.get("GITHUB_TOKEN", "")
     if "/" not in args.repo:
         raise ValueError("--repo must be in owner/repo format.")
     owner, repo = args.repo.split("/", 1)
-    response = await analyze_pr(owner, repo, args.pr, token=token)
+
+    try:
+        response = await analyze_pr(owner, repo, args.pr, token=token)
+    except Exception as exc:  # noqa: BLE001 — always leave a diagnostic behind
+        traceback.print_exc(file=sys.stderr)
+        if args.comment:
+            _write_error_comment(args.comment, exc)
+        return 2
+
     report_json = json.dumps(response.model_dump(mode="json"), indent=2)
 
     if args.output == "-":
