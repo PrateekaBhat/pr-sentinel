@@ -5,6 +5,7 @@ from engine.models import (
     AIAnalysis,
     AnalyzeResponse,
     ChangedFile,
+    ConfidenceExplanation,
     FileRisk,
     HeuristicFactor,
     HeuristicResult,
@@ -192,6 +193,44 @@ def test_analysis_scope_section():
     assert "**Files analyzed:** 2 / 2" in markdown
     assert "**Agents executed:** 1" in markdown
     assert "**Agents skipped:** 4" in markdown
+
+
+def test_evidence_quality_and_confidence_never_contradict():
+    """High evidence quality must never sit next to a 'below-target
+    confidence' readiness penalty — both are sourced from the same
+    ConfidenceExplanation."""
+    response = _sample_response(
+        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673)],
+    )
+    response.report.confidence_explanation = ConfidenceExplanation(
+        score=60,
+        level="High",
+        repository_context_available=True,
+        llm_heuristic_agreement=True,
+        evidence_completeness="complete",
+    )
+    markdown = render_markdown(response)
+    assert "Evidence Quality — 60% confidence (High)" in markdown
+    assert "below-target confidence" not in markdown
+
+
+def test_not_impacted_section_replaces_no_review_needed():
+    response = _sample_response(
+        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
+    )
+    markdown = render_markdown(response)
+    assert "## Not Impacted" in markdown
+    assert "No Review Needed" not in markdown
+
+
+def test_release_decision_and_status_are_distinct():
+    response = _sample_response(
+        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
+    )
+    markdown = render_markdown(response)
+    assert "## Release Decision: ALLOW" in markdown
+    assert "**Release Posture:**" in markdown
+    assert "## Release Decision: READY" not in markdown
 
 
 def test_review_queue_uses_priority_labels():

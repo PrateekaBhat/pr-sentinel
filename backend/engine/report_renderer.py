@@ -15,10 +15,22 @@ def _risk_label(level: RiskLevel | str) -> str:
 
 
 def _badge(decision: str, readiness: int | None) -> str:
+    """Human-readable merge gate status.
+
+    This is deliberately kept separate from `decision` (ALLOW/BLOCK, the
+    release gate) and from `readiness` (the 0-100 merge-readiness score).
+    "ALLOW" and "READY" are not the same claim: a PR can be ALLOWed to merge
+    (no blocking findings) while still needing focused human review before
+    it's actually READY. Conflating them under one badge is what let
+    "Release Decision: READY" and "Decision: ALLOW" appear side by side in
+    the same report, implying two different verdicts. The header now always
+    states the ALLOW/BLOCK decision plainly; this badge is only used for the
+    plain-language merge-gate summary line beneath it.
+    """
     if decision == "BLOCK" or (readiness is not None and readiness < 55):
         return "DO NOT MERGE"
     if decision == "ALLOW" and (readiness is None or readiness >= 80):
-        return "READY"
+        return "READY TO MERGE"
     return "REVIEW REQUIRED BEFORE MERGE"
 
 
@@ -178,6 +190,42 @@ def _file_risk_score(response: AnalyzeResponse, filename: str, changes: int, cat
     return max(5, min(95, score))
 
 
+_CRITICALITY_WEIGHT = {
+    "implementation": 1.0,
+    "api": 1.0,
+    "database": 1.0,
+    "infrastructure": 0.7,
+    "test": 0.5,
+    "documentation": 0.2,
+}
+
+
+def _priority_label(score: int) -> str:
+    if score >= 70:
+        return "P1"
+    if score >= 40:
+        return "P2"
+    return "P3"
+
+
+def _review_priority(risk_score: int, category: str, is_renderer: bool, behavioral_change: bool, confidence: int) -> int:
+    """priority = risk x architectural importance x behavioral change x uncertainty.
+
+    Deliberately does not use LOC. A 1,000-line diff isn't automatically
+    higher review priority than a 50-line diff that changes core,
+    low-confidence, behavior-altering logic — LOC only affects how *long*
+    a file takes to review (see _file_review_minutes), not where it sits
+    in the queue.
+    """
+    criticality = _CRITICALITY_WEIGHT.get(category, 0.6)
+    if is_renderer:
+        criticality = min(1.2, criticality + 0.2)
+    behavior = 1.0 if behavioral_change else 0.6
+    uncertainty = 1.0 + max(0, 70 - confidence) / 100  # lower confidence -> higher priority
+    score = risk_score * criticality * behavior * uncertainty
+    return max(1, min(100, round(score)))
+
+
 @dataclass
 class ReviewQueueItem:
     filename: str
@@ -191,6 +239,8 @@ class ReviewQueueItem:
     why_reviewed: list[str]
     primary_risk: str
     reviewer_action: str
+    priority_score: int = 0
+    priority_label: str = "P3"
 
 
 def _candidate_files(response: AnalyzeResponse) -> list[tuple[str, str, str]]:
@@ -212,6 +262,7 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
     pr = response.pr
     items: list[ReviewQueueItem] = []
     seen: set[str] = set()
+    confidence = response.report.confidence_explanation.score if response.report.confidence_explanation else response.ai.confidence
 
     for filename, risk, reason in _candidate_files(response):
         rel = _relative_path(response, filename)
@@ -261,6 +312,9 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
             impact = "A regression in the changed behavior."
             action = "Review the changed lines and validate behavior."
 
+        behavioral_change = category not in {"test", "documentation"}
+        priority_score = _review_priority(risk_score, category, is_renderer, behavioral_change, confidence)
+
         items.append(
             ReviewQueueItem(
                 filename=rel,
@@ -274,11 +328,17 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
                 why_reviewed=why,
                 primary_risk=impact,
                 reviewer_action=action,
+                priority_score=priority_score,
+                priority_label=_priority_label(priority_score),
             )
         )
 
+    # Primary ordering is review priority (risk x criticality x behavioral
+    # change x uncertainty), not line count. Severity and LOC only break ties
+    # between files of equal priority, for stable, deterministic ordering.
     items.sort(
         key=lambda item: (
+            -item.priority_score,
             _SEVERITY_RANK[item.severity],
             _CATEGORY_RANK.get(item.category, 99),
             -next((file.changes for file in pr.files if _relative_path(response, file.filename) == item.filename), 0),
@@ -316,21 +376,28 @@ def _analysis_scope(response: AnalyzeResponse) -> dict[str, int]:
     }
 
 
-def _report_evidence_quality(response: AnalyzeResponse) -> tuple[str, list[tuple[bool, str]]]:
-    """Measure how reliable this report is — kept consistent with the confidence
-    score so 'High evidence, 55% confidence' can't happen: both are driven by
-    whether the AI pipeline actually ran, not just whether repo docs exist."""
+def _report_evidence_quality(response: AnalyzeResponse) -> tuple[str, int, list[tuple[bool, str]]]:
+    """Measure how reliable this report is. Evidence quality and confidence are
+    two views of the same underlying signal — whether the analysis pipeline
+    ran to completion — so both are read from the same ConfidenceExplanation
+    rather than computed independently. That makes 'Evidence Quality: High'
+    next to a 'below-target confidence' penalty structurally impossible: the
+    same source of truth drives the label, the percentage, and (via
+    evidence_complete) whether Merge Readiness may deduct for it."""
     checks: list[tuple[bool, str]] = [
         (True, "Deterministic analysis"),
         (response.rag.scanned and bool(response.rag.retrieved), "Repository context"),
         (True, "Changed files classified"),
         (True, "Git diff"),
         (response.ai_enabled, "AI specialist synthesis"),
-        (False, "Runtime telemetry"),
+        (False, "Runtime telemetry (not available to a local PR analyzer)"),
     ]
+    explanation = response.report.confidence_explanation
+    if explanation:
+        return explanation.level, explanation.score, checks
     available = sum(1 for ok, _ in checks if ok)
     level = "High" if available >= 5 else "Medium" if available >= 3 else "Low"
-    return level, checks
+    return level, available * 20, checks
 
 
 def _why_not_block(response: AnalyzeResponse) -> list[tuple[bool, str]]:
@@ -413,9 +480,10 @@ def _render_decision(response: AnalyzeResponse, ctx: dict) -> list[str]:
     effort_label = _format_effort(total_minutes) if queue else report.review_effort_label
 
     lines = [
-        f"## Release Decision: {ctx['badge']}",
+        f"## Release Decision: {report.decision}",
         "",
-        f"- **Decision:** {report.decision} | **Risk:** {_risk_label(response.ai.overall_risk)} | **Merge readiness:** {readiness_score}/100 | **Deployment:** {strategy}",
+        f"- **Status:** {ctx['badge']} | **Release Posture:** {strategy} | **Risk:** {_risk_label(response.ai.overall_risk)}",
+        f"- **Merge readiness:** {readiness_score}/100 | **Confidence:** {ctx['evidence_quality'][1]}%",
         f"- **Estimated review effort:** {effort_label} (see Review Queue for breakdown)",
         f"- **Main review concern:** {_primary_concern(response)}",
         "- **Why this decision:** Risk is calculated from deterministic rules; AI summarizes evidence and recommends rollout.",
@@ -481,8 +549,8 @@ def _render_checklist(response: AnalyzeResponse, ctx: dict) -> list[str]:
 
 
 def _render_evidence_quality(response: AnalyzeResponse, ctx: dict) -> list[str]:
-    level, checks = ctx["evidence_quality"]
-    lines = ["", "## Evidence Quality", ""]
+    level, confidence, checks = ctx["evidence_quality"]
+    lines = ["", f"## Evidence Quality — {confidence}% confidence ({level})", ""]
     for ok, label in checks:
         lines.append(f"- [{'x' if ok else ' '}] {label}")
     lines.append(f"- **Overall:** {level}")
@@ -497,12 +565,16 @@ def _render_not_impacted(response: AnalyzeResponse, ctx: dict) -> list[str]:
     if not safe_to_ignore:
         return []
     labels = {
-        "Security-sensitive files changed": "Authentication, secrets",
+        "Security-sensitive files changed": "Security-sensitive paths (auth, secrets)",
         "Infrastructure changed": "Infrastructure",
         "API contracts changed": "API contracts",
     }
-    lines = ["", "## No Review Needed", ""]
-    lines.extend(f"- [x] {labels[item]}" for item in safe_to_ignore)
+    # "Not Impacted" instead of "No Review Needed" — the latter reads as an
+    # instruction to skip reviewing security/infra/API concerns, when what's
+    # actually true is narrower: these specific areas weren't touched by this
+    # diff, so there's nothing here to review.
+    lines = ["", "## Not Impacted", ""]
+    lines.extend(f"- ✓ {labels[item]} — not impacted" for item in safe_to_ignore)
     return lines
 
 
@@ -522,6 +594,7 @@ def _render_review_queue(response: AnalyzeResponse, ctx: dict) -> list[str]:
             f"### {index}. [`{item.filename}`]({pr.url}/files) — {item.minutes} min",
             "",
             f"- **Role:** {item.role}",
+            f"- **Review priority:** {item.priority_label}",
             f"- **Reason:** {reason} ({item.loc_label})",
             f"- **{label}:** {item.primary_risk}",
             f"- **Suggested validation:** {item.reviewer_action}",
@@ -617,7 +690,7 @@ def _render_specialist_routing(response: AnalyzeResponse, ctx: dict) -> list[str
 def _render_repository_evidence(response: AnalyzeResponse, ctx: dict) -> list[str]:
     rag = response.rag
     docs = list(dict.fromkeys((rag.indexed_doc_paths or []) + [chunk.path for chunk in rag.retrieved]))
-    level, _ = ctx["evidence_quality"]
+    level, _confidence, _checks = ctx["evidence_quality"]
     lines = ["", "### Repository Context Used", ""]
     if docs:
         if any("readme" in path.lower() for path in docs):

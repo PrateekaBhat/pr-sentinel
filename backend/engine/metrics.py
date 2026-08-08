@@ -250,11 +250,24 @@ def derive_production_readiness_score(
     categories: list[RiskCategory],
     confidence: int,
     em: EngineeringMetrics,
+    evidence_complete: bool = True,
 ) -> ProductionReadinessScore:
     """A single 0-100 score summarizing 'is this ready to ship', built entirely
     from numbers already computed elsewhere in the pipeline — deterministic and
     reproducible, not an LLM guess. Starts at 100 and subtracts points for each
-    concrete readiness gap, so the explanation is just the list of deductions."""
+    concrete readiness gap, so the explanation is just the list of deductions.
+
+    `evidence_complete` mirrors ConfidenceExplanation.evidence_completeness ==
+    "complete" (repo docs available, all applicable specialist agents ran, AI
+    pipeline available, claims grounded). A readiness deduction here is only
+    justified when there's an actual gap in *how* the PR was analyzed — not
+    simply because the model's self-reported confidence number is below an
+    arbitrary threshold. Otherwise a report can show "Evidence Quality: High"
+    right next to a readiness penalty for "low confidence," which is a
+    contradiction reviewers rightly distrust. When the pipeline ran to
+    completion, we take its confidence score at face value and don't
+    second-guess it here.
+    """
     score = 100
     reasons: list[str] = []
     by_category = {c.category: c for c in categories}
@@ -265,11 +278,14 @@ def derive_production_readiness_score(
         score -= risk_penalty
         reasons.append(f"-{risk_penalty} for overall risk score ({heuristics.score}/100)")
 
-    # Confidence
-    if confidence < 70:
+    # Confidence — only a readiness concern when the analysis itself was
+    # incomplete (missing repo context, specialist agents that couldn't run,
+    # ungrounded claims). A low self-reported confidence on a *complete*
+    # analysis is information, not a gap, so it isn't double-penalized here.
+    if not evidence_complete and confidence < 70:
         conf_penalty = min(15, (70 - confidence) // 2)
         score -= conf_penalty
-        reasons.append(f"-{conf_penalty} for below-target confidence ({confidence}%)")
+        reasons.append(f"-{conf_penalty} for incomplete evidence coverage (confidence {confidence}%)")
 
     # Tests
     if em.test_files_touched == 0 and by_category.get("Application/Core Logic", None) and by_category["Application/Core Logic"].evidence:
@@ -285,10 +301,16 @@ def derive_production_readiness_score(
         score -= 10
         reasons.append(f"-10 for multi-domain deployment complexity ({', '.join(complexity_categories)})")
 
-    # Documentation
-    if em.documentation_ratio == 0 and em.lines_added > 300:
+    # Documentation — only a defensible deduction when the change actually
+    # adds or alters something other people need to be told about (a public
+    # API/route). A large internal refactor with no behavior change for
+    # consumers doesn't owe a documentation update, so it isn't penalized
+    # for lacking one.
+    if em.documentation_ratio == 0 and em.lines_added > 300 and em.public_apis_modified:
         score -= 5
-        reasons.append("-5 for a large change with no accompanying documentation update")
+        reasons.append(
+            f"-5 for {em.public_apis_modified} public API change(s) with no accompanying documentation update"
+        )
 
     # Secrets
     secrets_cat = by_category.get("Secrets")
