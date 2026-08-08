@@ -82,6 +82,7 @@ jobs:
             echo "report_body<<${delimiter}"
             if [ -s reports/report.md ]; then
               cat reports/report.md
+              echo
             else
               echo "No report generated (analysis step failed or produced an empty report)."
             fi
