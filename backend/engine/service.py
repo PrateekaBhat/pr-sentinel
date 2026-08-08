@@ -13,6 +13,7 @@ from .categories import (
     build_category_breakdown,
     build_confidence_explanation,
     build_specialist_routing,
+    reconcile_executive_summary,
 )
 from .config import get_settings
 from .github_client import GitHubError
@@ -76,6 +77,7 @@ def _build_risk_breakdown(heuristics: HeuristicResult) -> dict[str, int]:
         "infra": "Infrastructure",
         "migration": "Database",
         "api_contract": "API",
+        "api_client": "API",
         "tests_deleted": "Tests",
         "no_tests": "Tests",
         "large_diff": "Review surface",
@@ -255,6 +257,12 @@ def _build_report(
             + exec_summary
         )
 
+    agent_decisions = build_agent_decisions(state)
+    # Deterministic guardrail: never let the executive summary claim "no concerns" while
+    # a specialist agent actually raised some — regardless of whether the LLM followed
+    # the prompt's consistency instructions.
+    exec_summary = reconcile_executive_summary(exec_summary, agent_decisions)
+
     return RiskReport(
         decision=decision,
         release_risk=release_risk,
@@ -274,7 +282,7 @@ def _build_report(
         evidence=_build_evidence(heuristics, ai),
         timeline=_build_timeline(repo_loaded_ms, repo_context_ms, state),
         agent_statuses=_build_agent_statuses(state),
-        agent_decisions=build_agent_decisions(state),
+        agent_decisions=agent_decisions,
         repository_metadata=_infer_repository_metadata(pr, rag),
         summary=ai.summary,
         executive_summary=exec_summary,

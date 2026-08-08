@@ -613,6 +613,59 @@ def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list
     return entries
 
 
+_BLANKET_REASSURANCE_RE = re.compile(
+    r"no concerning issues|nothing concerning|no issues (were )?found|no concerns (were )?"
+    r"(found|raised|identified)",
+    re.I,
+)
+
+
+def reconcile_executive_summary(summary: str, decisions: list[AgentDecision]) -> str:
+    """Deterministic guardrail, independent of whether the LLM followed the prompt's
+    consistency rule: if any specialist agent raised concerns, the executive summary
+    must not claim otherwise, and those concerns must actually be named in the text.
+
+    - specialist.concerns > 0  → specialist findings MUST appear in the summary
+    - specialist.concerns == 0 → specialist may be described as clean/PASS
+
+    This never removes or rewrites a summary that already surfaces the concerns; it
+    only appends what's missing, and only strips a blanket "no concerns" claim when
+    that claim is actually contradicted by the evidence.
+    """
+    with_concerns = [d for d in decisions if d.decision.startswith("Concerns raised")]
+
+    if not with_concerns:
+        return summary
+
+    text = summary or ""
+    if _BLANKET_REASSURANCE_RE.search(text):
+        # Drop whole clauses containing the false blanket reassurance rather than
+        # leaving a dangling sentence fragment behind.
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        cleaned = []
+        for s in sentences:
+            if not _BLANKET_REASSURANCE_RE.search(s):
+                cleaned.append(s)
+                continue
+            # Same sentence may have a clause worth keeping (split on ", but"/", and").
+            clauses = re.split(r",\s*(?:but|and)\s+", s)
+            surviving = [c for c in clauses if not _BLANKET_REASSURANCE_RE.search(c)]
+            if surviving:
+                clause = surviving[0].strip().rstrip(" .,;")
+                if clause:
+                    cleaned.append(clause + ".")
+        text = " ".join(cleaned).strip()
+
+    missing = [d for d in with_concerns if d.label.lower() not in text.lower()]
+    if not missing:
+        return text
+
+    addendum = " ".join(f"{d.label} — {d.decision}: {d.reasoning}".strip() for d in missing)
+    if text and not text.endswith((".", "!", "?")):
+        text += "."
+    return f"{text} {addendum}".strip()
+
+
 def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
     decisions: list[AgentDecision] = []
     for domain in ["security", "database", "api", "tests", "performance"]:

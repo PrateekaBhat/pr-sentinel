@@ -14,7 +14,22 @@ PATH_RULES: list[tuple[str, str, int, re.Pattern]] = [
     # heuristic fires frequently on routine PRs and was over-inflating scores.
     ("infra", "Infrastructure / deployment files changed", 20, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
     ("migration", "Database migration detected", 35, re.compile(r"(^|/)(migrations?|schema)(/|\.).*\.(sql|py|ts|js)$|alembic", re.I)),
-    ("api_contract", "Public API contract changed", 25, re.compile(r"(^|/)(routes?|controllers?|api|graphql|schema\.graphql|openapi)(/|\.)", re.I)),
+    # "Public API contract changed" is reserved for evidence of the actual server-side
+    # contract (route/controller definitions, GraphQL/OpenAPI schema) — not merely a
+    # path that happens to contain "api". A frontend directory like
+    # `frontend/src/api/client.ts` is a *consumer* of the contract, not the contract
+    # itself, so it must never match here (see api_client rule below).
+    ("api_contract", "Public API contract changed", 25, re.compile(
+        r"(^|/)(routes?|controllers?)(/|\.)|(^|/)(graphql|schema\.graphql|openapi)(/|\.)", re.I
+    )),
+    # Weaker, distinct signal: a frontend/client-side API adapter changed. This only
+    # means "an API compatibility review is warranted" — it is NOT evidence that the
+    # public contract itself changed, since the client could just be catching up to an
+    # already-shipped backend change (or vice versa). Scored lower than api_contract
+    # and never conflated with it in reporting.
+    ("api_client", "API client / integration changed", 10, re.compile(
+        r"(^|/)api(/|\.).*\.(ts|tsx|js|jsx)$", re.I
+    )),
 ]
 
 TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|spec)(/|\.)|\.(test|spec)\.", re.I)

@@ -114,6 +114,7 @@ DEMOS: dict[str, AnalyzeResponse] = {
                 HeuristicFactor(key="config", label="Configuration files changed", triggered=True, weight=30, reason="Matched in config/auth.yaml"),
                 HeuristicFactor(key="tests_deleted", label="Test files were deleted", triggered=True, weight=25, reason="auth/session_store.test.ts removed with no replacement."),
                 HeuristicFactor(key="api_contract", label="Public API contract changed", triggered=False, weight=25, reason="No matching files in this diff."),
+                HeuristicFactor(key="api_client", label="API client / integration changed", triggered=False, weight=10, reason="No matching files in this diff."),
             ],
         ),
         ai=AIAnalysis(

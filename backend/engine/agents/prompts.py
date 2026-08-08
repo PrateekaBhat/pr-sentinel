@@ -65,6 +65,13 @@ CRITICAL — Evidence-only writing rules for executive_summary:
   Actions workflow to replace llama3.1 with llama3.2 and modifies the report renderer."
   Example of a bad sentence: "The impact on the FastAPI backend is unclear without further
   context from the repository documentation."
+- MANDATORY consistency rule: if ANY specialist agent above reported one or more findings
+  (i.e. its findings list is non-empty), the executive_summary MUST name that agent's domain
+  and summarize what it found. You may NOT write "no concerning issues were found by the
+  specialist agents" (or any equivalent blanket reassurance) unless EVERY applicable agent's
+  findings list is empty. A specialist with concerns and a summary claiming none is a
+  contradiction and is never acceptable. Only describe a specific domain as clean ("no
+  concerns") if that domain's own findings list was empty — never generalize across domains.
 
 Respond with ONLY a single JSON object (no markdown fences, no prose before or after):
 {
@@ -100,6 +107,10 @@ Also flag any of the following speculation patterns if they appear in executive_
 - "unclear impact" / "it is unclear" / "without further context"
 - "may affect" / "could potentially" / "might impact"
 - Claims about subsystems that no agent reviewed or no heuristic triggered
+- A blanket reassurance ("no concerning issues found", "nothing concerning", etc.) that
+  contradicts one or more specialist agents whose findings list was non-empty. If any agent
+  in the evidence reported findings and the executive_summary does not name that agent's
+  domain and concern, flag it as an unsupported/contradictory claim.
 
 Respond with ONLY JSON:
 {
