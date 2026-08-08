@@ -99,7 +99,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           issue-number: ${{ github.event.pull_request.number }}
-          body-path: reports/report.md
+          body: ${{ steps.report.outputs.report_body }}
 
       - name: Fail if blocked
         if: ${{ steps.analyze.outputs.exit_code == '1' }}
