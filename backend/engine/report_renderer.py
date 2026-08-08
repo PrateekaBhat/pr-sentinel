@@ -120,6 +120,16 @@ def render_markdown(response: AnalyzeResponse) -> str:
             "",
         ])
 
+    if response.judge and response.judge.grounded is False:
+        lines.extend([
+            "> ⚠ **Evidence requires review** — the groundedness check flagged claims in "
+            "this report that aren't fully supported by the underlying evidence. The "
+            "release decision above is unaffected (it's produced by deterministic "
+            "policy, not the LLM narrative), but read the executive summary and agent "
+            "findings with that in mind.",
+            "",
+        ])
+
     if report.llm_disagreement and report.llm_disagreement.detected:
         lines.extend([
             "### ⚠ Deterministic Override",
@@ -319,6 +329,10 @@ def render_console(response: AnalyzeResponse) -> str:
 
     if report.llm_disagreement and report.llm_disagreement.detected:
         lines.append(_color("  ⚠ Deterministic Override — LLM cannot change release policy", _YELLOW))
+        lines.append("")
+
+    if response.judge and response.judge.grounded is False:
+        lines.append(_color("  ⚠ Evidence requires review — groundedness check flagged unsupported claims", _YELLOW))
         lines.append("")
 
     if not response.ai_enabled:

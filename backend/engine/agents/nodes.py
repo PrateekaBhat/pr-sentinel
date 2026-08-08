@@ -15,6 +15,7 @@ from ..models import (
     RiskLevel,
 )
 from ..ollama_client import OllamaError, chat_json
+from ..categories import clean_finding_text, reconcile_executive_summary
 from .prompts import (
     AGENT_RESPONSE_INSTRUCTIONS,
     AGENT_SYSTEM_PROMPTS,
@@ -74,8 +75,9 @@ async def run_agent(domain: str, state: AgentState) -> dict:
         system = AGENT_SYSTEM_PROMPTS[domain]
         user = f"## Files in scope\n{_files_prompt(files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
         data = await chat_json(system, user, timeout=120.0)
-        findings = [str(x) for x in (data.get("findings") or [])][:4]
-        risk_note = str(data.get("risk_note", ""))
+        findings = [clean_finding_text(str(x)) for x in (data.get("findings") or [])][:4]
+        findings = [f for f in findings if f]
+        risk_note = clean_finding_text(str(data.get("risk_note", "")))
         confidence = int(data.get("confidence", 60))
     except OllamaError as exc:
         logger.warning("%s agent failed: %s", domain, exc)
@@ -221,11 +223,15 @@ async def coordinator_node(state: AgentState) -> dict:
         else:
             strategy = "Standard"
 
+    exec_summary = reconcile_executive_summary(
+        data.get("executive_summary") or data.get("summary", ""), agent_findings
+    )
+
     result = AIAnalysis(
         overall_risk=overall_risk,
         confidence=int(data.get("confidence", 60)),
         summary=data.get("summary", ""),
-        executive_summary=data.get("executive_summary") or data.get("summary", ""),
+        executive_summary=exec_summary,
         architectural_impact=data.get("architectural_impact", ""),
         affected_subsystems=[str(x) for x in (data.get("affected_subsystems") or [])],
         operational_risks=data.get("operational_risks", []) or [],
@@ -261,10 +267,17 @@ async def judge_node(state: AgentState) -> dict:
             timeout=120.0,
         )
         duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+        issues = [str(x) for x in (data.get("issues") or [])][:5]
+        # Don't blindly trust the model's self-reported "grounded" flag — if it also
+        # listed issues, that's a self-contradiction (it found something ungrounded but
+        # still called the report grounded). Force grounded=False whenever there are
+        # issues, deterministically, rather than let the LLM's inconsistency propagate
+        # into the report's Evidence Confidence score.
+        grounded = bool(data.get("grounded", True)) and not issues
         return {
             "judge_result": JudgeVerdict(
-                grounded=bool(data.get("grounded", True)),
-                issues=[str(x) for x in (data.get("issues") or [])][:5],
+                grounded=grounded,
+                issues=issues,
                 notes=str(data.get("notes", "")),
             ),
             "judge_duration_ms": duration_ms,

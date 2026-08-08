@@ -43,8 +43,8 @@ Rather than relying on a black-box LLM to "guess" risk, PR Sentinel enforces a s
                        agent findings + RAG citations → report
                                         │
                               Judge (LLM-as-Judge)
-                       Checks every claim in the report traces
-                             back to empirical evidence
+                     Validates whether report claims are grounded
+                    in evidence; flags unsupported/speculative ones
                                         │
                         React + TypeScript Dashboard &
                         GitHub PR Comment / Markdown Artifact

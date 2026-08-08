@@ -258,10 +258,11 @@ def _build_report(
         )
 
     agent_decisions = build_agent_decisions(state)
-    # Deterministic guardrail: never let the executive summary claim "no concerns" while
-    # a specialist agent actually raised some — regardless of whether the LLM followed
-    # the prompt's consistency instructions.
-    exec_summary = reconcile_executive_summary(exec_summary, agent_decisions)
+    # Belt-and-suspenders: the coordinator already reconciles the executive summary
+    # against agent findings before the judge sees it (agents/nodes.py), so this call
+    # is normally a no-op. It stays here as a safety net for the ai_enabled=False path
+    # and any future callers that bypass the coordinator. Idempotent by construction.
+    exec_summary = reconcile_executive_summary(exec_summary, ai.agent_findings)
 
     return RiskReport(
         decision=decision,

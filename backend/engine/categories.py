@@ -615,55 +615,107 @@ def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list
 
 _BLANKET_REASSURANCE_RE = re.compile(
     r"no concerning issues|nothing concerning|no issues (were )?found|no concerns (were )?"
-    r"(found|raised|identified)",
+    r"(found|raised|identified)|no (significant |major |real )?(risks?|problems?) (were )?"
+    r"(found|identified|detected)",
     re.I,
 )
 
+# Some local LLMs echo the response schema's placeholder tokens back verbatim instead
+# of replacing them (e.g. returning "<short, specific finding>: Renamed endpoint x"
+# instead of just "Renamed endpoint x"). Strip these schema artifacts defensively so
+# they never reach the rendered report.
+_PLACEHOLDER_ARTIFACT_RE = re.compile(r"<[^<>]{0,60}>:?\s*", re.I)
 
-def reconcile_executive_summary(summary: str, decisions: list[AgentDecision]) -> str:
+
+def clean_finding_text(text: str) -> str:
+    """Strip literal prompt-template placeholders an LLM echoed back verbatim."""
+    cleaned = _PLACEHOLDER_ARTIFACT_RE.sub("", text or "").strip()
+    return cleaned
+
+
+def reconcile_executive_summary(summary: str, agent_findings: list[AgentFinding]) -> str:
     """Deterministic guardrail, independent of whether the LLM followed the prompt's
-    consistency rule: if any specialist agent raised concerns, the executive summary
-    must not claim otherwise, and those concerns must actually be named in the text.
+    consistency/grounding rules:
 
-    - specialist.concerns > 0  → specialist findings MUST appear in the summary
-    - specialist.concerns == 0 → specialist may be described as clean/PASS
+    1. Any specialist domain the summary references must have actually run and be
+       applicable — a mention of a domain that was SKIPPED (not applicable) is by
+       definition fabricated, since that agent reviewed nothing. Sentences making such
+       a claim are removed outright.
+    2. If specialist.concerns > 0, that specialist's finding MUST appear in the summary.
+       If specialist.concerns == 0, the specialist may be described as clean.
+    3. A blanket reassurance ("no concerning issues found") is never allowed to coexist
+       with a specialist that actually raised concerns.
 
-    This never removes or rewrites a summary that already surfaces the concerns; it
-    only appends what's missing, and only strips a blanket "no concerns" claim when
-    that claim is actually contradicted by the evidence.
+    This never rewrites a summary that's already accurate; it only removes what's
+    fabricated and appends what's missing.
     """
-    with_concerns = [d for d in decisions if d.decision.startswith("Concerns raised")]
+    text = summary or ""
+
+    with_concerns = [f for f in agent_findings if f.applicable and f.findings]
+    skipped_labels = [f.label for f in agent_findings if not f.applicable]
+
+    def _split_sentences(t: str) -> list[str]:
+        return [s for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
+
+    # 1. Remove sentences that attribute findings to a domain that never ran.
+    if skipped_labels:
+        kept = []
+        for s in _split_sentences(text):
+            if any(re.search(re.escape(label), s, re.I) for label in skipped_labels):
+                continue
+            kept.append(s)
+        text = " ".join(kept).strip()
 
     if not with_concerns:
-        return summary
+        # No real concerns to reconcile against — but a blanket "no concerns" claim is
+        # still fine to leave as-is here, since it isn't contradicted by anything.
+        return text
 
-    text = summary or ""
-    if _BLANKET_REASSURANCE_RE.search(text):
-        # Drop whole clauses containing the false blanket reassurance rather than
-        # leaving a dangling sentence fragment behind.
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        cleaned = []
-        for s in sentences:
-            if not _BLANKET_REASSURANCE_RE.search(s):
-                cleaned.append(s)
-                continue
-            # Same sentence may have a clause worth keeping (split on ", but"/", and").
+    # 2. Decide, against the *current* text, which concerned specialists are actually
+    #    and accurately addressed: mentioned by name, in a sentence that isn't just a
+    #    reassurance ("no risks found") sitting next to the name.
+    def _sentence_addresses_concern(label: str) -> bool:
+        for s in _split_sentences(text):
+            if re.search(re.escape(label), s, re.I) and not _BLANKET_REASSURANCE_RE.search(s):
+                return True
+        return False
+
+    missing = [f for f in with_concerns if not _sentence_addresses_concern(f.label)]
+
+    # 3. Now clean up: drop any sentence that pairs a *missing* specialist's name with a
+    #    reassuring phrase (actively misleading), and strip any remaining blanket
+    #    reassurance clauses that aren't tied to a specific specialist at all.
+    cleaned = []
+    for s in _split_sentences(text):
+        misleads_a_missing_one = any(
+            re.search(re.escape(f.label), s, re.I) for f in missing
+        ) and _BLANKET_REASSURANCE_RE.search(s)
+        if misleads_a_missing_one:
+            continue
+        if _BLANKET_REASSURANCE_RE.search(s):
             clauses = re.split(r",\s*(?:but|and)\s+", s)
             surviving = [c for c in clauses if not _BLANKET_REASSURANCE_RE.search(c)]
             if surviving:
                 clause = surviving[0].strip().rstrip(" .,;")
                 if clause:
                     cleaned.append(clause + ".")
-        text = " ".join(cleaned).strip()
+            continue
+        cleaned.append(s)
+    text = " ".join(cleaned).strip()
 
-    missing = [d for d in with_concerns if d.label.lower() not in text.lower()]
     if not missing:
         return text
 
-    addendum = " ".join(f"{d.label} — {d.decision}: {d.reasoning}".strip() for d in missing)
+    addendum_parts = []
+    for f in missing:
+        cleaned_findings = [clean_finding_text(x) for x in f.findings[:2]]
+        cleaned_findings = [x for x in cleaned_findings if x]
+        detail = "; ".join(cleaned_findings) if cleaned_findings else (f.risk_note or "see agent findings")
+        addendum_parts.append(f"{f.label} raised {len(f.findings)} concern(s): {detail}.")
+
     if text and not text.endswith((".", "!", "?")):
         text += "."
-    return f"{text} {addendum}".strip()
+    return f"{text} {' '.join(addendum_parts)}".strip()
 
 
 def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
