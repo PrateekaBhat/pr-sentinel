@@ -17,7 +17,9 @@ from .models import (
     RiskCategory,
     RiskFactorFlag,
     RiskLevel,
+    SpecialistRoutingEntry,
 )
+from .policy import classify_release_risk
 
 # Fixed taxonomy the whole report is scored against. Order matters.
 CATEGORIES = [
@@ -172,12 +174,12 @@ _SEVERITY_BONUS = {RiskLevel.HIGH: 25, RiskLevel.MEDIUM: 10, RiskLevel.LOW: 0}
 
 
 def _confidence_label(score: int) -> str:
-    """Convert a 0-100 confidence score to a human-readable tier."""
+    """Evidence Confidence tier — not a calibrated probability."""
     if score >= 75:
-        return "High"
+        return "HIGH"
     if score >= 50:
-        return "Medium"
-    return "Low"
+        return "MEDIUM"
+    return "LOW"
 
 
 def _snippet_for(f: ChangedFile, max_lines: int = 6, max_chars: int = 320) -> str | None:
@@ -467,53 +469,76 @@ def build_confidence_explanation(
     rag: RAGContext,
     ai_enabled: bool,
     judge_grounded: bool | None,
+    llm_disagreement_detected: bool = False,
 ) -> ConfidenceExplanation:
     repo_context_available = bool(rag.scanned and rag.retrieved)
 
-    heuristic_band = (
-        RiskLevel.HIGH if heuristics.score >= 70
-        else RiskLevel.MEDIUM if heuristics.score >= 35
-        else RiskLevel.LOW
-    )
-    agreement = heuristic_band == ai.overall_risk
+    deterministic_risk = classify_release_risk(heuristics.score)
+    agreement = deterministic_risk == ai.overall_risk if ai_enabled else True
 
-    all_agents_ran = ai_enabled and all(af.applicable or not af.files_reviewed for af in ai.agent_findings)
+    applicable_agents = [af for af in ai.agent_findings if af.applicable]
+    all_agents_ran = ai_enabled and all(
+        af.applicable or not af.files_reviewed for af in ai.agent_findings
+    )
+
     completeness = "complete" if (ai_enabled and repo_context_available and all_agents_ran) else "partial"
 
     reasons = []
-    reasons.append(
-        "Repository documentation was retrieved and used as context"
-        if repo_context_available
-        else "No repository documentation was available to ground the analysis"
-    )
-    reasons.append(
-        "the heuristic score and the LLM's risk assessment agree"
-        if agreement
-        else "the heuristic score and the LLM's risk assessment diverge; a conservative bias was applied"
-    )
     if not ai_enabled:
-        reasons.append("the AI pipeline was unavailable; this is a deterministic heuristics-only assessment")
-    elif judge_grounded is False:
-        reasons.append("the groundedness judge flagged claims that weren't fully traceable to evidence")
-        completeness = "partial"
+        reasons.append("AI synthesis unavailable — deterministic policy produced the release decision")
+    if repo_context_available:
+        reasons.append("repository context was retrieved")
+    else:
+        reasons.append("repository context was unavailable")
+    if agreement:
+        reasons.append("LLM assessment agrees with deterministic release risk")
+    elif ai_enabled:
+        reasons.append("LLM assessment diverges from deterministic policy (override active)")
+    if judge_grounded is False:
+        reasons.append("groundedness check failed — review explanation quality separately from release policy")
 
     narrative = "; ".join(reasons) + "."
 
-    score = ai.confidence
-    if completeness == "partial":
-        score = min(score, 65)
-    if judge_grounded is False:
-        score = min(score, 55)
-
-    level = _confidence_label(score)
-
+    # Evidence Confidence tier — deterministic checks
     checks = [
-        RiskFactorFlag(key="repo_docs", label="Repository documentation found", passed=repo_context_available),
-        RiskFactorFlag(key="heuristic_llm_agree", label="Heuristic and LLM assessments agree", passed=agreement),
-        RiskFactorFlag(key="agents_completed", label="All applicable specialist agents completed", passed=all_agents_ran),
-        RiskFactorFlag(key="ai_available", label="AI pipeline was available", passed=ai_enabled),
-        RiskFactorFlag(key="grounded", label="Groundedness check passed", passed=bool(judge_grounded) if judge_grounded is not None else True),
+        RiskFactorFlag(key="deterministic", label="Deterministic analysis available", passed=True),
+        RiskFactorFlag(key="repo_docs", label="Repository context available", passed=repo_context_available),
+        RiskFactorFlag(
+            key="specialists",
+            label="Applicable specialists completed",
+            passed=bool(applicable_agents) if ai_enabled else False,
+        ),
+        RiskFactorFlag(key="ai_available", label="AI synthesis available", passed=ai_enabled),
+        RiskFactorFlag(
+            key="grounded",
+            label="Groundedness check passed",
+            passed=bool(judge_grounded) if judge_grounded is not None else (not ai_enabled),
+        ),
+        RiskFactorFlag(
+            key="no_major_gaps",
+            label="No major evidence gaps",
+            passed=ai_enabled and completeness == "complete" and judge_grounded is not False,
+        ),
     ]
+
+    passed_count = sum(1 for c in checks if c.passed)
+    if not ai_enabled:
+        score = 45
+        level = "LOW"
+    elif passed_count >= 5 and agreement and judge_grounded is not False:
+        score = 85
+        level = "HIGH"
+    elif passed_count >= 3:
+        score = 60
+        level = "MEDIUM"
+    else:
+        score = 40
+        level = "LOW"
+
+    if llm_disagreement_detected:
+        score = min(score, 65)
+        if level == "HIGH":
+            level = "MEDIUM"
 
     return ConfidenceExplanation(
         score=score,
@@ -526,6 +551,68 @@ def build_confidence_explanation(
     )
 
 
+_DOMAIN_SKIP_TRIGGERS = {
+    "security": "no authentication, session, or payment-related files detected",
+    "database": "no database/schema/migration files detected",
+    "api": "no API routes, controllers, or endpoint files detected",
+    "tests": "no test or spec files detected",
+    "performance": "no cache, queue, or performance-related files detected",
+}
+
+_DOMAIN_EXECUTE_TRIGGERS = {
+    "security": "authentication or security-sensitive files changed",
+    "database": "database migration or schema files changed",
+    "api": "API routes or controller files changed",
+    "tests": "test or spec files changed",
+    "performance": "performance or cache-related files changed",
+}
+
+
+def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list[SpecialistRoutingEntry]:
+    """Explainable specialist routing — EXECUTED vs SKIPPED with triggers."""
+    from . import agent_routing
+
+    entries: list[SpecialistRoutingEntry] = []
+    for domain in ["security", "database", "api", "tests", "performance"]:
+        status = state.get(f"{domain}_status")
+        finding: AgentFinding | None = state.get(f"{domain}_finding")
+        label = agent_routing.DOMAIN_LABELS[domain]
+        domain_files = agent_routing.files_for_domain(pr.files, domain)
+        file_names = [f.filename for f in domain_files]
+
+        if status is None and finding is None:
+            continue
+
+        if finding and finding.applicable:
+            duration = status["duration_ms"] if isinstance(status, dict) else (status.duration_ms if status else 0)
+            entries.append(
+                SpecialistRoutingEntry(
+                    domain=domain,
+                    label=label,
+                    status="EXECUTED",
+                    trigger=_DOMAIN_EXECUTE_TRIGGERS.get(domain, f"{domain} domain files detected"),
+                    files_count=len(file_names),
+                    duration_ms=duration,
+                    llm_call_made=True,
+                    files=file_names[:5],
+                )
+            )
+        else:
+            entries.append(
+                SpecialistRoutingEntry(
+                    domain=domain,
+                    label=label,
+                    status="SKIPPED",
+                    trigger=_DOMAIN_SKIP_TRIGGERS.get(domain, f"no {domain} domain files detected"),
+                    files_count=0,
+                    duration_ms=0,
+                    llm_call_made=False,
+                    files=[],
+                )
+            )
+    return entries
+
+
 def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
     decisions: list[AgentDecision] = []
     for domain in ["security", "database", "api", "tests", "performance"]:
@@ -534,8 +621,8 @@ def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
         if status is None or finding is None:
             continue
         if not finding.applicable:
-            decision = "Skipped \u2014 no files in this agent\u2019s domain were touched"
-            reasoning = finding.risk_note
+            decision = "SKIPPED — no files in domain"
+            reasoning = f"Trigger: {_DOMAIN_SKIP_TRIGGERS.get(domain, 'no matching files')}. LLM call: not made."
             confidence = 100
         elif finding.findings:
             decision = f"Concerns raised ({len(finding.findings)})"

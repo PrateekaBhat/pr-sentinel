@@ -44,6 +44,29 @@ async def health() -> dict:
     }
 
 
+@app.get("/api/golden-tests")
+async def get_golden_tests() -> dict:
+    from engine.golden_tests import run_golden_tests
+
+    results = run_golden_tests()
+    passed = sum(1 for r in results if r.passed)
+    return {
+        "title": "PR Sentinel Policy Verification",
+        "passed": passed,
+        "total": len(results),
+        "tests": [
+            {
+                "id": r.id,
+                "name": r.name,
+                "passed": r.passed,
+                "expected": r.expected,
+                "actual": r.actual,
+            }
+            for r in results
+        ],
+    }
+
+
 @app.get("/api/demos", response_model=list[DemoSummary])
 async def get_demos() -> list[DemoSummary]:
     return demo_data.list_demos()

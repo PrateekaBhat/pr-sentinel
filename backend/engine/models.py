@@ -16,6 +16,54 @@ class RiskLevel(str, Enum):
     HIGH = "HIGH"
 
 
+class ReleaseDecision(str, Enum):
+    ALLOW = "ALLOW"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    BLOCK = "BLOCK"
+
+
+class LLMDisagreement(BaseModel):
+    """Audit record when LLM release-risk assessment diverges from deterministic policy."""
+
+    detected: bool
+    deterministic_risk: RiskLevel
+    llm_risk: RiskLevel | None = None
+    final_risk: RiskLevel
+    direction: str | None = None  # "optimistic" | "pessimistic"
+    reason: str
+
+
+class ReviewComplexityResult(BaseModel):
+    """How hard this PR is to review — separate from release risk."""
+
+    score: int  # 0-100
+    level: RiskLevel
+    drivers: list[str] = Field(default_factory=list)
+
+
+class ReviewQueueItem(BaseModel):
+    priority: str  # P1 | P2 | P3 | P4
+    filename: str
+    role: str
+    why_it_matters: str
+    potential_regression: str
+    suggested_validation: str
+    estimated_minutes: int
+
+
+class SpecialistRoutingEntry(BaseModel):
+    """Explainable specialist agent routing diagnostic."""
+
+    domain: str
+    label: str
+    status: str  # EXECUTED | SKIPPED
+    trigger: str
+    files_count: int
+    duration_ms: int = 0
+    llm_call_made: bool = False
+    files: list[str] = Field(default_factory=list)
+
+
 class ChangedFile(BaseModel):
     filename: str
     status: str  # added | modified | removed | renamed
@@ -76,12 +124,13 @@ class ScoreMathFactor(BaseModel):
 
 
 class HeuristicResult(BaseModel):
-    score: int  # 0-100
+    score: int  # 0-100 release-risk score (excludes diff-size signals)
     factors: list[HeuristicFactor]
     score_math: list[ScoreMathFactor] = Field(default_factory=list)
     tests_touched: bool
     tests_deleted: bool
     migration_touched: bool
+    review_signals: list[HeuristicFactor] = Field(default_factory=list)  # diff-size etc., not in release score
 
 
 class FileRisk(BaseModel):
@@ -205,10 +254,10 @@ class ArchitecturalImpact(BaseModel):
 
 
 class ConfidenceExplanation(BaseModel):
-    """Explains *why* the model is as confident as it is, instead of a bare number."""
+    """Evidence confidence tier — qualitative, not a calibrated probability."""
 
-    score: int  # 0-100
-    level: str = "Medium"  # "High" | "Medium" | "Low" — human-readable tier derived from score
+    score: int  # 0-100 internal score; UI emphasizes level tier
+    level: str = "MEDIUM"  # HIGH | MEDIUM | LOW — Evidence Confidence tier
     repository_context_available: bool
     llm_heuristic_agreement: bool
     evidence_completeness: str  # "complete" | "partial"
@@ -326,9 +375,14 @@ class ExecutionMetrics(BaseModel):
 
 
 class RiskReport(BaseModel):
-    decision: str
-    risk_score: int
-    confidence: int
+    decision: str  # ALLOW | NEEDS_REVIEW | BLOCK — from deterministic policy
+    release_risk: RiskLevel = RiskLevel.LOW
+    review_complexity: ReviewComplexityResult | None = None
+    llm_disagreement: LLMDisagreement | None = None
+    specialist_routing: list[SpecialistRoutingEntry] = Field(default_factory=list)
+    review_queue: list[ReviewQueueItem] = Field(default_factory=list)
+    risk_score: int  # deterministic release-risk score
+    confidence: int  # internal; prefer confidence_explanation.level in UI
     review_effort_minutes: int = 15
     review_effort_label: str = "15 minutes"
     deployment_strategy: str
@@ -387,6 +441,7 @@ class AnalyzeResponse(BaseModel):
     rag: RAGContext = Field(default_factory=lambda: RAGContext(scanned=False))
     judge: Optional[JudgeVerdict] = None
     source: str = "live"  # "live" or "demo"
+    policy_note: str = ""  # e.g. AI synthesis unavailable message
 
 
 class DemoSummary(BaseModel):

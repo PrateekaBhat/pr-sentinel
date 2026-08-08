@@ -13,15 +13,9 @@ export default function ConfidenceCard({ confidence }: { confidence: ConfidenceE
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-baseline gap-2">
-        <span className="font-display text-2xl font-semibold text-paper">{confidence.score}%</span>
-        <span
-          className={`rounded px-2 py-0.5 font-mono text-[11px] font-semibold ${
-            confidence.evidence_completeness === "complete"
-              ? "bg-risk-low/15 text-risk-low"
-              : "bg-risk-medium/15 text-risk-medium"
-          }`}
-        >
-          {confidence.evidence_completeness} evidence
+        <span className="font-display text-2xl font-semibold text-paper">{confidence.level ?? "MEDIUM"}</span>
+        <span className="rounded px-2 py-0.5 font-mono text-[11px] font-semibold bg-steel/50 text-fog">
+          Evidence Confidence
         </span>
       </div>
       <p className="text-sm leading-relaxed text-fog">{confidence.narrative}</p>

@@ -7,6 +7,7 @@ via /api/analyze. Each entry is a fully-formed AnalyzeResponse payload.
 from __future__ import annotations
 
 from .categories import build_agent_decisions
+from .enrich import enrich_analyze_response
 from .models import (
     AgentFinding,
     AIAnalysis,
@@ -205,6 +206,7 @@ DEMOS: dict[str, AnalyzeResponse] = {
         ),
         report=RiskReport(
             decision="BLOCK",
+            release_risk=RiskLevel.HIGH,
             risk_score=78,
             confidence=91,
             deployment_strategy="Canary",
@@ -283,13 +285,13 @@ DEMOS: dict[str, AnalyzeResponse] = {
             ],
         ),
         heuristics=HeuristicResult(
-            score=35,
+            score=45,
             tests_touched=False,
             tests_deleted=False,
             migration_touched=True,
             factors=[
                 HeuristicFactor(key="migration", label="Database migration detected", triggered=True, weight=35, reason="Matched in migrations/0042_add_refund_reason.sql"),
-                HeuristicFactor(key="no_tests", label="No test files touched", triggered=True, weight=15, reason="This PR changes code but doesn't add or modify any tests."),
+                HeuristicFactor(key="no_tests", label="No test files touched", triggered=True, weight=10, reason="This PR changes code but doesn't add or modify any tests."),
             ],
         ),
         ai=AIAnalysis(
@@ -320,8 +322,8 @@ DEMOS: dict[str, AnalyzeResponse] = {
             ],
         ),
         report=RiskReport(
-            decision="ALLOW",
-            risk_score=35,
+            decision="NEEDS_REVIEW",
+            release_risk=RiskLevel.MEDIUM,
             confidence=84,
             deployment_strategy="Blue/Green",
             risk_breakdown={"Database": 35, "Tests": 15},
@@ -465,6 +467,7 @@ DEMOS: dict[str, AnalyzeResponse] = {
         ),
         report=RiskReport(
             decision="ALLOW",
+            release_risk=RiskLevel.LOW,
             risk_score=0,
             confidence=97,
             deployment_strategy="Standard",
@@ -521,14 +524,176 @@ DEMOS: dict[str, AnalyzeResponse] = {
             ),
         ),
     ),
+    "large-refactor": AnalyzeResponse(
+        source="demo",
+        ai_enabled=True,
+        pr=PullRequestData(
+            owner="acme",
+            repo="platform-core",
+            number=512,
+            title="Refactor reporting module across backend and frontend",
+            body="Large internal refactor with comprehensive test updates. No auth, migration, or infra changes.",
+            author="devon",
+            url="https://github.com/acme/platform-core/pull/512",
+            state="open",
+            repository={
+                "owner": "acme",
+                "name": "platform-core",
+                "full_name": "acme/platform-core",
+                "description": "Core platform services.",
+                "primary_language": "TypeScript",
+                "stars": 200,
+                "default_branch": "main",
+            },
+            additions=1900,
+            deletions=180,
+            changed_files_count=10,
+            labels=["refactor"],
+            commit_messages=["Refactor report renderer", "Update frontend dashboard tests"],
+            files=[
+                ChangedFile(filename=f"backend/reports/module_{i}.py", status="modified", additions=200, deletions=15, changes=215)
+                for i in range(6)
+            ]
+            + [
+                ChangedFile(filename=f"frontend/src/components/Panel_{i}.tsx", status="modified", additions=120, deletions=10, changes=130)
+                for i in range(2)
+            ]
+            + [
+                ChangedFile(filename="backend/tests/test_reports.py", status="modified", additions=80, deletions=20, changes=100),
+                ChangedFile(filename="frontend/src/tests/panels.test.tsx", status="modified", additions=60, deletions=15, changes=75),
+            ],
+        ),
+        heuristics=HeuristicResult(
+            score=0,
+            tests_touched=True,
+            tests_deleted=False,
+            migration_touched=False,
+            factors=[],
+            review_signals=[
+                HeuristicFactor(
+                    key="large_diff",
+                    label="Large diff (800+ line changes)",
+                    triggered=True,
+                    weight=0,
+                    reason="2062 lines changed across 10 files.",
+                )
+            ],
+        ),
+        ai=AIAnalysis(
+            overall_risk=RiskLevel.LOW,
+            confidence=88,
+            summary="Large refactor with tests updated. No release-risk signals — review complexity is high due to breadth.",
+            architectural_impact="Internal refactor across reporting modules; no external contract changes detected.",
+            operational_risks=["Regression in report formatting if edge cases were missed"],
+            rollout_strategy="Standard",
+            rollout_reason="Low release risk; thorough human review recommended due to change surface.",
+            rollback_required=False,
+            suggested_test_areas=["Report snapshot tests", "Frontend component regression"],
+            risk_factors=[],
+            file_risks=[],
+        ),
+        report=RiskReport(
+            decision="ALLOW",
+            release_risk=RiskLevel.LOW,
+            risk_score=0,
+            confidence=88,
+            deployment_strategy="Standard",
+            summary="Large refactor — low release risk, high review complexity.",
+            executive_summary=(
+                "Release Risk LOW / Review Complexity HIGH. "
+                "2,062 lines changed across 8 production files plus test updates, "
+                "but no security, migration, infrastructure, or test-removal signals detected."
+            ),
+        ),
+    ),
+    "llm-disagreement": AnalyzeResponse(
+        source="demo",
+        ai_enabled=True,
+        pr=PullRequestData(
+            owner="acme",
+            repo="payments-api",
+            number=77,
+            title="Harden auth middleware and remove legacy session tests",
+            body="Security-critical auth changes with deleted tests.",
+            author="alex",
+            url="https://github.com/acme/payments-api/pull/77",
+            state="open",
+            repository={
+                "owner": "acme",
+                "name": "payments-api",
+                "full_name": "acme/payments-api",
+                "primary_language": "Python",
+                "stars": 90,
+                "default_branch": "main",
+            },
+            additions=120,
+            deletions=95,
+            changed_files_count=4,
+            labels=["security"],
+            commit_messages=["Update auth middleware"],
+            files=[
+                ChangedFile(filename="auth/middleware.py", status="modified", additions=70, deletions=40, changes=110),
+                ChangedFile(filename="auth/session.py", status="modified", additions=30, deletions=20, changes=50),
+                ChangedFile(filename="tests/test_session.py", status="removed", additions=0, deletions=35, changes=35),
+            ],
+        ),
+        heuristics=HeuristicResult(
+            score=65,
+            tests_touched=False,
+            tests_deleted=True,
+            migration_touched=False,
+            factors=[
+                HeuristicFactor(key="auth", label="Authentication logic touched", triggered=True, weight=40, reason="Matched in auth/middleware.py"),
+                HeuristicFactor(key="tests_deleted", label="Test files were deleted", triggered=True, weight=25, reason="tests/test_session.py removed."),
+            ],
+        ),
+        ai=AIAnalysis(
+            overall_risk=RiskLevel.LOW,
+            confidence=72,
+            summary="LLM optimistically assessed this as low risk despite auth changes and deleted tests.",
+            architectural_impact="Auth middleware rewrite.",
+            operational_risks=["Session validation regressions"],
+            rollout_strategy="Standard",
+            rollout_reason="LLM recommended standard merge — overridden by deterministic policy.",
+            rollback_required=False,
+            suggested_test_areas=["Auth integration tests"],
+            risk_factors=[],
+            file_risks=[],
+            agent_findings=[
+                AgentFinding(
+                    agent="security",
+                    label="Security",
+                    applicable=True,
+                    files_reviewed=["auth/middleware.py", "auth/session.py"],
+                    findings=["Auth path rewritten with deleted tests"],
+                    risk_note="High-risk auth change",
+                    confidence=85,
+                ),
+            ],
+        ),
+        report=RiskReport(
+            decision="BLOCK",
+            release_risk=RiskLevel.HIGH,
+            risk_score=65,
+            confidence=72,
+            deployment_strategy="Manual Approval",
+            summary="Deterministic override: LLM LOW vs policy HIGH.",
+            executive_summary=(
+                "Deterministic policy classified HIGH release risk (auth + deleted tests). "
+                "LLM assessed LOW — override active. Final decision: BLOCK."
+            ),
+        ),
+    ),
 }
 
 
 def list_demos() -> list[DemoSummary]:
     taglines = {
-        "auth-refactor": "High-risk: auth rewrite with deleted tests",
-        "db-migration": "Medium-risk: additive schema migration",
-        "docs-refactor": "Low-risk: documentation-only change",
+        "auth-refactor": "HIGH release risk: auth rewrite with deleted tests → BLOCK",
+        "db-migration": "MEDIUM release risk: additive schema migration → NEEDS REVIEW",
+        "docs-refactor": "LOW release risk: documentation-only change → ALLOW",
+        "large-refactor": "LOW release risk / HIGH review complexity → ALLOW",
+        "llm-disagreement": "LLM LOW vs deterministic HIGH → BLOCK (override)",
     }
     return [
         DemoSummary(
@@ -543,4 +708,7 @@ def list_demos() -> list[DemoSummary]:
 
 
 def get_demo(demo_id: str) -> AnalyzeResponse | None:
-    return DEMOS.get(demo_id)
+    demo = DEMOS.get(demo_id)
+    if demo is None:
+        return None
+    return enrich_analyze_response(demo)

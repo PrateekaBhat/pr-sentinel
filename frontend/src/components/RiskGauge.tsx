@@ -2,7 +2,7 @@ import type { RiskLevel } from "../types";
 
 interface Props {
   risk: RiskLevel;
-  confidence: number;
+  evidenceConfidence?: string;
 }
 
 const RISK_FRACTION: Record<RiskLevel, number> = {
@@ -30,7 +30,7 @@ const arcStart = polarToCartesian(180); // left, low-risk end
 const arcEnd = polarToCartesian(0); // right, high-risk end
 const trackPath = `M ${arcStart.x} ${arcStart.y} A ${R} ${R} 0 1 1 ${arcEnd.x} ${arcEnd.y}`;
 
-export default function RiskGauge({ risk, confidence }: Props) {
+export default function RiskGauge({ risk, evidenceConfidence = "MEDIUM" }: Props) {
   const fraction = RISK_FRACTION[risk];
   const needleAngle = 180 - fraction * 180;
   const needleTip = polarToCartesian(needleAngle);
@@ -111,10 +111,10 @@ export default function RiskGauge({ risk, confidence }: Props) {
           className="font-display text-2xl font-semibold tracking-tight"
           style={{ color }}
         >
-          {risk}
+          {risk} Release Risk
         </span>
         <span className="font-mono text-xs text-fog">
-          {confidence}% confidence
+          Evidence Confidence: {evidenceConfidence}
         </span>
       </div>
     </div>
