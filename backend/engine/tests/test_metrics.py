@@ -54,6 +54,52 @@ def test_metrics_counts_workflow_and_config_files():
     assert em.lines_removed == 3
 
 
+def test_public_apis_modified_ignores_internal_functions():
+    """A plain internal refactor with lots of `def ...` lines in non-API files
+    must not be counted as public API surface change — that's what produced
+    the '54 public API changes' false positive on a report-renderer refactor
+    with zero actual API routes touched."""
+    internal_patch = "\n".join(f"+def helper_{i}():" for i in range(20))
+    files = [
+        ChangedFile(
+            filename="backend/engine/report_renderer.py",
+            status="modified",
+            additions=200,
+            deletions=50,
+            changes=250,
+            patch=internal_patch,
+        ),
+    ]
+    pr = _make_pr(files)
+    h = heuristics_mod.analyze(pr)
+    ai = _stub_ai()
+    cats = build_category_breakdown(pr, h, ai)
+    em = build_engineering_metrics(pr, cats)
+
+    assert em.public_apis_modified == 0
+
+
+def test_public_apis_modified_counts_functions_in_api_files():
+    api_patch = "\n".join(f"+def get_thing_{i}():" for i in range(3))
+    files = [
+        ChangedFile(
+            filename="backend/app/api/routes.py",
+            status="modified",
+            additions=30,
+            deletions=5,
+            changes=35,
+            patch=api_patch,
+        ),
+    ]
+    pr = _make_pr(files)
+    h = heuristics_mod.analyze(pr)
+    ai = _stub_ai()
+    cats = build_category_breakdown(pr, h, ai)
+    em = build_engineering_metrics(pr, cats)
+
+    assert em.public_apis_modified == 3
+
+
 def test_checklist_includes_ci_task_when_workflow_changed():
     files = [ChangedFile(filename=".github/workflows/ci.yml", status="modified", additions=5, deletions=1, changes=6)]
     pr = _make_pr(files)

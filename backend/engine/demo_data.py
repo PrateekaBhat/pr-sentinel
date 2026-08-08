@@ -380,6 +380,7 @@ DEMOS: dict[str, AnalyzeResponse] = {
             ),
             confidence_explanation=ConfidenceExplanation(
                 score=84,
+                level="High",
                 repository_context_available=False,
                 llm_heuristic_agreement=True,
                 evidence_completeness="complete",
@@ -506,6 +507,7 @@ DEMOS: dict[str, AnalyzeResponse] = {
             ),
             confidence_explanation=ConfidenceExplanation(
                 score=97,
+                level="High",
                 repository_context_available=False,
                 llm_heuristic_agreement=True,
                 evidence_completeness="complete",
