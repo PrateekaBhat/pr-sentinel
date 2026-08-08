@@ -65,13 +65,16 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p reports
+          set +e
           python backend/cli.py analyze \
             --repo "${GITHUB_REPOSITORY}" \
             --pr "${{ github.event.pull_request.number }}" \
             --output reports/report.json \
             --comment reports/report.md \
             --token "${{ secrets.GITHUB_TOKEN }}"
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit_code=$?
+          set -e
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
 
       - name: Read report markdown
         id: report
