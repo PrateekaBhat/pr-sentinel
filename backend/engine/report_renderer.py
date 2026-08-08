@@ -81,12 +81,28 @@ def _actions(response: AnalyzeResponse) -> list[str]:
 # File classification and review queue (single source of truth for effort)
 # ---------------------------------------------------------------------------
 
-_CATEGORY_RANK = {"implementation": 0, "api": 1, "database": 2, "infrastructure": 3, "documentation": 4}
+_CATEGORY_RANK = {"implementation": 0, "api": 1, "database": 2, "test": 3, "infrastructure": 4, "documentation": 5}
 _SEVERITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+_ROLE_LABELS = {
+    "implementation": "Production implementation",
+    "api": "Public API",
+    "database": "Database migration",
+    "test": "Regression test",
+    "infrastructure": "Infrastructure config",
+    "documentation": "Documentation",
+}
+_FRONTEND_ROLE_LABELS = {
+    "implementation": "Frontend application",
+    "test": "Frontend test",
+}
 
 
 def _file_category(filename: str) -> str:
     lower = filename.lower()
+    if any(marker in lower for marker in (
+        "/test", "\\test", "test_", "_test.", ".test.", ".spec.", "tests/", "__tests__",
+    )):
+        return "test"
     if any(marker in lower for marker in (".github/workflows", ".github/actions", "workflow", "terraform", "k8s/", "kubernetes/", "helm/", "dockerfile", "docker-compose")):
         return "infrastructure"
     if any(marker in lower for marker in ("migration", "alembic", "schema.sql", "database/")):
@@ -98,9 +114,19 @@ def _file_category(filename: str) -> str:
     return "implementation"
 
 
+def _file_role(filename: str, category: str) -> str:
+    lower = filename.lower()
+    is_frontend = lower.endswith((".tsx", ".jsx", ".vue", ".svelte", ".ts", ".js"))
+    if is_frontend and category in _FRONTEND_ROLE_LABELS:
+        if category == "implementation" and any(marker in lower for marker in ("card", "panel", "component", "widget")):
+            return "UI component"
+        return _FRONTEND_ROLE_LABELS[category]
+    return _ROLE_LABELS.get(category, "Implementation")
+
+
 def _queue_severity(response: AnalyzeResponse, filename: str, category: str) -> str:
     lower = filename.lower()
-    if category in {"infrastructure", "documentation"}:
+    if category in {"infrastructure", "documentation", "test"}:
         return "LOW"
     if category == "api":
         return "MEDIUM"
@@ -116,24 +142,40 @@ def _queue_severity(response: AnalyzeResponse, filename: str, category: str) -> 
     return "MEDIUM"
 
 
-def _file_review_minutes(response: AnalyzeResponse, changed: ChangedFile | None, is_renderer: bool) -> int:
+# Minutes per changed line, by category — a 1,000-line generated report or a
+# 1,000-line test file isn't as slow to review line-for-line as core
+# implementation, so LOC alone isn't a fair proxy for review effort.
+_CATEGORY_MINUTES_PER_LINE = {
+    "implementation": 1 / 30,
+    "api": 1 / 25,
+    "database": 1 / 25,
+    "test": 1 / 60,
+    "infrastructure": 1 / 40,
+    "documentation": 1 / 80,
+}
+
+
+def _file_review_minutes(response: AnalyzeResponse, changed: ChangedFile | None, category: str, is_renderer: bool) -> int:
     changes = changed.changes if changed else 0
-    minutes = max(5, round(changes / 35 / 5) * 5)
-    if is_renderer:
+    rate = _CATEGORY_MINUTES_PER_LINE.get(category, 1 / 30)
+    minutes = max(5, round(changes * rate / 5) * 5)
+    if is_renderer and category != "test":
         minutes += 5
-    if _has_trigger(response, "no_tests") and changed and _file_category(changed.filename) == "implementation":
+    if _has_trigger(response, "no_tests") and category == "implementation":
         minutes += 5
     return minutes
 
 
-def _file_risk_score(response: AnalyzeResponse, filename: str, changes: int, is_renderer: bool) -> int:
+def _file_risk_score(response: AnalyzeResponse, filename: str, changes: int, category: str, is_renderer: bool) -> int:
     total = max(1, response.pr.additions + response.pr.deletions)
     score = 35 + round((changes / total) * 15)
-    if is_renderer:
+    if is_renderer and category != "test":
         score += 7
+    if category == "test":
+        score -= 15
     if _has_trigger(response, "no_tests"):
         score += 5
-    return min(95, score)
+    return max(5, min(95, score))
 
 
 @dataclass
@@ -144,6 +186,7 @@ class ReviewQueueItem:
     minutes: int
     risk_score: int
     category: str
+    role: str
     loc_label: str
     why_reviewed: list[str]
     primary_risk: str
@@ -182,13 +225,16 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
         )
         category = _file_category(rel)
         severity = _queue_severity(response, rel, category)
-        is_renderer = any(marker in rel.lower() for marker in ("report", "render"))
+        role = _file_role(rel, category)
+        is_renderer = category != "test" and any(marker in rel.lower() for marker in ("report", "render"))
         loc = f"{changed.changes} LOC modified" if changed else "Changed file"
-        minutes = _file_review_minutes(response, changed, is_renderer)
-        risk_score = _file_risk_score(response, rel, changed.changes if changed else 0, is_renderer)
+        minutes = _file_review_minutes(response, changed, category, is_renderer)
+        risk_score = _file_risk_score(response, rel, changed.changes if changed else 0, category, is_renderer)
 
         why = [loc]
-        if is_renderer:
+        if category == "test":
+            why.append("Regression coverage for the changed implementation.")
+        elif is_renderer:
             why.append("Core report generation logic.")
         elif category == "infrastructure":
             why.append("CI/CD or deployment configuration changed.")
@@ -199,7 +245,10 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
         if _has_trigger(response, "no_tests") and category == "implementation":
             why.append("No regression tests updated.")
 
-        if is_renderer:
+        if category == "test":
+            impact = "Gaps in coverage for the changed rendering paths."
+            action = "Confirm the tests cover the changed rendering paths."
+        elif is_renderer:
             impact = "Incorrect deployment recommendations shown to reviewers."
             action = "Compare rendered output with the previous version."
         elif category == "infrastructure":
@@ -220,6 +269,7 @@ def build_review_queue(response: AnalyzeResponse) -> list[ReviewQueueItem]:
                 minutes=minutes,
                 risk_score=risk_score,
                 category=category,
+                role=role,
                 loc_label=loc,
                 why_reviewed=why,
                 primary_risk=impact,
@@ -267,35 +317,38 @@ def _analysis_scope(response: AnalyzeResponse) -> dict[str, int]:
 
 
 def _report_evidence_quality(response: AnalyzeResponse) -> tuple[str, list[tuple[bool, str]]]:
-    """Measure how reliable this report is — not review findings."""
+    """Measure how reliable this report is — kept consistent with the confidence
+    score so 'High evidence, 55% confidence' can't happen: both are driven by
+    whether the AI pipeline actually ran, not just whether repo docs exist."""
     checks: list[tuple[bool, str]] = [
         (True, "Deterministic analysis"),
         (response.rag.scanned and bool(response.rag.retrieved), "Repository context"),
         (True, "Changed files classified"),
         (True, "Git diff"),
+        (response.ai_enabled, "AI specialist synthesis"),
         (False, "Runtime telemetry"),
     ]
     available = sum(1 for ok, _ in checks if ok)
-    level = "High" if available >= 4 else "Medium" if available >= 3 else "Low"
+    level = "High" if available >= 5 else "Medium" if available >= 3 else "Low"
     return level, checks
 
 
-def _why_not_block(response: AnalyzeResponse) -> list[str]:
+def _why_not_block(response: AnalyzeResponse) -> list[tuple[bool, str]]:
     if response.report.decision != "ALLOW":
         return []
 
-    reasons: list[str] = []
+    reasons: list[tuple[bool, str]] = []
     driver_map = dict(_drivers(response))
-    if not driver_map.get("Security-sensitive files changed"):
-        reasons.append("No security changes")
-    if not driver_map.get("Infrastructure changed"):
-        reasons.append("No infrastructure risk")
-    if not driver_map.get("API contracts changed"):
-        reasons.append("No API contract changes")
-    if response.ai.overall_risk != RiskLevel.HIGH:
-        reasons.append("No high-severity findings detected")
-    if _has_trigger(response, "no_tests"):
-        reasons.append("Only missing regression coverage")
+    reasons.append((True, "No security-sensitive changes") if not driver_map.get("Security-sensitive files changed") else (False, "Security-sensitive files changed"))
+    if driver_map.get("Tests updated"):
+        reasons.append((True, "Tests updated"))
+    elif _has_trigger(response, "no_tests"):
+        reasons.append((False, "Missing regression coverage"))
+    reasons.append((True, "No API contract changes") if not driver_map.get("API contracts changed") else (False, "API contract changes detected"))
+    reasons.append((True, "No infrastructure changes") if not driver_map.get("Infrastructure changed") else (False, "Infrastructure changes detected"))
+    reasons.append((True, "No high-severity findings") if response.ai.overall_risk != RiskLevel.HIGH else (False, "High-severity findings detected"))
+    if driver_map.get("Large implementation diff"):
+        reasons.append((False, "Large diff requires focused review"))
     return reasons
 
 
@@ -377,9 +430,9 @@ def _render_why_not_block(response: AnalyzeResponse, ctx: dict) -> list[str]:
     reasons = ctx["why_not_block"]
     if not reasons:
         return []
-    lines = ["", "### Why not BLOCK?", ""]
-    for reason in reasons:
-        lines.append(f"- ✓ {reason}")
+    lines = ["", "### Why ALLOW?", ""]
+    for ok, reason in reasons:
+        lines.append(f"- {'✓' if ok else '⚠'} {reason}")
     return lines
 
 
@@ -464,11 +517,13 @@ def _render_review_queue(response: AnalyzeResponse, ctx: dict) -> list[str]:
         # why_reviewed[0] is always the LOC label; why_reviewed[-1] is the most
         # specific reason, so collapse the redundant middle entries into one line.
         reason = item.why_reviewed[-1] if item.why_reviewed else "Changed file."
+        label = "Review focus" if item.category == "test" else "Potential regression"
         lines.extend([
             f"### {index}. [`{item.filename}`]({pr.url}/files) — {item.minutes} min",
             "",
+            f"- **Role:** {item.role}",
             f"- **Reason:** {reason} ({item.loc_label})",
-            f"- **Potential regression:** {item.primary_risk}",
+            f"- **{label}:** {item.primary_risk}",
             f"- **Suggested validation:** {item.reviewer_action}",
             "",
         ])
@@ -516,12 +571,18 @@ def _render_risk_breakdown(response: AnalyzeResponse, ctx: dict) -> list[str]:
     lines.append(f"| **Final risk score** | **{report.risk_score} / 100** |")
 
     lines.extend(["", f"### Merge Readiness ({readiness_score}/100)", ""])
-    if readiness and readiness.deductions:
-        lines.append("Starts at 100, deducted for:")
-        lines.append("")
-        lines.extend(f"- {reason}" for reason in readiness.deductions)
+    if readiness:
+        lines.extend(["```", f"{'Base':<32}{100:>4}"])
+        for reason in readiness.deductions:
+            # deductions are formatted like "-6 for overall risk score (20/100)"
+            points, _, explanation = reason.partition(" for ")
+            label = explanation[:1].upper() + explanation[1:] if explanation else reason
+            lines.append(f"{label:<32}{points:>4}")
+        lines.append("-" * 36)
+        lines.append(f"{'Final':<32}{readiness_score:>4}")
+        lines.append("```")
     else:
-        lines.append("No deductions — every readiness check passed.")
+        lines.append("Merge readiness could not be calculated from the available evidence.")
     return lines
 
 
@@ -536,6 +597,20 @@ def _render_analysis_scope(response: AnalyzeResponse, ctx: dict) -> list[str]:
         f"- **Agents executed:** {scope['agents_executed']}",
         f"- **Agents skipped:** {scope['agents_skipped']}",
     ]
+    return lines
+
+
+def _render_specialist_routing(response: AnalyzeResponse, ctx: dict) -> list[str]:
+    decisions = response.report.agent_decisions
+    if not decisions:
+        return []
+    lines = ["", "### Specialist Routing", "", "| Domain | Status |", "|---|---|"]
+    for item in decisions:
+        skipped = item.decision.startswith("Skipped")
+        status = "— Skipped" if skipped else "✓ Executed"
+        lines.append(f"| {item.label} | {status} |")
+    lines.append("")
+    lines.append("Skipped domains had no relevant files changed — no LLM call was made for them.")
     return lines
 
 
@@ -585,6 +660,7 @@ def _render_diagnostics_details(response: AnalyzeResponse, ctx: dict) -> list[st
     lines = ["", "<details>", "<summary><strong>Diagnostics</strong></summary>"]
     lines.extend(_render_analysis_performed(response, ctx))
     lines.extend(_render_analysis_scope(response, ctx))
+    lines.extend(_render_specialist_routing(response, ctx))
     lines.extend(["", "</details>"])
     return lines
 

@@ -155,9 +155,9 @@ def test_why_not_block_for_allow_decision():
         no_tests=True,
     )
     markdown = render_markdown(response)
-    assert "### Why not BLOCK?" in markdown
-    assert "No security changes" in markdown
-    assert "Only missing regression coverage" in markdown
+    assert "### Why ALLOW?" in markdown
+    assert "No security-sensitive changes" in markdown
+    assert "Missing regression coverage" in markdown
 
 
 def test_risk_breakdown_has_no_percentages():
