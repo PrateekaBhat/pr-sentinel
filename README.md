@@ -502,6 +502,7 @@ https://github.com/user-attachments/assets/72c1b0fa-650d-478e-ae76-326db40bef9c
 ### 3. CLI
 Demonstrates running PR Sentinel locally through the command-line interface and generating the analysis report.
 
+https://github.com/user-attachments/assets/b1790587-002d-4583-b21e-c1c0c3a42ee5
 
 ---
 
