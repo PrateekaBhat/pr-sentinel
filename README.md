@@ -1,8 +1,8 @@
 ﻿# PR Sentinel
 
-**AI-Assisted Deployment Risk Assessment & Decision System for Pull Requests.**
+**An AI-assisted PR / deployment-risk assessment tool.**
 
-PR Sentinel is an engineering platform that combines **deterministic rule-based scoring**, **repository documentation retrieval (RAG)**, and **role-based AI specialist reviewers (LangGraph)** to generate explainable deployment recommendations for pull requests.
+PR Sentinel is a developer-productivity tool that combines **deterministic rule-based scoring**, **repository documentation retrieval (RAG)**, and **role-based AI specialist reviewers (LangGraph)** to generate explainable deployment-risk assessments for pull requests — surfaced as a CI check, PR comment, and dashboard.
 
 Rather than relying on a black-box LLM to "guess" risk, PR Sentinel enforces a strict separation:
 1. **The Deterministic Rule Engine calculates the risk score and detects evidence.**
@@ -97,7 +97,8 @@ python test_workflow.py --repo PrateekaBhat/pr-sentinel --pr 2
 
 ### 3. Run Unit & Regression Tests
 ```bash
-python -m pytest engine/tests/test_risk_engine.py engine/tests/test_category_classifier.py -v
+pip install -r requirements-dev.txt
+python -m pytest engine/tests -q
 ```
 
 ---
@@ -133,4 +134,4 @@ PR Sentinel was run against its own pull requests as part of development. That e
 
 ---
 
-*PR Sentinel is built for Engineering Managers, Staff Engineers, and Developer Productivity teams looking for explainable, production-ready deployment decision tooling.*
+*PR Sentinel is built for Engineering Managers, Staff Engineers, and Developer Productivity teams looking for explainable, evidence-grounded PR risk assessments — a review aid, not an autonomous deployment controller.*

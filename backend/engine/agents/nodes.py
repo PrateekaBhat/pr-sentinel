@@ -32,13 +32,37 @@ MAX_FILES_PER_AGENT = 4
 
 
 def _files_prompt(files) -> str:
-    parts = []
-    for f in files[:MAX_FILES_PER_AGENT]:
-        patch_lines = (f.patch or "").splitlines()[:MAX_PATCH_LINES]
+    total_files = len(files)
+    shown_files = files[:MAX_FILES_PER_AGENT]
+    parts = [
+        f"{total_files} file(s) are in this agent's scope; {len(shown_files)} are shown below."
+    ]
+    for f in shown_files:
+        all_patch_lines = (f.patch or "").splitlines()
+        patch_lines = all_patch_lines[:MAX_PATCH_LINES]
         patch = "\n".join(patch_lines)[:MAX_PATCH_CHARS]
-        parts.append(f"### {f.filename} ({f.status}, +{f.additions}/-{f.deletions})\n```diff\n{patch}\n```")
-    if len(files) > MAX_FILES_PER_AGENT:
-        parts.append(f"... and {len(files) - MAX_FILES_PER_AGENT} more files not shown.")
+        truncated_by_lines = len(all_patch_lines) > MAX_PATCH_LINES
+        truncated_by_chars = len("\n".join(patch_lines)) > MAX_PATCH_CHARS
+        if truncated_by_lines:
+            truncation_note = (
+                f"(showing {len(patch_lines)} of {len(all_patch_lines)} patch lines — TRUNCATED)"
+            )
+        elif truncated_by_chars:
+            truncation_note = "(patch text TRUNCATED to a character limit)"
+        else:
+            truncation_note = "(full patch shown)"
+        parts.append(
+            f"### {f.filename} ({f.status}, +{f.additions}/-{f.deletions}) {truncation_note}\n"
+            f"```diff\n{patch}\n```"
+        )
+    if total_files > MAX_FILES_PER_AGENT:
+        parts.append(
+            f"... and {total_files - MAX_FILES_PER_AGENT} more file(s) in scope that are NOT shown at all."
+        )
+    parts.append(
+        "\nDo not infer behavior from code that was not shown. If the provided patch is "
+        "truncated, lower confidence and describe only what the provided evidence supports."
+    )
     return "\n".join(parts)
 
 

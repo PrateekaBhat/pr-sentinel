@@ -45,9 +45,17 @@ def main() -> int:
         print(result.stderr)
 
     report_path = output_dir / "report.json"
+
+    # Exit-code handling mirrors cli.py exactly: 0 = ALLOW/NEEDS_REVIEW, 1 = BLOCK,
+    # 2+ = analysis/runtime failure. The presence of a report.json file (which may be
+    # stale from a previous run) must never override what the subprocess actually reported.
+    if result.returncode not in (0, 1):
+        print(f"PR Sentinel CLI failed unexpectedly (exit code {result.returncode}).")
+        return result.returncode
+
     if not report_path.exists():
-        print(f"ERROR: expected report file not found: {report_path}")
-        return 1
+        print(f"ERROR: CLI reported success (exit code {result.returncode}) but expected report file not found: {report_path}")
+        return 2
 
     with report_path.open("r", encoding="utf-8") as handle:
         report = json.load(handle)
@@ -57,12 +65,12 @@ def main() -> int:
     print(f"Report location: {report_path}")
     print(f"Markdown summary: {output_dir / 'report.md'}")
 
-    if decision == "BLOCK":
+    if result.returncode == 1:
         print("PR Sentinel returned BLOCK. The full flow is working and would fail a CI job.")
-        return 1
+    else:
+        print("PR Sentinel returned ALLOW/NEEDS_REVIEW. The full flow is working and would pass a CI job.")
 
-    print("PR Sentinel returned PASS/WARN. The full flow is working and would pass a CI job.")
-    return 0
+    return result.returncode
 
 
 if __name__ == "__main__":
