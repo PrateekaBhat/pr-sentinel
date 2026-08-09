@@ -487,12 +487,21 @@ pr-sentinel/
 * Refine test-related risk heuristics so documentation-only and other non-executable changes are distinguished from executable code changes.
 
 ---
+## Demos
 
-## Dashboard Demo
+### 1. GitHub Actions Workflow
+Demonstrates PR analysis running directly in GitHub Actions, including the deterministic release decision, AI analysis, workflow status, and generated PR comment.
 
-A short walkthrough of the PR Sentinel dashboard, showing the analysis report, deterministic release decision, risk breakdown, specialist findings, repository context, groundedness check, and engineering metrics.
+
+
+### 2. Dashboard
+Demonstrates the PR Sentinel dashboard, including the release decision, risk breakdown, specialist findings, repository context, and engineering metrics.
 
 https://github.com/user-attachments/assets/72c1b0fa-650d-478e-ae76-326db40bef9c
+
+### 3. CLI
+Demonstrates running PR Sentinel locally through the command-line interface and generating the analysis report.
+
 
 ---
 
