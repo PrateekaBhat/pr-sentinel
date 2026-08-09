@@ -16,6 +16,59 @@ class RiskLevel(str, Enum):
     HIGH = "HIGH"
 
 
+class ReleaseDecision(str, Enum):
+    ALLOW = "ALLOW"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    BLOCK = "BLOCK"
+
+
+class LLMDisagreement(BaseModel):
+    """Audit record when LLM release-risk assessment diverges from deterministic policy."""
+
+    detected: bool
+    deterministic_risk: RiskLevel
+    llm_risk: RiskLevel | None = None
+    final_risk: RiskLevel
+    direction: str | None = None  # "optimistic" | "pessimistic"
+    reason: str
+
+
+class ReviewComplexityResult(BaseModel):
+    """How hard this PR is to review — separate from release risk."""
+
+    score: int  # 0-100
+    level: RiskLevel
+    drivers: list[str] = Field(default_factory=list)
+
+
+class ReviewQueueItem(BaseModel):
+    priority: str  # P1 | P2 | P3 | P4
+    filename: str
+    role: str
+    why_it_matters: str
+    potential_regression: str
+    suggested_validation: str
+    estimated_minutes: int
+
+
+class SpecialistRoutingEntry(BaseModel):
+    """Explainable specialist agent routing diagnostic."""
+
+    domain: str
+    label: str
+    status: str  # EXECUTED | SKIPPED
+    trigger: str
+    files_count: int
+    duration_ms: int = 0
+    llm_call_made: bool = False
+    files: list[str] = Field(default_factory=list)
+    # Context-selection metadata: how many domain-matched files existed vs. how many
+    # were actually sent to the LLM, and whether the context was therefore bounded.
+    files_available: int = 0
+    files_selected: int = 0
+    context_bounded: bool = False
+
+
 class ChangedFile(BaseModel):
     filename: str
     status: str  # added | modified | removed | renamed
@@ -76,12 +129,13 @@ class ScoreMathFactor(BaseModel):
 
 
 class HeuristicResult(BaseModel):
-    score: int  # 0-100
+    score: int  # 0-100 release-risk score (excludes diff-size signals)
     factors: list[HeuristicFactor]
     score_math: list[ScoreMathFactor] = Field(default_factory=list)
     tests_touched: bool
     tests_deleted: bool
     migration_touched: bool
+    review_signals: list[HeuristicFactor] = Field(default_factory=list)  # diff-size etc., not in release score
 
 
 class FileRisk(BaseModel):
@@ -116,6 +170,22 @@ class RAGContext(BaseModel):
     indexed_doc_paths: list[str] = Field(default_factory=list)
 
 
+class Finding(BaseModel):
+    """A single, structured specialist finding. Every actionable finding must be able
+    to stand alone: what's wrong, where, what evidence supports it, why it matters, and
+    what to do about it. This schema exists specifically so that malformed or truncated
+    model output (e.g. a sentence fragment cut off mid-clause) can be detected and
+    excluded deterministically instead of being rendered as a finished engineering claim."""
+
+    title: str  # one complete, self-contained sentence describing the finding
+    evidence: str  # what was actually seen in the shown diff/patch that supports this
+    impact: str = ""  # what could go wrong if unaddressed
+    recommendation: str = ""  # a concrete next step
+    file: Optional[str] = None
+    severity: str = "P3"  # P0 | P1 | P2 | P3
+    confidence: str = "MEDIUM"  # HIGH | MEDIUM | LOW
+
+
 class AgentFinding(BaseModel):
     """One specialist agent's output. Agents that found no relevant files skip the
     LLM call entirely and report applicable=False — this is what makes routing real
@@ -125,7 +195,18 @@ class AgentFinding(BaseModel):
     label: str
     applicable: bool
     files_reviewed: list[str] = Field(default_factory=list)
-    findings: list[str] = Field(default_factory=list)
+    # `structured_findings` is the single authoritative representation of validated,
+    # actionable (HIGH/MEDIUM confidence) specialist findings. `findings` below is kept
+    # ONLY as a backward-compatible string projection for callers/serializers that
+    # still expect a flat list of strings (e.g. older report consumers) — it is always
+    # derived 1:1 from `structured_findings[*].title` at construction time in
+    # agents/nodes.py and MUST NOT be populated independently or read as an
+    # authoritative source. All production logic (reconciliation, report rendering,
+    # counts, severity/confidence handling) must read from `structured_findings`.
+    findings: list[str] = Field(default_factory=list)  # compatibility projection — see above
+    structured_findings: list[Finding] = Field(default_factory=list)  # authoritative
+    needs_verification: list[Finding] = Field(default_factory=list)  # LOW-confidence, excluded from concerns
+    rejected_count: int = 0  # findings the validator discarded as incomplete/malformed
     risk_note: str = ""
     confidence: int = 60  # 0-100, how confident this agent is in its own findings
 
@@ -145,9 +226,16 @@ class AgentDecision(BaseModel):
 
 class JudgeVerdict(BaseModel):
     """Lightweight LLM-as-judge pass over the coordinator's output, checking that its
-    claims trace back to evidence the agents/heuristics actually produced."""
+    claims trace back to evidence the agents/heuristics actually produced.
 
-    grounded: bool
+    `grounded` is tri-state:
+      - True  -> AI synthesis was produced and the judge found it grounded (PASSED)
+      - False -> AI synthesis was produced and the judge found unsupported claims (FAILED)
+      - None  -> there was no AI synthesis to evaluate at all (NOT_RUN) -- this is
+                 distinct from a failed check and must never be rendered as PASSED.
+    """
+
+    grounded: bool | None
     issues: list[str] = Field(default_factory=list)
     notes: str = ""
 
@@ -205,10 +293,10 @@ class ArchitecturalImpact(BaseModel):
 
 
 class ConfidenceExplanation(BaseModel):
-    """Explains *why* the model is as confident as it is, instead of a bare number."""
+    """Evidence confidence tier — qualitative, not a calibrated probability."""
 
-    score: int  # 0-100
-    level: str = "Medium"  # "High" | "Medium" | "Low" — human-readable tier derived from score
+    score: int  # 0-100 internal score; UI emphasizes level tier
+    level: str = "MEDIUM"  # HIGH | MEDIUM | LOW — Evidence Confidence tier
     repository_context_available: bool
     llm_heuristic_agreement: bool
     evidence_completeness: str  # "complete" | "partial"
@@ -326,9 +414,14 @@ class ExecutionMetrics(BaseModel):
 
 
 class RiskReport(BaseModel):
-    decision: str
-    risk_score: int
-    confidence: int
+    decision: str  # ALLOW | NEEDS_REVIEW | BLOCK — from deterministic policy
+    release_risk: RiskLevel = RiskLevel.LOW
+    review_complexity: ReviewComplexityResult | None = None
+    llm_disagreement: LLMDisagreement | None = None
+    specialist_routing: list[SpecialistRoutingEntry] = Field(default_factory=list)
+    review_queue: list[ReviewQueueItem] = Field(default_factory=list)
+    risk_score: int  # deterministic release-risk score
+    confidence: int  # internal; prefer confidence_explanation.level in UI
     review_effort_minutes: int = 15
     review_effort_label: str = "15 minutes"
     deployment_strategy: str
@@ -356,6 +449,7 @@ class RiskReport(BaseModel):
     suggested_reviewers: list[SuggestedReviewer] = Field(default_factory=list)
     positive_signals: list[PositiveSignal] = Field(default_factory=list)
     uncertainties: list[UncertaintyItem] = Field(default_factory=list)
+    needs_verification: list[str] = Field(default_factory=list)  # LOW-confidence AI observations
 
 
 class AIAnalysis(BaseModel):
@@ -387,6 +481,7 @@ class AnalyzeResponse(BaseModel):
     rag: RAGContext = Field(default_factory=lambda: RAGContext(scanned=False))
     judge: Optional[JudgeVerdict] = None
     source: str = "live"  # "live" or "demo"
+    policy_note: str = ""  # e.g. AI synthesis unavailable message
 
 
 class DemoSummary(BaseModel):

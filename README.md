@@ -1,8 +1,8 @@
 ﻿# PR Sentinel
 
-**AI-Assisted Deployment Risk Assessment & Decision System for Pull Requests.**
+**An AI-assisted PR / deployment-risk assessment tool.**
 
-PR Sentinel is an engineering platform that combines **deterministic rule-based scoring**, **repository documentation retrieval (RAG)**, and **role-based AI specialist reviewers (LangGraph)** to generate explainable deployment recommendations for pull requests.
+PR Sentinel is a developer-productivity tool that combines **deterministic rule-based scoring**, **repository documentation retrieval (RAG)**, and **role-based AI specialist reviewers (LangGraph)** to generate explainable deployment-risk assessments for pull requests — surfaced as a CI check, PR comment, and dashboard.
 
 Rather than relying on a black-box LLM to "guess" risk, PR Sentinel enforces a strict separation:
 1. **The Deterministic Rule Engine calculates the risk score and detects evidence.**
@@ -43,8 +43,8 @@ Rather than relying on a black-box LLM to "guess" risk, PR Sentinel enforces a s
                        agent findings + RAG citations → report
                                         │
                               Judge (LLM-as-Judge)
-                       Checks every claim in the report traces
-                             back to empirical evidence
+                     Validates whether report claims are grounded
+                    in evidence; flags unsupported/speculative ones
                                         │
                         React + TypeScript Dashboard &
                         GitHub PR Comment / Markdown Artifact
@@ -97,8 +97,32 @@ python test_workflow.py --repo PrateekaBhat/pr-sentinel --pr 2
 
 ### 3. Run Unit & Regression Tests
 ```bash
-python -m pytest engine/tests/test_risk_engine.py engine/tests/test_category_classifier.py -v
+pip install -r requirements-dev.txt
+python -m pytest engine/tests -q
 ```
+
+---
+
+## 🛡️ Failure Handling
+
+The deterministic policy engine is the single source of truth for the release decision, so the pipeline degrades gracefully when the AI layer has problems:
+
+- **LLM unavailable** (Ollama down/unreachable): the pipeline falls back to deterministic-only analysis. The report/CLI/API response is still produced, `ai_enabled` is `false`, and a policy note states the deterministic engine made the call.
+- **A specialist agent fails**: that agent is marked skipped/errored in `agent_statuses`; the rest of the pipeline (other specialists, coordinator, deterministic policy) continues.
+- **The groundedness judge fails or flags unsupported claims**: this affects explanation confidence only — it never changes `release_risk` or the ALLOW/NEEDS_REVIEW/BLOCK decision.
+- **The analysis itself crashes** (bad input, unexpected exception): `backend/cli.py` exits with code `2`, which the GitHub Actions workflow treats as a hard CI failure — distinct from a deliberate `BLOCK` (exit `1`), which also fails CI but for a different, expected reason.
+
+## 🐕 Dogfooding
+
+PR Sentinel was run against its own pull requests as part of development. That exercise surfaced several real problems that are now fixed: demo fixtures that no longer matched the current Pydantic models, CI failure semantics that could mask a genuine crash as a passing workflow, and evidence-grounding gaps where the coordinator's narrative could drift from what the specialists and heuristics actually reported. The tests and prompt constraints in this repo exist largely because of what dogfooding turned up.
+
+## ⚠️ Limitations
+
+- File-path-based category classification is heuristic, not a static analyzer — it can miscategorize unconventional repository layouts.
+- Explanation quality depends on the local Ollama model in use; smaller CI-friendly models (e.g. `llama3.2`) trade depth for speed.
+- Repository RAG is only as good as the repository's own documentation — undocumented conventions won't be surfaced.
+- "Evidence Confidence" is a qualitative tier (High/Medium/Low), not a calibrated statistical probability.
+- The suggested rollout strategy (Standard/Canary/Blue-Green/Manual Approval) is advisory guidance for reviewers, not an automated deployment controller.
 
 ---
 
@@ -110,4 +134,4 @@ python -m pytest engine/tests/test_risk_engine.py engine/tests/test_category_cla
 
 ---
 
-*PR Sentinel is built for Engineering Managers, Staff Engineers, and Developer Productivity teams looking for explainable, production-ready deployment decision tooling.*
+*PR Sentinel is built for Engineering Managers, Staff Engineers, and Developer Productivity teams looking for explainable, evidence-grounded PR risk assessments — a review aid, not an autonomous deployment controller.*

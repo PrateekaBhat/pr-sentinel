@@ -17,7 +17,9 @@ from .models import (
     RiskCategory,
     RiskFactorFlag,
     RiskLevel,
+    SpecialistRoutingEntry,
 )
+from .policy import classify_release_risk
 
 # Fixed taxonomy the whole report is scored against. Order matters.
 CATEGORIES = [
@@ -172,7 +174,7 @@ _SEVERITY_BONUS = {RiskLevel.HIGH: 25, RiskLevel.MEDIUM: 10, RiskLevel.LOW: 0}
 
 
 def _confidence_label(score: int) -> str:
-    """Convert a 0-100 confidence score to a human-readable tier."""
+    """Evidence Confidence tier — not a calibrated probability."""
     if score >= 75:
         return "High"
     if score >= 50:
@@ -374,8 +376,8 @@ def build_category_breakdown(
             # Evidence explanation: prefer LLM reasoning → agent finding → deterministic label.
             if fr and fr.reason:
                 explanation = fr.reason
-            elif agent_note and agent_note.findings:
-                explanation = agent_note.findings[0]
+            elif agent_note and agent_note.structured_findings:
+                explanation = agent_note.structured_findings[0].title
             else:
                 explanation = _explain_file_for_category(f, category)
 
@@ -467,53 +469,76 @@ def build_confidence_explanation(
     rag: RAGContext,
     ai_enabled: bool,
     judge_grounded: bool | None,
+    llm_disagreement_detected: bool = False,
 ) -> ConfidenceExplanation:
     repo_context_available = bool(rag.scanned and rag.retrieved)
 
-    heuristic_band = (
-        RiskLevel.HIGH if heuristics.score >= 70
-        else RiskLevel.MEDIUM if heuristics.score >= 35
-        else RiskLevel.LOW
-    )
-    agreement = heuristic_band == ai.overall_risk
+    deterministic_risk = classify_release_risk(heuristics.score)
+    agreement = deterministic_risk == ai.overall_risk if ai_enabled else True
 
-    all_agents_ran = ai_enabled and all(af.applicable or not af.files_reviewed for af in ai.agent_findings)
+    applicable_agents = [af for af in ai.agent_findings if af.applicable]
+    all_agents_ran = ai_enabled and all(
+        af.applicable or not af.files_reviewed for af in ai.agent_findings
+    )
+
     completeness = "complete" if (ai_enabled and repo_context_available and all_agents_ran) else "partial"
 
     reasons = []
-    reasons.append(
-        "Repository documentation was retrieved and used as context"
-        if repo_context_available
-        else "No repository documentation was available to ground the analysis"
-    )
-    reasons.append(
-        "the heuristic score and the LLM's risk assessment agree"
-        if agreement
-        else "the heuristic score and the LLM's risk assessment diverge; a conservative bias was applied"
-    )
     if not ai_enabled:
-        reasons.append("the AI pipeline was unavailable; this is a deterministic heuristics-only assessment")
-    elif judge_grounded is False:
-        reasons.append("the groundedness judge flagged claims that weren't fully traceable to evidence")
-        completeness = "partial"
+        reasons.append("AI synthesis unavailable — deterministic policy produced the release decision")
+    if repo_context_available:
+        reasons.append("repository context was retrieved")
+    else:
+        reasons.append("repository context was unavailable")
+    if agreement:
+        reasons.append("LLM assessment agrees with deterministic release risk")
+    elif ai_enabled:
+        reasons.append("LLM assessment diverges from deterministic policy (override active)")
+    if judge_grounded is False:
+        reasons.append("groundedness check failed — review explanation quality separately from release policy")
 
     narrative = "; ".join(reasons) + "."
 
-    score = ai.confidence
-    if completeness == "partial":
-        score = min(score, 65)
-    if judge_grounded is False:
-        score = min(score, 55)
-
-    level = _confidence_label(score)
-
+    # Evidence Confidence tier — deterministic checks
     checks = [
-        RiskFactorFlag(key="repo_docs", label="Repository documentation found", passed=repo_context_available),
-        RiskFactorFlag(key="heuristic_llm_agree", label="Heuristic and LLM assessments agree", passed=agreement),
-        RiskFactorFlag(key="agents_completed", label="All applicable specialist agents completed", passed=all_agents_ran),
-        RiskFactorFlag(key="ai_available", label="AI pipeline was available", passed=ai_enabled),
-        RiskFactorFlag(key="grounded", label="Groundedness check passed", passed=bool(judge_grounded) if judge_grounded is not None else True),
+        RiskFactorFlag(key="deterministic", label="Deterministic analysis available", passed=True),
+        RiskFactorFlag(key="repo_docs", label="Repository context available", passed=repo_context_available),
+        RiskFactorFlag(
+            key="specialists",
+            label="Applicable specialists completed",
+            passed=bool(applicable_agents) if ai_enabled else False,
+        ),
+        RiskFactorFlag(key="ai_available", label="AI synthesis available", passed=ai_enabled),
+        RiskFactorFlag(
+            key="grounded",
+            label="Groundedness check passed",
+            passed=bool(judge_grounded) if judge_grounded is not None else (not ai_enabled),
+        ),
+        RiskFactorFlag(
+            key="no_major_gaps",
+            label="No major evidence gaps",
+            passed=ai_enabled and completeness == "complete" and judge_grounded is not False,
+        ),
     ]
+
+    passed_count = sum(1 for c in checks if c.passed)
+    if not ai_enabled:
+        score = 45
+        level = "LOW"
+    elif passed_count >= 5 and agreement and judge_grounded is not False:
+        score = 85
+        level = "HIGH"
+    elif passed_count >= 3:
+        score = 60
+        level = "MEDIUM"
+    else:
+        score = 40
+        level = "LOW"
+
+    if llm_disagreement_detected:
+        score = min(score, 65)
+        if level == "HIGH":
+            level = "MEDIUM"
 
     return ConfidenceExplanation(
         score=score,
@@ -526,6 +551,192 @@ def build_confidence_explanation(
     )
 
 
+_DOMAIN_SKIP_TRIGGERS = {
+    "security": "no authentication, session, or payment-related files detected",
+    "database": "no database/schema/migration files detected",
+    "api": "no API routes, controllers, or endpoint files detected",
+    "tests": "no test or spec files detected",
+    "performance": "no cache, queue, or performance-related files detected",
+}
+
+_DOMAIN_EXECUTE_TRIGGERS = {
+    "security": "authentication or security-sensitive files changed",
+    "database": "database migration or schema files changed",
+    "api": "API routes or controller files changed",
+    "tests": "test or spec files changed",
+    "performance": "performance or cache-related files changed",
+}
+
+
+def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list[SpecialistRoutingEntry]:
+    """Explainable specialist routing — EXECUTED vs SKIPPED with triggers."""
+    from . import agent_routing
+
+    entries: list[SpecialistRoutingEntry] = []
+    for domain in ["security", "database", "api", "tests", "performance"]:
+        status = state.get(f"{domain}_status")
+        finding: AgentFinding | None = state.get(f"{domain}_finding")
+        label = agent_routing.DOMAIN_LABELS[domain]
+        domain_files = agent_routing.files_for_domain(pr.files, domain)
+        file_names = [f.filename for f in domain_files]
+
+        if status is None and finding is None:
+            continue
+
+        if finding and finding.applicable:
+            duration = status["duration_ms"] if isinstance(status, dict) else (status.duration_ms if status else 0)
+            # `status` (set in agents/nodes.py) carries the real available/selected
+            # counts for this run. Demo-reconstructed states (see enrich.py) may not
+            # have the newer fields, so fall back to what we can infer.
+            if isinstance(status, dict):
+                files_selected = status.get("files_reviewed", len(getattr(finding, "files_reviewed", []) or []))
+                files_available = status.get("files_available", len(file_names))
+                context_bounded = status.get("context_bounded", files_available > files_selected)
+            else:
+                files_selected = len(getattr(finding, "files_reviewed", []) or [])
+                files_available = len(file_names)
+                context_bounded = files_available > files_selected
+            entries.append(
+                SpecialistRoutingEntry(
+                    domain=domain,
+                    label=label,
+                    status="EXECUTED",
+                    trigger=_DOMAIN_EXECUTE_TRIGGERS.get(domain, f"{domain} domain files detected"),
+                    files_count=files_selected,
+                    duration_ms=duration,
+                    llm_call_made=True,
+                    files=(getattr(finding, "files_reviewed", None) or file_names)[:5],
+                    files_available=files_available,
+                    files_selected=files_selected,
+                    context_bounded=context_bounded,
+                )
+            )
+        else:
+            entries.append(
+                SpecialistRoutingEntry(
+                    domain=domain,
+                    label=label,
+                    status="SKIPPED",
+                    trigger=_DOMAIN_SKIP_TRIGGERS.get(domain, f"no {domain} domain files detected"),
+                    files_count=0,
+                    duration_ms=0,
+                    llm_call_made=False,
+                    files=[],
+                )
+            )
+    return entries
+
+
+_BLANKET_REASSURANCE_RE = re.compile(
+    r"no concerning issues|nothing concerning|no issues (were )?found|no concerns (were )?"
+    r"(found|raised|identified)|no (significant |major |real )?(risks?|problems?) (were )?"
+    r"(found|identified|detected)",
+    re.I,
+)
+
+# Some local LLMs echo the response schema's placeholder tokens back verbatim instead
+# of replacing them (e.g. returning "<short, specific finding>: Renamed endpoint x"
+# instead of just "Renamed endpoint x"). Strip these schema artifacts defensively so
+# they never reach the rendered report.
+_PLACEHOLDER_ARTIFACT_RE = re.compile(r"<[^<>]{0,60}>:?\s*", re.I)
+
+
+def clean_finding_text(text: str) -> str:
+    """Strip literal prompt-template placeholders an LLM echoed back verbatim."""
+    cleaned = _PLACEHOLDER_ARTIFACT_RE.sub("", text or "").strip()
+    return cleaned
+
+
+def reconcile_executive_summary(summary: str, agent_findings: list[AgentFinding]) -> str:
+    """Deterministic guardrail, independent of whether the LLM followed the prompt's
+    consistency/grounding rules:
+
+    1. Any specialist domain the summary references must have actually run and be
+       applicable — a mention of a domain that was SKIPPED (not applicable) is by
+       definition fabricated, since that agent reviewed nothing. Sentences making such
+       a claim are removed outright.
+    2. If specialist.concerns > 0, that specialist's finding MUST appear in the summary.
+       If specialist.concerns == 0, the specialist may be described as clean.
+    3. A blanket reassurance ("no concerning issues found") is never allowed to coexist
+       with a specialist that actually raised concerns.
+
+    This never rewrites a summary that's already accurate; it only removes what's
+    fabricated and appends what's missing.
+    """
+    text = summary or ""
+
+    # `structured_findings` is the authoritative, validated representation of what a
+    # specialist actually found — reconciliation is deliberately checked against it
+    # rather than the legacy `findings` string list, so a finding the validation layer
+    # rejected can never be reintroduced here just because it once existed in raw form.
+    with_concerns = [f for f in agent_findings if f.applicable and f.structured_findings]
+    skipped_labels = [f.label for f in agent_findings if not f.applicable]
+
+    def _split_sentences(t: str) -> list[str]:
+        return [s for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
+
+    # 1. Remove sentences that attribute findings to a domain that never ran.
+    if skipped_labels:
+        kept = []
+        for s in _split_sentences(text):
+            if any(re.search(re.escape(label), s, re.I) for label in skipped_labels):
+                continue
+            kept.append(s)
+        text = " ".join(kept).strip()
+
+    if not with_concerns:
+        # No real concerns to reconcile against — but a blanket "no concerns" claim is
+        # still fine to leave as-is here, since it isn't contradicted by anything.
+        return text
+
+    # 2. Decide, against the *current* text, which concerned specialists are actually
+    #    and accurately addressed: mentioned by name, in a sentence that isn't just a
+    #    reassurance ("no risks found") sitting next to the name.
+    def _sentence_addresses_concern(label: str) -> bool:
+        for s in _split_sentences(text):
+            if re.search(re.escape(label), s, re.I) and not _BLANKET_REASSURANCE_RE.search(s):
+                return True
+        return False
+
+    missing = [f for f in with_concerns if not _sentence_addresses_concern(f.label)]
+
+    # 3. Now clean up: drop any sentence that pairs a *missing* specialist's name with a
+    #    reassuring phrase (actively misleading), and strip any remaining blanket
+    #    reassurance clauses that aren't tied to a specific specialist at all.
+    cleaned = []
+    for s in _split_sentences(text):
+        misleads_a_missing_one = any(
+            re.search(re.escape(f.label), s, re.I) for f in missing
+        ) and _BLANKET_REASSURANCE_RE.search(s)
+        if misleads_a_missing_one:
+            continue
+        if _BLANKET_REASSURANCE_RE.search(s):
+            clauses = re.split(r",\s*(?:but|and)\s+", s)
+            surviving = [c for c in clauses if not _BLANKET_REASSURANCE_RE.search(c)]
+            if surviving:
+                clause = surviving[0].strip().rstrip(" .,;")
+                if clause:
+                    cleaned.append(clause + ".")
+            continue
+        cleaned.append(s)
+    text = " ".join(cleaned).strip()
+
+    if not missing:
+        return text
+
+    addendum_parts = []
+    for f in missing:
+        # Titles on structured_findings are already validated/cleaned — no need to
+        # re-run clean_finding_text, and no unvalidated text can reach this addendum.
+        titles = [sf.title for sf in f.structured_findings[:2] if sf.title]
+        detail = "; ".join(titles) if titles else (f.risk_note or "see agent findings")
+        addendum_parts.append(f"{f.label} raised {len(f.structured_findings)} concern(s): {detail}.")
+
+    if text and not text.endswith((".", "!", "?")):
+        text += "."
+    return f"{text} {' '.join(addendum_parts)}".strip()
+
+
 def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
     decisions: list[AgentDecision] = []
     for domain in ["security", "database", "api", "tests", "performance"]:
@@ -534,12 +745,14 @@ def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
         if status is None or finding is None:
             continue
         if not finding.applicable:
-            decision = "Skipped \u2014 no files in this agent\u2019s domain were touched"
-            reasoning = finding.risk_note
+            decision = "SKIPPED — no files in domain"
+            reasoning = f"Trigger: {_DOMAIN_SKIP_TRIGGERS.get(domain, 'no matching files')}. LLM call: not made."
             confidence = 100
-        elif finding.findings:
-            decision = f"Concerns raised ({len(finding.findings)})"
-            reasoning = " ".join(finding.findings[:2])
+        elif finding.structured_findings:
+            # structured_findings is the authoritative, validated source — counts and
+            # rendered reasoning are derived from it, never from the raw/legacy list.
+            decision = f"Concerns raised ({len(finding.structured_findings)})"
+            reasoning = " ".join(sf.title for sf in finding.structured_findings[:2])
             confidence = finding.confidence
         else:
             decision = "No concerns raised"

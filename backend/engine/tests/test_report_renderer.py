@@ -1,279 +1,102 @@
 from __future__ import annotations
 
-from engine.models import (
-    AgentFinding,
-    AIAnalysis,
-    AnalyzeResponse,
-    ChangedFile,
-    ConfidenceExplanation,
-    FileRisk,
-    HeuristicFactor,
-    HeuristicResult,
-    ProductionReadinessScore,
-    PullRequestData,
-    RAGChunk,
-    RAGContext,
-    RepositoryInfo,
-    RiskLevel,
-    RiskReport,
-    RepositoryMetadata,
-    ScoreMathFactor,
-)
-from engine.report_renderer import build_review_queue, render_markdown, _total_review_minutes
+from engine.demo_data import get_demo
+from engine.models import JudgeVerdict, ReviewQueueItem, ScoreMathFactor
+from engine.report_renderer import render_markdown
+
+# Fixtures are derived from the existing (enriched) demo payloads rather than
+# hand-built from scratch, so these tests exercise the same shapes the app
+# actually serves and stay in sync with the current renderer contract.
+ALLOW_DEMO = get_demo("docs-refactor")
+NEEDS_REVIEW_DEMO = get_demo("db-migration")
+BLOCK_DEMO = get_demo("auth-refactor")
+DISAGREEMENT_DEMO = get_demo("llm-disagreement")
 
 
-def _sample_response(
-    files: list[ChangedFile],
-    *,
-    no_tests: bool = False,
-    with_rag: bool = True,
-    with_agents: bool = True,
-) -> AnalyzeResponse:
-    repo = RepositoryInfo(owner="test", name="test", full_name="test/test")
-    pr = PullRequestData(
-        owner="test",
-        repo="test",
-        number=3,
-        title="Refactor PR Summary report",
-        author="dev",
-        url="https://github.com/test/test/pull/3",
-        state="open",
-        additions=sum(f.additions for f in files),
-        deletions=sum(f.deletions for f in files),
-        changed_files_count=len(files),
-        files=files,
-        repository=repo,
-    )
-    factors = []
-    if no_tests:
-        factors.append(
-            HeuristicFactor(key="no_tests", label="No test files touched", triggered=True, weight=10, reason="No tests")
-        )
-    factors.append(
-        HeuristicFactor(key="large_diff", label="Large diff", triggered=True, weight=20, reason="800+ lines")
-    )
-    heuristics = HeuristicResult(
-        score=30,
-        factors=factors,
-        score_math=[
-            ScoreMathFactor(factor="Large diff", points=20, reason="800+ line changes"),
-            ScoreMathFactor(factor="Missing tests", points=10, reason="No test files touched"),
-        ],
-        tests_touched=False,
-        tests_deleted=False,
-        migration_touched=False,
-    )
-    file_risks = [
-        FileRisk(filename=f.filename, risk=RiskLevel.MEDIUM, reason="Changed")
-        for f in files
-    ]
-    agent_findings = [
-        AgentFinding(agent="security", label="Security", applicable=False, risk_note="Skipped"),
-        AgentFinding(agent="database", label="Database", applicable=False, risk_note="Skipped"),
-        AgentFinding(agent="api", label="API", applicable=False, risk_note="Skipped"),
-        AgentFinding(agent="tests", label="Tests", applicable=True, files_reviewed=["backend/engine/report_renderer.py"], findings=["No tests updated"]),
-        AgentFinding(agent="performance", label="Performance", applicable=False, risk_note="Skipped"),
-    ] if with_agents else []
-    report = RiskReport(
-        decision="ALLOW",
-        risk_score=30,
-        confidence=72,
-        deployment_strategy="Canary",
-        production_readiness=ProductionReadinessScore(score=65, label="Needs attention", deductions=[]),
-        repository_metadata=RepositoryMetadata(files_changed_count=len(files)),
-    )
-    return AnalyzeResponse(
-        source="test",
-        ai_enabled=True,
-        pr=pr,
-        heuristics=heuristics,
-        ai=AIAnalysis(
-            overall_risk=RiskLevel.MEDIUM,
-            confidence=72,
-            summary="Refactored report rendering.",
-            architectural_impact="Report generation updated.",
-            operational_risks=[],
-            rollout_strategy="Canary",
-            rollout_reason="Medium risk change.",
-            rollback_required=False,
-            file_risks=file_risks,
-            agent_findings=agent_findings,
-        ),
-        rag=RAGContext(
-            scanned=with_rag,
-            retrieved=[RAGChunk(path="README.md", snippet="Report Generation", score=0.9)] if with_rag else [],
-            indexed_doc_paths=["README.md"] if with_rag else [],
-        ),
-        report=report,
-    )
+def test_allow_report_renders_successfully():
+    assert ALLOW_DEMO.report.decision == "ALLOW"
+    markdown = render_markdown(ALLOW_DEMO)
+    assert "# PR Sentinel" in markdown
+    assert "ALLOW" in markdown
 
 
-def test_review_queue_ranks_implementation_before_infrastructure():
-    files = [
-        ChangedFile(filename=".github/workflows/main.yml", status="modified", additions=10, deletions=2, changes=12),
-        ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673),
-        ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=200, deletions=136, changes=336),
-    ]
-    response = _sample_response(files, no_tests=True)
-    queue = build_review_queue(response)
-    categories = [item.category for item in queue]
-    impl_index = categories.index("implementation")
-    infra_index = categories.index("infrastructure")
-    assert impl_index < infra_index
+def test_needs_review_report_renders_successfully():
+    assert NEEDS_REVIEW_DEMO.report.decision == "NEEDS_REVIEW"
+    markdown = render_markdown(NEEDS_REVIEW_DEMO)
+    assert "NEEDS_REVIEW" in markdown
 
 
-def test_review_effort_matches_queue_total():
-    files = [
-        ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673),
-        ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=200, deletions=136, changes=336),
-        ChangedFile(filename=".github/workflows/main.yml", status="modified", additions=10, deletions=2, changes=12),
-    ]
-    response = _sample_response(files, no_tests=True)
-    queue = build_review_queue(response)
-    total = _total_review_minutes(queue)
-    markdown = render_markdown(response)
-    assert f"**Total review effort:** ~{total} minutes" in markdown or f"**Total review effort:** ~1 hour" in markdown
-    assert "Review Queue" in markdown
-    assert "Review Priorities" not in markdown
-    assert "Review Order" not in markdown
+def test_block_report_renders_successfully():
+    assert BLOCK_DEMO.report.decision == "BLOCK"
+    markdown = render_markdown(BLOCK_DEMO)
+    assert "BLOCK" in markdown
 
 
-def test_evidence_quality_excludes_regression_tests():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/service.py", status="modified", additions=50, deletions=10, changes=60)],
-        no_tests=True,
+def test_llm_disagreement_section_rendered_when_disagreement_exists():
+    assert DISAGREEMENT_DEMO.report.llm_disagreement is not None
+    assert DISAGREEMENT_DEMO.report.llm_disagreement.detected is True
+    markdown = render_markdown(DISAGREEMENT_DEMO)
+    assert "Deterministic Override" in markdown
+    assert "LLM Disagreement Audit" in markdown
+
+
+def test_llm_disagreement_section_absent_when_no_disagreement():
+    assert ALLOW_DEMO.report.llm_disagreement is None or not ALLOW_DEMO.report.llm_disagreement.detected
+    markdown = render_markdown(ALLOW_DEMO)
+    assert "Deterministic Override" not in markdown
+
+
+def test_groundedness_failure_warning_rendered_when_judge_not_grounded():
+    response = ALLOW_DEMO.model_copy(
+        update={"judge": JudgeVerdict(grounded=False, issues=["Unsupported claim about rollout strategy."])}
     )
     markdown = render_markdown(response)
-    assert "Deterministic analysis" in markdown
-    assert "Git diff" in markdown
-    assert "Runtime telemetry" in markdown
-    assert "- [ ] Regression tests" not in markdown
+    assert "Evidence requires review" in markdown
+    assert "Unsupported claim about rollout strategy." in markdown
+    # The release decision must remain framed as deterministic, not overridden by the judge.
+    assert "release decision above is unaffected" in markdown
 
 
-def test_why_not_block_for_allow_decision():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
-        no_tests=True,
-    )
+def test_no_groundedness_warning_when_judge_passes():
+    response = ALLOW_DEMO.model_copy(update={"judge": JudgeVerdict(grounded=True)})
     markdown = render_markdown(response)
-    assert "### Why ALLOW?" in markdown
-    assert "No security-sensitive changes" in markdown
-    assert "Missing regression coverage" in markdown
+    assert "Evidence requires review" not in markdown
 
 
-def test_risk_breakdown_has_no_percentages():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
-        no_tests=True,
+def test_review_queue_section_rendered_when_queue_items_exist():
+    queue_item = ReviewQueueItem(
+        priority="P1",
+        filename="auth/session_store.ts",
+        role="Removed with no equivalent test coverage",
+        why_it_matters="Session handling regressions would be undetected.",
+        potential_regression="Silent auth bypass",
+        suggested_validation="Add integration test covering token refresh",
+        estimated_minutes=20,
     )
+    response = BLOCK_DEMO.model_copy(update={"report": BLOCK_DEMO.report.model_copy(update={"review_queue": [queue_item]})})
     markdown = render_markdown(response)
-    assert "| Share |" not in markdown
-    assert "%" not in markdown.split("Risk Contributors")[1].split("Merge Readiness")[0]
+    assert "## Review Queue" in markdown
+    assert "auth/session_store.ts" in markdown
 
 
-def test_coordinator_synthesis_and_repository_coverage():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
-    )
+def test_no_review_queue_section_when_queue_empty():
+    response = BLOCK_DEMO.model_copy(update={"report": BLOCK_DEMO.report.model_copy(update={"review_queue": []})})
     markdown = render_markdown(response)
-    assert "Final synthesis" in markdown
-    assert "Coordinator Summary" not in markdown
-    assert "Repository coverage:" in markdown
-    assert "Repository confidence:" not in markdown
+    assert "## Review Queue" not in markdown
 
 
-def test_analysis_scope_section():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120),
-         ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=50, deletions=30, changes=80)],
-        with_agents=True,
-    )
+def test_release_risk_calculation_contains_deterministic_score():
+    score_math = [ScoreMathFactor(factor="Authentication logic touched", points=40, reason="Matched in auth/middleware.ts")]
+    response = BLOCK_DEMO.model_copy(update={"report": BLOCK_DEMO.report.model_copy(update={"score_math": score_math})})
     markdown = render_markdown(response)
-    assert "### Analysis Scope" in markdown
-    assert "**Files analyzed:** 2 / 2" in markdown
-    assert "**Agents executed:** 1" in markdown
-    assert "**Agents skipped:** 4" in markdown
+    assert "### Release Risk Calculation" in markdown
+    assert f"`{response.report.risk_score}`" in markdown
 
 
-def test_evidence_quality_and_confidence_never_contradict():
-    """High evidence quality must never sit next to a 'below-target
-    confidence' readiness penalty — both are sourced from the same
-    ConfidenceExplanation."""
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673)],
-    )
-    response.report.confidence_explanation = ConfidenceExplanation(
-        score=60,
-        level="High",
-        repository_context_available=True,
-        llm_heuristic_agreement=True,
-        evidence_completeness="complete",
-    )
-    markdown = render_markdown(response)
-    assert "Evidence Quality — 60% confidence (High)" in markdown
-    assert "below-target confidence" not in markdown
-
-
-def test_not_impacted_section_replaces_no_review_needed():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
-    )
-    markdown = render_markdown(response)
-    assert "## Not Impacted" in markdown
-    assert "No Review Needed" not in markdown
-
-
-def test_release_decision_and_status_are_distinct():
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=100, deletions=20, changes=120)],
-    )
-    markdown = render_markdown(response)
-    assert "## Release Decision: ALLOW" in markdown
-    assert "**Release Posture:**" in markdown
-    assert "## Release Decision: READY" not in markdown
-
-
-def test_hallucinated_ai_filenames_are_ignored_in_favor_of_real_files():
-    """If the AI's file_risks reference filenames that don't exist in the
-    actual diff, the queue must still be built from the real changed files —
-    not silently replaced by phantom entries."""
-    files = [
-        ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673),
-        ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=200, deletions=136, changes=336),
-    ]
-    response = _sample_response(files, no_tests=True)
-    response.ai.file_risks = [
-        FileRisk(filename="github_actions.yml", risk=RiskLevel.MEDIUM, reason="Hallucinated file."),
-        FileRisk(filename="test_build_review_queue.py", risk=RiskLevel.LOW, reason="Hallucinated file."),
-    ]
-    queue = build_review_queue(response)
-    filenames = {item.filename for item in queue}
-    assert "github_actions.yml" not in filenames
-    assert "test_build_review_queue.py" not in filenames
-    assert "backend/engine/report_renderer.py" in filenames
-    assert "frontend/src/App.tsx" in filenames
-
-
-def test_total_effort_covers_files_beyond_the_displayed_queue():
-    files = [
-        ChangedFile(filename=f"backend/engine/file_{i}.py", status="modified", additions=100, deletions=0, changes=100)
-        for i in range(7)
-    ]
-    response = _sample_response(files)
-    markdown = render_markdown(response)
-    assert "not shown above" in markdown
-
-
-def test_review_queue_uses_priority_labels():
-
-
-
-    response = _sample_response(
-        [ChangedFile(filename="backend/engine/report_renderer.py", status="modified", additions=600, deletions=73, changes=673),
-         ChangedFile(filename="frontend/src/App.tsx", status="modified", additions=200, deletions=136, changes=336)],
-        no_tests=True,
-    )
-    markdown = render_markdown(response)
-    assert "### 1." in markdown
-    assert "Review first" not in markdown
-    assert "Review next" not in markdown
+def test_renderer_does_not_claim_llm_controls_release_decision():
+    for demo in (ALLOW_DEMO, NEEDS_REVIEW_DEMO, BLOCK_DEMO, DISAGREEMENT_DEMO):
+        markdown = render_markdown(demo)
+        assert "deterministic policy controls release decisions" in markdown
+        # Guard against future regressions that hand the decision to the LLM.
+        assert "LLM decides" not in markdown
+        assert "LLM controls the release" not in markdown

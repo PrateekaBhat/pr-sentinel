@@ -14,7 +14,22 @@ PATH_RULES: list[tuple[str, str, int, re.Pattern]] = [
     # heuristic fires frequently on routine PRs and was over-inflating scores.
     ("infra", "Infrastructure / deployment files changed", 20, re.compile(r"(^|/)(terraform|infra|deploy|docker|ci|\.github/workflows)(/|\.)", re.I)),
     ("migration", "Database migration detected", 35, re.compile(r"(^|/)(migrations?|schema)(/|\.).*\.(sql|py|ts|js)$|alembic", re.I)),
-    ("api_contract", "Public API contract changed", 25, re.compile(r"(^|/)(routes?|controllers?|api|graphql|schema\.graphql|openapi)(/|\.)", re.I)),
+    # "Public API contract changed" is reserved for evidence of the actual server-side
+    # contract (route/controller definitions, GraphQL/OpenAPI schema) — not merely a
+    # path that happens to contain "api". A frontend directory like
+    # `frontend/src/api/client.ts` is a *consumer* of the contract, not the contract
+    # itself, so it must never match here (see api_client rule below).
+    ("api_contract", "Public API contract changed", 25, re.compile(
+        r"(^|/)(routes?|controllers?)(/|\.)|(^|/)(graphql|schema\.graphql|openapi)(/|\.)", re.I
+    )),
+    # Weaker, distinct signal: a frontend/client-side API adapter changed. This only
+    # means "an API compatibility review is warranted" — it is NOT evidence that the
+    # public contract itself changed, since the client could just be catching up to an
+    # already-shipped backend change (or vice versa). Scored lower than api_contract
+    # and never conflated with it in reporting.
+    ("api_client", "API client / integration changed", 10, re.compile(
+        r"(^|/)api(/|\.).*\.(ts|tsx|js|jsx)$", re.I
+    )),
 ]
 
 TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|spec)(/|\.)|\.(test|spec)\.", re.I)
@@ -66,27 +81,26 @@ def analyze(pr: PullRequestData) -> HeuristicResult:
             )
         )
 
-    # Large diffs carry more residual risk regardless of category
+    # Diff-size signals inform review complexity, NOT release risk.
+    review_signals: list[HeuristicFactor] = []
     total_changes = pr.additions + pr.deletions
     if total_changes > 800:
-        score += 20
-        factors.append(
+        review_signals.append(
             HeuristicFactor(
                 key="large_diff",
                 label="Large diff (800+ line changes)",
                 triggered=True,
-                weight=20,
+                weight=0,
                 reason=f"{total_changes} lines changed across {pr.changed_files_count} files.",
             )
         )
     elif total_changes > 300:
-        score += 10
-        factors.append(
+        review_signals.append(
             HeuristicFactor(
                 key="medium_diff",
                 label="Medium-sized diff (300+ line changes)",
                 triggered=True,
-                weight=10,
+                weight=0,
                 reason=f"{total_changes} lines changed across {pr.changed_files_count} files.",
             )
         )
@@ -109,30 +123,34 @@ def analyze(pr: PullRequestData) -> HeuristicResult:
         tests_touched=tests_touched,
         tests_deleted=tests_deleted,
         migration_touched="migration" in matched_keys,
+        review_signals=review_signals,
     )
 
 
 def calculate_review_effort(pr: PullRequestData, heuristics: HeuristicResult) -> tuple[int, str]:
     """Deterministically estimates the time required for a thorough human code review."""
+    from .review_complexity import calculate_review_complexity
+
+    complexity = calculate_review_complexity(pr, heuristics)
     total_changes = pr.additions + pr.deletions
-    subsystems_count = pr.changed_files_count
 
-    # Base estimate from change size
-    if total_changes < 50 and subsystems_count <= 2:
-        minutes = 5
-    elif total_changes < 200:
-        minutes = 15
-    elif total_changes < 600:
-        minutes = 30
-    elif total_changes < 1200:
-        minutes = 60
+    # Base estimate from review complexity level
+    if complexity.level.value == "HIGH":
+        minutes = 120 if total_changes >= 2000 else 60
+    elif complexity.level.value == "MEDIUM":
+        minutes = 30 if total_changes < 600 else 60
     else:
-        minutes = 120
+        if total_changes < 50 and pr.changed_files_count <= 2:
+            minutes = 5
+        elif total_changes < 200:
+            minutes = 15
+        else:
+            minutes = 30
 
-    # Risk adjustments
-    if heuristics.score >= 70:
+    # Release-risk adjustments (review thoroughness, not decision)
+    if heuristics.score >= 60:
         minutes = max(minutes, 60)
-    elif heuristics.score >= 40:
+    elif heuristics.score >= 30:
         minutes = max(minutes, 30)
 
     if minutes < 60:

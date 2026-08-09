@@ -12,11 +12,16 @@ from .categories import (
     build_architectural_impact,
     build_category_breakdown,
     build_confidence_explanation,
+    build_specialist_routing,
+    reconcile_executive_summary,
 )
 from .config import get_settings
 from .github_client import GitHubError
 from . import history
 from .metrics import build_engineering_metrics, build_operational_checklist, derive_production_readiness_score
+from .policy import audit_llm_disagreement, evaluate_policy
+from .review_complexity import calculate_review_complexity
+from .review_queue import build_review_queue
 from .reviewers import build_suggested_reviewers
 from .evidence_gaps import build_positive_signals, build_uncertainties
 from datetime import datetime, timezone
@@ -72,10 +77,11 @@ def _build_risk_breakdown(heuristics: HeuristicResult) -> dict[str, int]:
         "infra": "Infrastructure",
         "migration": "Database",
         "api_contract": "API",
+        "api_client": "API",
         "tests_deleted": "Tests",
         "no_tests": "Tests",
-        "large_diff": "Diff size",
-        "medium_diff": "Diff size",
+        "large_diff": "Review surface",
+        "medium_diff": "Review surface",
     }
     breakdown: dict[str, int] = {}
     for factor in heuristics.factors:
@@ -100,6 +106,9 @@ def _build_evidence(heuristics: HeuristicResult, ai: AIAnalysis) -> list[str]:
     for factor in heuristics.factors:
         if factor.triggered:
             evidence.append(f"{factor.label}: {factor.reason}")
+    for signal in heuristics.review_signals:
+        if signal.triggered:
+            evidence.append(f"[Review complexity] {signal.label}: {signal.reason}")
     for risk in ai.file_risks[:3]:
         evidence.append(f"{risk.filename}: {risk.reason}")
     if not evidence and ai.operational_risks:
@@ -171,11 +180,25 @@ def _build_report(
     judge: JudgeVerdict | None,
     total_duration_ms: int,
 ) -> RiskReport:
-    decision = "BLOCK" if ai.overall_risk == RiskLevel.HIGH else "ALLOW"
+    release_risk, release_decision = evaluate_policy(heuristics.score)
+    decision = release_decision.value
+
+    llm_risk = ai.overall_risk if ai_enabled else None
+    disagreement = audit_llm_disagreement(release_risk, llm_risk, ai_enabled=ai_enabled)
+
+    review_complexity = calculate_review_complexity(pr, heuristics)
+    review_queue = build_review_queue(pr, heuristics)
+    specialist_routing = build_specialist_routing(state, pr) if state else []
+
     category_breakdown = build_category_breakdown(pr, heuristics, ai)
     architectural_impact = build_architectural_impact(pr, category_breakdown, ai)
     confidence_explanation = build_confidence_explanation(
-        heuristics, ai, rag, ai_enabled, judge.grounded if judge else None
+        heuristics,
+        ai,
+        rag,
+        ai_enabled,
+        judge.grounded if judge else None,
+        llm_disagreement_detected=disagreement.detected,
     )
     effort_minutes, effort_label = heuristics_mod.calculate_review_effort(pr, heuristics)
 
@@ -212,18 +235,46 @@ def _build_report(
     engineering_metrics = build_engineering_metrics(pr, category_breakdown)
     operational_checklist = build_operational_checklist(category_breakdown, heuristics, engineering_metrics)
     production_readiness = derive_production_readiness_score(
-        heuristics,
-        category_breakdown,
-        confidence_explanation.score,
-        engineering_metrics,
-        evidence_complete=confidence_explanation.evidence_completeness == "complete",
+        heuristics, category_breakdown, confidence_explanation.score, engineering_metrics
     )
     suggested_reviewers = build_suggested_reviewers(pr, category_breakdown)
     positive_signals = build_positive_signals(heuristics)
     uncertainties = build_uncertainties(pr, heuristics, ai, rag, category_breakdown)
 
+    # Tier-1 main concern from deterministic signals + review complexity
+    triggered = [f for f in heuristics.factors if f.triggered]
+    if triggered:
+        main_concern = triggered[0].label
+    elif review_complexity.level == RiskLevel.HIGH:
+        main_concern = "Large change surface requires focused review"
+    else:
+        main_concern = "No high-severity release-risk signals detected"
+
+    exec_summary = ai.executive_summary or ai.summary
+    if not ai_enabled:
+        exec_summary = (
+            "AI synthesis unavailable. Final release decision was produced by the deterministic policy engine. "
+            + exec_summary
+        )
+
+    agent_decisions = build_agent_decisions(state)
+    needs_verification: list[str] = []
+    for f in ai.agent_findings:
+        for lv in f.needs_verification:
+            needs_verification.append(f"{f.label}: {lv.title}")
+    # Belt-and-suspenders: the coordinator already reconciles the executive summary
+    # against agent findings before the judge sees it (agents/nodes.py), so this call
+    # is normally a no-op. It stays here as a safety net for the ai_enabled=False path
+    # and any future callers that bypass the coordinator. Idempotent by construction.
+    exec_summary = reconcile_executive_summary(exec_summary, ai.agent_findings)
+
     return RiskReport(
         decision=decision,
+        release_risk=release_risk,
+        review_complexity=review_complexity,
+        llm_disagreement=disagreement,
+        specialist_routing=specialist_routing,
+        review_queue=review_queue,
         risk_score=heuristics.score,
         confidence=confidence_explanation.score,
         review_effort_minutes=effort_minutes,
@@ -236,10 +287,10 @@ def _build_report(
         evidence=_build_evidence(heuristics, ai),
         timeline=_build_timeline(repo_loaded_ms, repo_context_ms, state),
         agent_statuses=_build_agent_statuses(state),
-        agent_decisions=build_agent_decisions(state),
+        agent_decisions=agent_decisions,
         repository_metadata=_infer_repository_metadata(pr, rag),
         summary=ai.summary,
-        executive_summary=ai.executive_summary or ai.summary,
+        executive_summary=exec_summary,
         architectural_impact=architectural_impact,
         confidence_explanation=confidence_explanation,
         deployment_recommendation=deployment_recommendation,
@@ -249,6 +300,7 @@ def _build_report(
         suggested_reviewers=suggested_reviewers,
         positive_signals=positive_signals,
         uncertainties=uncertainties,
+        needs_verification=needs_verification,
         execution_metrics=ExecutionMetrics(
             generated_at=datetime.now(timezone.utc).isoformat(),
             total_duration_ms=total_duration_ms,
@@ -309,11 +361,29 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
 
     total_duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+
+    if not ai_enabled and (judge_result is None or judge_result.grounded is not None):
+        # Belt-and-suspenders: whichever path led here (coordinator failure inside the
+        # graph, an OllamaError before/around the graph, or any other unexpected
+        # exception), there was no AI synthesis for a judge to evaluate. Guarantee a
+        # single, consistent NOT_RUN verdict rather than relying on every call site to
+        # get this right independently.
+        judge_result = JudgeVerdict(
+            grounded=None,
+            notes="No AI synthesis was produced, so groundedness was not evaluated.",
+        )
+
     report = _build_report(
         pr, heuristic_result, ai_result, rag_context, state,
         repo_loaded_ms, repo_context_ms, ai_enabled, judge_result,
         total_duration_ms,
     )
+    policy_note = ""
+    if not ai_enabled:
+        policy_note = (
+            "AI synthesis unavailable. Final release decision was produced by the deterministic policy engine."
+        )
+
     response = AnalyzeResponse(
         pr=pr,
         heuristics=heuristic_result,
@@ -324,6 +394,7 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         rag=rag_context,
         judge=judge_result,
         source="live",
+        policy_note=policy_note,
     )
     try:
         history.record_analysis(response)

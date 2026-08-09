@@ -1,5 +1,58 @@
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH";
 
+export type ReleaseDecision = "ALLOW" | "NEEDS_REVIEW" | "BLOCK";
+
+export interface LLMDisagreement {
+  detected: boolean;
+  deterministic_risk: RiskLevel;
+  llm_risk?: RiskLevel | null;
+  final_risk: RiskLevel;
+  direction?: string | null;
+  reason: string;
+}
+
+export interface ReviewComplexityResult {
+  score: number;
+  level: RiskLevel;
+  drivers: string[];
+}
+
+export interface ReviewQueueItem {
+  priority: string;
+  filename: string;
+  role: string;
+  why_it_matters: string;
+  potential_regression: string;
+  suggested_validation: string;
+  estimated_minutes: number;
+}
+
+export interface SpecialistRoutingEntry {
+  domain: string;
+  label: string;
+  status: string;
+  trigger: string;
+  files_count: number;
+  duration_ms: number;
+  llm_call_made: boolean;
+  files: string[];
+}
+
+export interface GoldenTestEntry {
+  id: string;
+  name: string;
+  passed: boolean;
+  expected: string;
+  actual: string;
+}
+
+export interface GoldenTestsResponse {
+  title: string;
+  passed: number;
+  total: number;
+  tests: GoldenTestEntry[];
+}
+
 export interface ChangedFile {
   filename: string;
   status: string;
@@ -39,6 +92,7 @@ export interface HeuristicResult {
   tests_touched: boolean;
   tests_deleted: boolean;
   migration_touched: boolean;
+  review_signals?: HeuristicFactor[];
 }
 
 export interface FileRisk {
@@ -283,6 +337,11 @@ export interface RepositoryHealth {
 
 export interface RiskReport {
   decision: string;
+  release_risk?: RiskLevel;
+  review_complexity?: ReviewComplexityResult | null;
+  llm_disagreement?: LLMDisagreement | null;
+  specialist_routing?: SpecialistRoutingEntry[];
+  review_queue?: ReviewQueueItem[];
   risk_score: number;
   confidence: number;
   deployment_strategy: string;
@@ -338,6 +397,7 @@ export interface AnalyzeResponse {
   rag: RAGContext;
   judge?: JudgeVerdict | null;
   source: "live" | "demo";
+  policy_note?: string;
 }
 
 export interface DemoSummary {

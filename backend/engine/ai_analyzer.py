@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .models import AIAnalysis, FileRisk, HeuristicResult, PullRequestData, RiskFactorFlag, RiskLevel
 from .ollama_client import OllamaError, chat_json
+from .policy import classify_release_risk
 
 MAX_FILES_IN_PROMPT = 12
 MAX_PATCH_CHARS = 600
@@ -138,12 +139,7 @@ def analyze_with_heuristics_only(
     pr: PullRequestData, heuristics: HeuristicResult, reason: str = ""
 ) -> AIAnalysis:
     """Fallback used when Ollama isn't reachable/configured, so the app still works end to end."""
-    if heuristics.score >= 60:
-        risk = RiskLevel.HIGH
-    elif heuristics.score >= 30:
-        risk = RiskLevel.MEDIUM
-    else:
-        risk = RiskLevel.LOW
+    risk = classify_release_risk(heuristics.score)
 
     triggered = [f for f in heuristics.factors if f.triggered]
     top_files = sorted(pr.files, key=lambda f: f.changes, reverse=True)[:5]

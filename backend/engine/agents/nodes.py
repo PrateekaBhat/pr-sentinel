@@ -5,7 +5,8 @@ import json
 import logging
 import time
 
-from .. import agent_routing
+from .. import agent_routing, finding_validation
+from ..config import get_settings
 from ..models import (
     AgentFinding,
     AIAnalysis,
@@ -15,6 +16,7 @@ from ..models import (
     RiskLevel,
 )
 from ..ollama_client import OllamaError, chat_json
+from ..categories import clean_finding_text, reconcile_executive_summary
 from .prompts import (
     AGENT_RESPONSE_INSTRUCTIONS,
     AGENT_SYSTEM_PROMPTS,
@@ -25,19 +27,47 @@ from .state import AgentState
 
 logger = logging.getLogger("pr_sentinel.agents")
 
-MAX_PATCH_CHARS = 600
-MAX_PATCH_LINES = 30
-MAX_FILES_PER_AGENT = 4
+# Sourced from Settings (backend/engine/config.py) so these are configurable via env
+# vars (MAX_PATCH_CHARS / MAX_PATCH_LINES / MAX_FILES_PER_AGENT) without changing the
+# previous effective defaults (600 / 30 / 4).
+_settings = get_settings()
+MAX_PATCH_CHARS = _settings.max_patch_chars
+MAX_PATCH_LINES = _settings.max_patch_lines
+MAX_FILES_PER_AGENT = _settings.max_files_per_agent
 
 
 def _files_prompt(files) -> str:
-    parts = []
-    for f in files[:MAX_FILES_PER_AGENT]:
-        patch_lines = (f.patch or "").splitlines()[:MAX_PATCH_LINES]
+    total_files = len(files)
+    shown_files = files[:MAX_FILES_PER_AGENT]
+    parts = [
+        f"{total_files} file(s) are in this agent's scope; {len(shown_files)} are shown below."
+    ]
+    for f in shown_files:
+        all_patch_lines = (f.patch or "").splitlines()
+        patch_lines = all_patch_lines[:MAX_PATCH_LINES]
         patch = "\n".join(patch_lines)[:MAX_PATCH_CHARS]
-        parts.append(f"### {f.filename} ({f.status}, +{f.additions}/-{f.deletions})\n```diff\n{patch}\n```")
-    if len(files) > MAX_FILES_PER_AGENT:
-        parts.append(f"... and {len(files) - MAX_FILES_PER_AGENT} more files not shown.")
+        truncated_by_lines = len(all_patch_lines) > MAX_PATCH_LINES
+        truncated_by_chars = len("\n".join(patch_lines)) > MAX_PATCH_CHARS
+        if truncated_by_lines:
+            truncation_note = (
+                f"(showing {len(patch_lines)} of {len(all_patch_lines)} patch lines — TRUNCATED)"
+            )
+        elif truncated_by_chars:
+            truncation_note = "(patch text TRUNCATED to a character limit)"
+        else:
+            truncation_note = "(full patch shown)"
+        parts.append(
+            f"### {f.filename} ({f.status}, +{f.additions}/-{f.deletions}) {truncation_note}\n"
+            f"```diff\n{patch}\n```"
+        )
+    if total_files > MAX_FILES_PER_AGENT:
+        parts.append(
+            f"... and {total_files - MAX_FILES_PER_AGENT} more file(s) in scope that are NOT shown at all."
+        )
+    parts.append(
+        "\nDo not infer behavior from code that was not shown. If the provided patch is "
+        "truncated, lower confidence and describe only what the provided evidence supports."
+    )
     return "\n".join(parts)
 
 
@@ -69,17 +99,47 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             },
         }
 
+    # Rank the domain-matched files so the most useful evidence is selected first,
+    # then cap to MAX_FILES_PER_AGENT — this is what's actually sent to the LLM.
+    # `files_reviewed` below must only ever list files that were truly shown.
+    ranked_files = agent_routing.rank_files_for_domain(files, domain)
+    available_count = len(ranked_files)
+    selected_files = ranked_files[:MAX_FILES_PER_AGENT]
+    context_bounded = available_count > len(selected_files)
+
     start = time.perf_counter_ns()
     try:
         system = AGENT_SYSTEM_PROMPTS[domain]
-        user = f"## Files in scope\n{_files_prompt(files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
+        user = f"## Files in scope\n{_files_prompt(ranked_files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
         data = await chat_json(system, user, timeout=120.0)
-        findings = [str(x) for x in (data.get("findings") or [])][:4]
-        risk_note = str(data.get("risk_note", ""))
+        raw_findings = (data.get("findings") or [])[:4]
+        # Clean placeholder/template artifacts before structural validation so a
+        # stripped placeholder doesn't itself trigger a truncation false-positive.
+        cleaned_raw = []
+        for raw in raw_findings:
+            if isinstance(raw, dict):
+                cleaned_raw.append(
+                    {k: (clean_finding_text(v) if isinstance(v, str) else v) for k, v in raw.items()}
+                )
+            else:
+                cleaned_raw.append(clean_finding_text(str(raw)))
+        structured, needs_verification, rejected_count = finding_validation.normalize_findings(cleaned_raw)
+        # `structured_findings` (built above) is the authoritative, validated source.
+        # `findings` is populated here ONLY as a derived compatibility projection —
+        # titles of the already-validated structured findings — and must never be
+        # populated from raw model output directly. Downstream code (coordinator
+        # prompt, report renderer, executive-summary reconciliation) reads from
+        # `structured_findings`; this projection exists solely for callers/serializers
+        # that still expect a flat string list.
+        findings = [f.title for f in structured]
+        risk_note = clean_finding_text(str(data.get("risk_note", "")))
         confidence = int(data.get("confidence", 60))
     except OllamaError as exc:
         logger.warning("%s agent failed: %s", domain, exc)
         findings = []
+        structured = []
+        needs_verification = []
+        rejected_count = 0
         risk_note = f"Agent call failed ({exc}); files were not analyzed by AI for this domain."
         confidence = 0
     duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
@@ -89,8 +149,11 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             agent=domain,
             label=label,
             applicable=True,
-            files_reviewed=[f.filename for f in files],
+            files_reviewed=[f.filename for f in selected_files],
             findings=findings,
+            structured_findings=structured,
+            needs_verification=needs_verification,
+            rejected_count=rejected_count,
             risk_note=risk_note,
             confidence=confidence,
         ),
@@ -98,8 +161,10 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             "agent": domain,
             "label": label,
             "status": "Completed",
-            "files_reviewed": len(files),
+            "files_reviewed": len(selected_files),
             "duration_ms": duration_ms,
+            "files_available": available_count,
+            "context_bounded": context_bounded,
         },
     }
 
@@ -128,11 +193,22 @@ def _build_coordinator_prompt(state: AgentState) -> str:
         if not finding.applicable:
             agent_lines.append(f"- {finding.label}: not applicable ({finding.risk_note})")
             continue
-        findings_text = "; ".join(finding.findings) if finding.findings else "no concerns raised"
+        if finding.structured_findings:
+            detail_lines = []
+            for sf in finding.structured_findings:
+                detail_lines.append(
+                    f"    * [{sf.severity}/{sf.confidence}] {sf.title} — evidence: {sf.evidence}"
+                )
+            findings_text = "no concerns raised" if not detail_lines else "\n" + "\n".join(detail_lines)
+        else:
+            findings_text = "no concerns raised"
         agent_lines.append(
             f"- {finding.label} (reviewed {len(finding.files_reviewed)} file(s)): "
             f"{findings_text}. Risk note: {finding.risk_note}"
         )
+        if finding.needs_verification:
+            low_conf = "; ".join(sf.title for sf in finding.needs_verification)
+            agent_lines.append(f"    (also reported, LOW confidence, needs verification: {low_conf})")
 
     heuristic_lines = [
         f"- {f.label}: {'TRIGGERED' if f.triggered else 'not triggered'} ({f.reason})"
@@ -221,11 +297,15 @@ async def coordinator_node(state: AgentState) -> dict:
         else:
             strategy = "Standard"
 
+    exec_summary = reconcile_executive_summary(
+        data.get("executive_summary") or data.get("summary", ""), agent_findings
+    )
+
     result = AIAnalysis(
         overall_risk=overall_risk,
         confidence=int(data.get("confidence", 60)),
         summary=data.get("summary", ""),
-        executive_summary=data.get("executive_summary") or data.get("summary", ""),
+        executive_summary=exec_summary,
         architectural_impact=data.get("architectural_impact", ""),
         affected_subsystems=[str(x) for x in (data.get("affected_subsystems") or [])],
         operational_risks=data.get("operational_risks", []) or [],
@@ -248,7 +328,15 @@ async def judge_node(state: AgentState) -> dict:
     it just means no groundedness verdict is attached to the response."""
     coordinator_result = state.get("coordinator_result")
     if coordinator_result is None:
-        return {"judge_result": JudgeVerdict(grounded=True, notes="Coordinator produced no output to judge.")}
+        # No AI synthesis was produced (the coordinator failed/timed out), so there is
+        # nothing for the judge to evaluate. This must NOT be reported as "grounded" —
+        # grounded=None means "not run", distinct from a passed or failed check.
+        return {
+            "judge_result": JudgeVerdict(
+                grounded=None,
+                notes="No AI synthesis was produced, so groundedness was not evaluated.",
+            )
+        }
 
     evidence = _build_coordinator_prompt(state)
     report_json = json.dumps(coordinator_result.model_dump(), default=str)[:4000]
@@ -261,10 +349,17 @@ async def judge_node(state: AgentState) -> dict:
             timeout=120.0,
         )
         duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+        issues = [str(x) for x in (data.get("issues") or [])][:5]
+        # Don't blindly trust the model's self-reported "grounded" flag — if it also
+        # listed issues, that's a self-contradiction (it found something ungrounded but
+        # still called the report grounded). Force grounded=False whenever there are
+        # issues, deterministically, rather than let the LLM's inconsistency propagate
+        # into the report's Evidence Confidence score.
+        grounded = bool(data.get("grounded", True)) and not issues
         return {
             "judge_result": JudgeVerdict(
-                grounded=bool(data.get("grounded", True)),
-                issues=[str(x) for x in (data.get("issues") or [])][:5],
+                grounded=grounded,
+                issues=issues,
                 notes=str(data.get("notes", "")),
             ),
             "judge_duration_ms": duration_ms,

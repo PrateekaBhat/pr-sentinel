@@ -1,4 +1,4 @@
-import type { AnalyzeResponse, DemoSummary, HistoryEntry, RepositoryHealth } from "../types";
+import type { AnalyzeResponse, DemoSummary, GoldenTestsResponse, HistoryEntry, RepositoryHealth } from "../types";
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -44,6 +44,11 @@ export async function fetchHistory(params: { limit?: number; repository?: string
   const qs = search.toString();
   const res = await fetch(`${BASE_URL}/api/history${qs ? `?${qs}` : ""}`);
   return handleResponse<HistoryEntry[]>(res);
+}
+
+export async function fetchGoldenTests(): Promise<GoldenTestsResponse> {
+  const res = await fetch(`${BASE_URL}/api/golden-tests`);
+  return handleResponse<GoldenTestsResponse>(res);
 }
 
 export async function fetchRepositoryHealth(params: { repository?: string; window?: number } = {}): Promise<RepositoryHealth> {

@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
@@ -25,16 +29,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install backend dependencies
+      - name: Install backend dev dependencies
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run deterministic backend tests
+        working-directory: backend
+        run: |
+          python -m pytest engine/tests -q
 
       - name: Start Ollama
         run: |
-          docker pull ollama/ollama:latest
-          docker run -d --name pr-sentinel-ollama -p 11434:11434 ollama/ollama:latest
+          docker pull ollama/ollama:0.5.4
+          docker run -d --name pr-sentinel-ollama -p 11434:11434 ollama/ollama:0.5.4
           for i in $(seq 1 30); do
             if curl -sSf http://localhost:11434/v1/models > /dev/null 2>&1; then
               echo "Ollama ready"
@@ -65,25 +74,32 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p reports
+          set +e
           python backend/cli.py analyze \
             --repo "${GITHUB_REPOSITORY}" \
             --pr "${{ github.event.pull_request.number }}" \
             --output reports/report.json \
             --comment reports/report.md \
             --token "${{ secrets.GITHUB_TOKEN }}"
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit_code=$?
+          set -e
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
 
       - name: Read report markdown
         id: report
         if: always()
         run: |
-          echo "report_body<<EOF" >> "$GITHUB_OUTPUT"
-          if [ -f reports/report.md ]; then
-            cat reports/report.md
-          else
-            echo "No report generated."
-          fi
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          delimiter="EOF_$(openssl rand -hex 12)"
+          {
+            echo "report_body<<${delimiter}"
+            if [ -s reports/report.md ]; then
+              cat reports/report.md
+              echo
+            else
+              echo "No report generated (analysis step failed or produced an empty report)."
+            fi
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload report artifacts
         if: always()
@@ -99,13 +115,25 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           issue-number: ${{ github.event.pull_request.number }}
-          body-path: reports/report.md
+          body: ${{ steps.report.outputs.report_body || 'No report generated (analysis step failed or produced an empty report).' }}
 
-      - name: Fail if blocked
-        if: ${{ steps.analyze.outputs.exit_code == '1' }}
+      - name: Enforce analysis result
+        if: always()
         run: |
-          echo "PR Sentinel returned BLOCK; failing workflow."
-          exit 1
+          exit_code="${{ steps.analyze.outputs.exit_code }}"
+          case "${exit_code}" in
+            0)
+              echo "Analysis completed successfully; deterministic policy allowed the PR to proceed."
+              ;;
+            1)
+              echo "PR Sentinel returned BLOCK; failing workflow intentionally."
+              exit 1
+              ;;
+            *)
+              echo "PR Sentinel analysis failed unexpectedly (exit code ${exit_code}); failing workflow."
+              exit 1
+              ;;
+          esac
 
       - name: Stop Ollama
         if: always()
