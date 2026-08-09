@@ -15,7 +15,7 @@ Final report
   deterministic decision  +  AI narrative and specialist findings
 ```
 
-The two paths run independently from the same PR data and never feed into each other for the purpose of the decision — the deterministic path is the only source of `ALLOW` / `NEEDS_REVIEW` / `BLOCK`. The AI path's output is attached to the report as supporting evidence and explanation.
+The two paths are independent **with respect to release-decision authority** and run from the same PR data. The AI path may receive deterministic heuristic findings as context for its explanation, but it can never feed back into or override the release decision — the deterministic path is the only source of `ALLOW` / `NEEDS_REVIEW` / `BLOCK`. The AI path's output is attached to the report as supporting evidence and explanation.
 
 ---
 
@@ -29,21 +29,21 @@ PR Sentinel separates the two: a rule-based engine computes risk and the release
 
 ## At a glance
 
-| Capability | Implementation |
-|---|---|
-| Release decision | Deterministic policy engine (`engine/policy.py`) |
-| Risk scoring | Weighted regex rules over changed files (`engine/heuristics.py`) |
-| AI analysis | LangGraph specialist agents + coordinator (`engine/agents/`) |
-| Repository context | RAG over repository docs (`engine/rag/`) |
-| Vector store | ChromaDB, persisted locally, one collection per repo/branch |
-| Embeddings | `nomic-embed-text` via Ollama |
-| Default LLM | Ollama (`llama3.2` by default) |
-| Hosted LLMs | Not implemented — Ollama is the only supported backend |
-| Backend | FastAPI + Pydantic v2 |
-| Dashboard | React 18 + TypeScript, Vite, Tailwind |
-| CLI | `backend/cli.py` (Python, argparse) |
-| CI/CD | GitHub Actions, self-contained (starts Ollama in the runner) |
-| Analysis history | SQLite (`engine/history.py`) |
+| Capability         | Implementation                                                      |
+| ------------------ | ------------------------------------------------------------------- |
+| Release decision   | Deterministic policy engine (`engine/policy.py`)                    |
+| Risk scoring       | Weighted regex rules over changed files (`engine/heuristics.py`)    |
+| AI analysis        | LangGraph specialist agents + coordinator (`engine/agents/`)        |
+| Repository context | RAG over repository docs (`engine/rag/`)                            |
+| Vector store       | ChromaDB, persisted locally, one collection per repo/default branch |
+| Embeddings         | `nomic-embed-text` via Ollama                                       |
+| Default LLM        | Ollama (`llama3.2` by default)                                      |
+| Hosted LLMs        | Not implemented — Ollama is the only supported backend              |
+| Backend            | FastAPI + Pydantic v2                                               |
+| Dashboard          | React 18 + TypeScript, Vite, Tailwind                               |
+| CLI                | `backend/cli.py` (Python, argparse)                                 |
+| CI/CD              | GitHub Actions, self-contained (starts Ollama in the runner)        |
+| Analysis history   | SQLite (`engine/history.py`)                                        |
 
 ---
 
@@ -58,7 +58,7 @@ flowchart TD
     GH --> DOCS[Repository docs: README, /docs, ADRs]
 
     DOCS --> EMBED[nomic-embed-text embeddings]
-    EMBED --> CHROMA[(ChromaDB, per repo+branch)]
+    EMBED --> CHROMA[(ChromaDB, per repo+default branch)]
     META --> QUERY[Retrieval query from PR title/files]
     CHROMA --> QUERY
     QUERY --> RAGCTX[Top-k retrieved doc chunks]
@@ -94,12 +94,12 @@ flowchart TD
 
 What talks to what:
 
-- **GitHub REST API** supplies PR metadata, the diff, and the repository's file tree — the only external data source.
-- **Deterministic risk engine** (`engine/heuristics.py`, `engine/policy.py`) turns changed files into a risk score and a release decision, independent of everything below it.
-- **RAG** (`engine/rag/`) turns the repository's own docs into retrievable context so specialist prompts aren't reasoning over an isolated diff.
-- **LangGraph specialists** (`engine/agent_routing.py`, `engine/agents/`) are routed deterministically by file path, then call Ollama to produce domain-specific observations.
-- **Coordinator and judge** (`engine/agents/nodes.py`) synthesize those observations into a narrative and check it against the evidence it was given.
-- **CLI, FastAPI backend, and GitHub Actions** all call the same `analyze_pr()` entry point (`engine/service.py`) and render the same report.
+* **GitHub REST API** supplies PR metadata, the diff, and the repository's file tree — the only external data source.
+* **Deterministic risk engine** (`engine/heuristics.py`, `engine/policy.py`) turns changed files into a risk score and a release decision, independent of everything below it.
+* **RAG** (`engine/rag/`) turns the repository's own docs into retrievable context so specialist prompts aren't reasoning over an isolated diff.
+* **LangGraph specialists** (`engine/agent_routing.py`, `engine/agents/`) are routed deterministically by file path, then call Ollama to produce domain-specific observations.
+* **Coordinator and judge** (`engine/agents/nodes.py`) synthesize those observations into a narrative and check it against the evidence it was given.
+* **CLI, FastAPI backend, and GitHub Actions** all call the same `analyze_pr()` entry point (`engine/service.py`) and render the same report.
 
 ---
 
@@ -109,15 +109,15 @@ What talks to what:
 
 `heuristics.analyze()` runs a fixed set of weighted, regex-based rules against a PR's changed files — for example, files under `auth/`, `login/`, or `session/` add 40 points; `payment/`, `billing/`, or `stripe/` add 45; a detected database migration adds 35; deleted test files add 25 (see `engine/heuristics.py` for the full rule set). The resulting 0–100 score is mapped to a release risk band and decision in `engine/policy.py`:
 
-| Risk score | Release risk | Decision |
-|---|---|---|
-| `< 30` | LOW | `ALLOW` |
-| `30–59` | MEDIUM | `NEEDS_REVIEW` |
-| `>= 60` | HIGH | `BLOCK` |
+| Risk score | Release risk | Decision       |
+| ---------- | ------------ | -------------- |
+| `< 30`     | LOW          | `ALLOW`        |
+| `30–59`    | MEDIUM       | `NEEDS_REVIEW` |
+| `>= 60`    | HIGH         | `BLOCK`        |
 
 This mapping is the **only** thing that determines `decision`. The CLI's exit code and the GitHub Actions pass/fail status are both derived from this field, never from anything the AI layer produces.
 
-A separate, independently deterministic score — **review complexity** (`engine/review_complexity.py`) — estimates how much human review effort a PR requires (lines changed, files touched, subsystem spread, backend/frontend crossover, dependency churn), on the premise that review burden and release risk are different questions: a large documentation refactor can be high-complexity but low-risk. A **production readiness score** (`engine/metrics.py`) is likewise computed deterministically as 100 minus point deductions for concrete gaps (risk score, low confidence, missing tests) — it is arithmetic over already-computed numbers, not a model judgment.
+A separate, independently deterministic score — **review complexity** (`engine/review_complexity.py`) — estimates how much human review effort a PR requires (lines changed, files touched, subsystem spread, backend/frontend crossover, dependency churn), on the premise that review burden and release risk are different questions: a large documentation refactor can be high-complexity but low-risk. A **production readiness score** (`engine/metrics.py`) is likewise computed deterministically from already-computed numbers, starting at 100 and applying arithmetic deductions for concrete readiness gaps such as risk, below-target confidence, missing tests, deployment complexity, documentation gaps, secrets, and dependency churn — it is not a model judgment.
 
 `audit_llm_disagreement()` (`engine/policy.py`) separately compares the coordinator's own `overall_risk` read against the deterministic band and records the divergence on the report (`llm_disagreement`, with a direction: optimistic or pessimistic) purely for visibility — it never changes the release risk or decision.
 
@@ -125,12 +125,12 @@ A separate, independently deterministic score — **review complexity** (`engine
 
 Provides, and only provides:
 
-- specialist-level findings (security, database, performance, API, tests)
-- the report's narrative summary and architectural-impact description
-- a rollout-strategy recommendation (Standard / Canary / Blue-Green / Manual Approval)
-- a groundedness verdict on its own narrative
+* specialist-level findings (security, database, performance, API, tests)
+* the report's narrative summary and architectural-impact description
+* a rollout-strategy recommendation (Standard / Canary / Blue-Green / Manual Approval)
+* a groundedness verdict on its own narrative
 
-If the AI layer is unavailable, all deterministic outputs above — release risk, decision, review complexity, production readiness — are still computed and returned; only the narrative and specialist findings are replaced with a heuristics-only summary (see [AI failure and fallback behavior](#ai-failure-and-fallback-behavior)).
+If the AI layer is unavailable, all deterministic outputs above — release risk, decision, review complexity, production readiness — are still computed and returned. The narrative falls back to a heuristics-only summary, while any specialist findings that were successfully computed remain attached to the report; failed specialists are recorded with their failure note rather than being treated as successful findings (see [AI failure and fallback behavior](#ai-failure-and-fallback-behavior)).
 
 ---
 
@@ -139,7 +139,7 @@ If the AI layer is unavailable, all deterministic outputs above — release risk
 RAG exists because specialist and coordinator prompts should reason about a PR in the context of the repository's own documented architecture and conventions, rather than only seeing an isolated diff.
 
 ```text
-Repository documentation (README, CONTRIBUTING, SECURITY, docs/, ADRs)
+Repository documentation (README, CONTRIBUTING, SECURITY, architecture/design docs, docs/, ADRs)
         ↓
 doc_fetcher.py — selects doc-like paths from the default branch, skips vendored/build dirs
         ↓
@@ -147,19 +147,19 @@ store.py — chunks each doc (800 chars, 100-char overlap)
         ↓
 Ollama nomic-embed-text — embeds each chunk
         ↓
-ChromaDB — persisted locally, one collection per (repo, branch)
+ChromaDB — persisted locally, one collection per repository/default branch
         ↓
 Similarity query built from PR title, labels, and changed filenames
         ↓
 Top-k chunks retrieved (RAG_TOP_K, default 5)
         ↓
-Included verbatim in the coordinator's prompt
+Retrieved snippets included in the coordinator's prompt
 ```
 
-- Up to `RAG_MAX_DOC_FILES` (default 12) doc files are indexed, each truncated to `RAG_MAX_DOC_CHARS` (default 4000) characters.
-- If a ChromaDB collection already exists for a given repo/branch, indexing is skipped and the existing index is queried directly — this is the "cache hit" reported in `execution_metrics.rag_cache_hit`.
-- Both the embedding model and the vector store run locally; no repository content is sent to a third party as part of RAG.
-- If no doc files are found, or the embedding call fails, RAG is skipped and the reason is recorded on the report (`rag.skip_reason`); the rest of the pipeline continues.
+* Up to `RAG_MAX_DOC_FILES` (default 12) doc files are indexed, each truncated to `RAG_MAX_DOC_CHARS` (default 4000) characters.
+* The index is built from the repository's **default branch**. If a ChromaDB collection already exists for that repository/default branch, indexing is skipped and the existing index is queried directly — this is the "cache hit" reported in `execution_metrics.rag_cache_hit`.
+* Both the embedding model and the vector store run locally; no repository content is sent to a third party as part of RAG.
+* If no doc files are found, or the embedding call fails, RAG is skipped and the reason is recorded on the report (`rag.skip_reason`); the rest of the pipeline continues.
 
 RAG surfaces what a repository has actually documented — it does not infer undocumented conventions, and retrieval can miss relevant context if the repository's docs don't cover it.
 
@@ -169,28 +169,25 @@ RAG surfaces what a repository has actually documented — it does not infer und
 
 LangGraph orchestrates role-specific LLM reviewers behind deterministic file/domain routing — the graph itself (`engine/agents/graph.py`) is a `StateGraph` with five specialist nodes running in parallel from `START`, all feeding a `coordinator` node, followed by a `judge` node before `END`. Which specialists actually run is decided entirely by regex matching against changed file paths (`engine/agent_routing.py`), with no LLM involved in that decision.
 
-| Specialist | Trigger (path pattern, examples) | Purpose |
-|---|---|---|
-| Security | `auth/`, `login/`, `session/`, `payment/`, `stripe/` | Auth, secrets, payment-path changes |
-| Database | `alembic/`, `migrations/`, `*.sql`, `prisma/`, `entity/`, `repository/` | Schema/migration and persistence-layer risk |
-| Performance | `cache/`, `redis/`, `queue/`, `worker/`, `benchmark/` | Hot paths, resource use |
-| API Compatibility | `routes?/`, `controllers?/`, `api/`, `graphql/`, `endpoints?/` | Endpoint additions/removals, contract compatibility |
-| Test Coverage | `tests?/`, `__tests__/`, `*.test.*`, `*.spec.*` | Missing coverage, deleted tests |
+| Specialist        | Trigger (path pattern, examples)                                        | Purpose                                             |
+| ----------------- | ----------------------------------------------------------------------- | --------------------------------------------------- |
+| Security          | `auth/`, `login/`, `session/`, `payment/`, `stripe/`                    | Auth, secrets, payment-path changes                 |
+| Database          | `alembic/`, `migrations/`, `*.sql`, `prisma/`, `entity/`, `repository/` | Schema/migration and persistence-layer risk         |
+| Performance       | `cache/`, `redis/`, `queue/`, `worker/`, `benchmark/`                   | Hot paths, resource use                             |
+| API Compatibility | `routes?/`, `controllers?/`, `api/`, `graphql/`, `endpoints?/`          | Endpoint additions/removals, contract compatibility |
+| Test Coverage     | `tests?/`, `__tests__/`, `*.test.*`, `*.spec.*`                         | Missing coverage, deleted tests                     |
 
 If a PR touches no files matching a domain, that specialist is skipped — no LLM call is made, and the report marks it `Skipped` rather than returning an empty result. Files shown to each specialist are ranked and capped (see [Context bounding](#context-bounding-and-large-prs)), and each specialist's output is validated against the evidence it was actually given before being included in the report.
 
-The **coordinator** receives every specialist's findings, the deterministic heuristic factors, and the retrieved RAG chunks, and produces the narrative, rollout strategy, and risk-factor list. If it fails, its error is recorded and the specialists' already-computed findings are still included in the report. A **judge** then re-checks the coordinator's narrative against the same evidence and returns a groundedness verdict — a quality check on the explanation, not a second vote on the release decision.
+The **coordinator** receives every specialist's findings, the deterministic heuristic factors, and the retrieved RAG context, and produces the narrative, rollout strategy, and risk-factor list. If it fails, its error is recorded and the specialists' already-computed findings are still included in the report. A **judge** then re-checks the coordinator's narrative against the same evidence and returns a groundedness verdict — a quality check on the explanation, not a second vote on the release decision.
 
-<details>
-<summary>Implementation details: ranking, validation, and the judge's conflict rule</summary>
+### Implementation details: ranking, validation, and the judge's conflict rule
 
-Matched files are ranked deterministically before being capped to the per-agent file limit — by keyword strength in the filename, then lines changed, then patch size (`agent_routing.rank_files_for_domain`). The report distinguishes files actually reviewed from files matched but not shown.
+Matched files are ranked deterministically before being capped to the per-agent file limit — by keyword strength in the filename, then filename keyword presence, then lines changed, then patch size (`agent_routing.rank_files_for_domain`). The report distinguishes files actually reviewed from files matched but not shown.
 
 Each specialist's raw JSON output is passed through `finding_validation.py`, which checks findings against the evidence it was actually given and demotes anything unverifiable to a separate `needs_verification` list instead of dropping it or presenting it with equal confidence.
 
 The judge returns `grounded: true/false/null` plus any issues found (`null` = not evaluated, e.g. no synthesis to check, or `ENABLE_JUDGE=false`). If the judge reports issues but also claims `grounded: true`, the code forces `grounded: false` — the self-reported flag is not trusted over the issues list in the same response.
-
-</details>
 
 ---
 
@@ -198,8 +195,8 @@ The judge returns `grounded: true/false/null` plus any issues found (`null` = no
 
 Local CPU inference makes prompt size a real constraint, so each specialist's context is explicitly bounded even though the deterministic engine evaluates the complete diff:
 
-- `MAX_FILES_PER_AGENT` (default 4) — files shown to a single specialist, after ranking
-- `MAX_PATCH_LINES` (default 30) and `MAX_PATCH_CHARS` (default 600) — per-file patch truncation
+* `MAX_FILES_PER_AGENT` (default 4) — files shown to a single specialist, after ranking
+* `MAX_PATCH_LINES` (default 30) and `MAX_PATCH_CHARS` (default 600) — per-file patch truncation
 
 All three are configurable and read from `Settings` (`engine/config.py`). When a specialist's matched files exceed these limits, its prompt is told explicitly how many files/lines were withheld, and the report records `context_bounded: true` alongside the true count of files available versus files actually reviewed for that agent — the gap between "available" and "shown" is surfaced in the output rather than absorbed silently.
 
@@ -213,13 +210,13 @@ Bounding context makes local inference more predictable, but it does mean a spec
 
 Ollama is the only inference backend currently implemented (`engine/ollama_client.py`), for both chat completions and embeddings, and is the default local/private execution path — no repository content or PR data is sent externally when using it.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server address |
-| `OLLAMA_MODEL` | `llama3.2` | Chat model for specialists, coordinator, judge |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model for RAG |
+| Variable             | Default                  | Purpose                                        |
+| -------------------- | ------------------------ | ---------------------------------------------- |
+| `OLLAMA_BASE_URL`    | `http://localhost:11434` | Ollama server address                          |
+| `OLLAMA_MODEL`       | `llama3.2`               | Chat model for specialists, coordinator, judge |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text`       | Embedding model for RAG                        |
 
-`.env.example` notes `llama3.1` (8B) as a stronger speed/quality balance with a GPU, versus the faster, CPU-friendly `llama3.2` (3B) used as the default and in CI.
+`.env.example` sets `llama3.2` as the current default and also lists `llama3.1` (8B) as a stronger speed/quality balance, with larger models requiring more capable hardware. `llama3.2` is used as the CPU-friendly default and in CI.
 
 ### Hosted providers
 
@@ -231,10 +228,10 @@ Not currently supported. There is no API-key configuration in `Settings`, and no
 
 Every AI-dependent stage is wrapped so a failure there degrades the report rather than crashing the pipeline:
 
-- **A specialist's** LLM call fails → that agent's finding is recorded with an explanatory `risk_note` and zero confidence; other specialists are unaffected.
-- **The coordinator** fails → its error is captured and the pipeline falls back to `analyze_with_heuristics_only()`, which builds the narrative directly from deterministic factors; the response is flagged `ai_enabled: false` and the executive summary is prefixed with *"AI synthesis unavailable. Final release decision was produced by the deterministic policy engine."*
-- **The judge** fails or is disabled → `grounded` is `null` ("not evaluated"), never silently reported as passing.
-- **RAG** fails (embedding call down, no docs found) → analysis continues without repository context, with the reason recorded on the report.
+* **A specialist's** LLM call fails → that agent's finding is recorded with an explanatory `risk_note` and zero confidence; other specialists are unaffected.
+* **The coordinator** fails → its error is captured and the pipeline falls back to `analyze_with_heuristics_only()`, which builds the narrative directly from deterministic factors. Specialist findings that were successfully computed remain in the report, while the response is flagged `ai_enabled: false` and the executive summary is prefixed with *"AI synthesis unavailable. Final release decision was produced by the deterministic policy engine."*
+* **The judge** fails or is disabled → `grounded` is `null` ("not evaluated"), never silently reported as passing.
+* **RAG** fails (embedding call down, no docs found) → analysis continues without repository context, with the reason recorded on the report.
 
 In every case, release risk, review complexity, production readiness, and the `ALLOW`/`NEEDS_REVIEW`/`BLOCK` decision are still computed — AI availability is never a precondition for getting a decision.
 
@@ -254,8 +251,8 @@ Deterministic engine detects "Public API contract changed" and
             ↓
 Score mapped to release risk + decision (policy.py)
             ↓
-Path routing selects the API and Performance/Security specialists as applicable
-(others are skipped if no matching files)
+Path routing selects the API specialist;
+other specialists run only if changed paths match their domains
             ↓
 Repository docs relevant to the PR are retrieved via RAG
             ↓
@@ -283,13 +280,13 @@ python backend/cli.py analyze \
   --token "$GITHUB_TOKEN"
 ```
 
-| Flag | Required | Description |
-|---|---|---|
-| `--repo` | yes | `owner/repo` |
-| `--pr` | yes | Pull request number |
-| `--output` | no | JSON report path, or `-` for stdout (default) |
-| `--comment` | no | Path to write a Markdown summary suitable for a PR comment |
-| `--token` | no | GitHub token; falls back to the `GITHUB_TOKEN` environment variable |
+| Flag        | Required | Description                                                         |
+| ----------- | -------- | ------------------------------------------------------------------- |
+| `--repo`    | yes      | `owner/repo`                                                        |
+| `--pr`      | yes      | Pull request number                                                 |
+| `--output`  | no       | JSON report path, or `-` for stdout (default)                       |
+| `--comment` | no       | Path to write a Markdown summary suitable for a PR comment          |
+| `--token`   | no       | GitHub token; falls back to the `GITHUB_TOKEN` environment variable |
 
 Exit codes: `0` (`ALLOW`/`NEEDS_REVIEW`), `1` (`BLOCK`), `2` (analysis error). If `--comment` is set and the run raises an exception, a short Markdown file explaining the failure is still written, so a CI comment step never posts nothing.
 
@@ -339,9 +336,9 @@ The final step is explicit about the distinction: exit `0` passes the workflow (
 
 ### Prerequisites
 
-- Python 3.12
-- Node.js
-- [Ollama](https://ollama.com), for local inference
+* Python 3.12
+* Node.js
+* [Ollama](https://ollama.com), for local inference
 
 ### Clone
 
@@ -392,23 +389,23 @@ docker compose up
 
 All settings are read from environment variables / `backend/.env` via `engine/config.py`.
 
-| Variable | Purpose | Default | Required |
-|---|---|---|---|
-| `OLLAMA_BASE_URL` | Ollama server address | `http://localhost:11434` | No |
-| `OLLAMA_MODEL` | Chat model for specialists, coordinator, judge | `llama3.2` | No |
-| `OLLAMA_EMBED_MODEL` | Embedding model for RAG | `nomic-embed-text` | No |
-| `GITHUB_TOKEN` | GitHub API token; raises the unauthenticated rate limit from 60/hr to 5,000/hr | *(empty)* | No |
-| `CORS_ORIGINS` | Comma-separated origins allowed to call the API | `http://localhost:5173` | No |
-| `RAG_ENABLED` | Toggles repository doc retrieval entirely | `true` | No |
-| `CHROMA_PERSIST_DIR` | On-disk path for the ChromaDB index | `./chroma_data` | No |
-| `RAG_MAX_DOC_FILES` | Max repo doc files indexed | `12` | No |
-| `RAG_MAX_DOC_CHARS` | Max characters read per doc file | `4000` | No |
-| `RAG_TOP_K` | Chunks retrieved per analysis | `5` | No |
-| `MAX_FILES_PER_AGENT` | Files shown to each specialist | `4` | No |
-| `MAX_PATCH_LINES` | Patch lines shown per file | `30` | No |
-| `MAX_PATCH_CHARS` | Patch characters shown per file | `600` | No |
-| `ENABLE_JUDGE` | Whether the groundedness judge pass runs | `true` | No |
-| `VITE_API_BASE_URL` (frontend) | Backend URL the dashboard calls | `http://localhost:8000` | No |
+| Variable                       | Purpose                                                                        | Default                  | Required |
+| ------------------------------ | ------------------------------------------------------------------------------ | ------------------------ | -------- |
+| `OLLAMA_BASE_URL`              | Ollama server address                                                          | `http://localhost:11434` | No       |
+| `OLLAMA_MODEL`                 | Chat model for specialists, coordinator, judge                                 | `llama3.2`               | No       |
+| `OLLAMA_EMBED_MODEL`           | Embedding model for RAG                                                        | `nomic-embed-text`       | No       |
+| `GITHUB_TOKEN`                 | GitHub API token; raises the unauthenticated rate limit from 60/hr to 5,000/hr | *(empty)*                | No       |
+| `CORS_ORIGINS`                 | Comma-separated origins allowed to call the API                                | `http://localhost:5173`  | No       |
+| `RAG_ENABLED`                  | Toggles repository doc retrieval entirely                                      | `true`                   | No       |
+| `CHROMA_PERSIST_DIR`           | On-disk path for the ChromaDB index                                            | `./chroma_data`          | No       |
+| `RAG_MAX_DOC_FILES`            | Max repo doc files indexed                                                     | `12`                     | No       |
+| `RAG_MAX_DOC_CHARS`            | Max characters read per doc file                                               | `4000`                   | No       |
+| `RAG_TOP_K`                    | Chunks retrieved per analysis                                                  | `5`                      | No       |
+| `MAX_FILES_PER_AGENT`          | Files shown to each specialist                                                 | `4`                      | No       |
+| `MAX_PATCH_LINES`              | Patch lines shown per file                                                     | `30`                     | No       |
+| `MAX_PATCH_CHARS`              | Patch characters shown per file                                                | `600`                    | No       |
+| `ENABLE_JUDGE`                 | Whether the groundedness judge pass runs                                       | `true`                   | No       |
+| `VITE_API_BASE_URL` (frontend) | Backend URL the dashboard calls                                                | `http://localhost:8000`  | No       |
 
 All settings have defaults; environment variables are optional.
 
@@ -416,7 +413,11 @@ All settings have defaults; environment variables are optional.
 
 ## Testing
 
-`backend/engine/tests/` contains 109 tests across 16 files. Deterministic components — risk scoring (`test_risk_engine.py`, `test_policy.py`), file/domain classification (`test_category_classifier.py`), specialist context selection and bounding (`test_context_selection.py`), agent-output validation (`test_finding_validation.py`), report rendering (`test_report_renderer.py`), review complexity, the API contract (`test_api_contract.py`), fallback behavior when AI is unavailable (`test_fallback_and_config.py`), and end-to-end policy scenarios (`test_golden_architecture.py`) — are unit-tested directly, with no model call required. This matters for this architecture specifically: the code that owns the release decision is fully testable without Ollama running.
+`backend/engine/tests/` contains 109 tests across 16 files.
+
+Deterministic components — risk scoring (`test_risk_engine.py`, `test_policy.py`), file/domain classification (`test_category_classifier.py`), specialist context selection and bounding (`test_context_selection.py`), agent-output validation (`test_finding_validation.py`), report rendering (`test_report_renderer.py`), review complexity, the API contract (`test_api_contract.py`), fallback behavior when AI is unavailable (`test_fallback_and_config.py`), and end-to-end policy scenarios (`test_golden_architecture.py`) — are unit-tested directly, with no model call required.
+
+This matters for this architecture specifically: the code that owns the release decision is fully testable without Ollama running.
 
 ```bash
 cd backend
@@ -455,34 +456,34 @@ pr-sentinel/
 
 ## Design principles
 
-- Deterministic policy owns the release decision; AI output can be recorded as disagreeing with it, but never overrides it.
-- Specialist routing is deterministic file-path matching, not a model deciding what matters.
-- Repository context is retrieved through RAG, not assumed or hardcoded per repository.
-- Context shown to each AI stage is explicitly bounded, and the report states when bounding occurred rather than hiding it.
-- AI failures are isolated from the deterministic release decision; when AI analysis is unavailable, the deterministic engine can still produce the release assessment.
-- Local execution (Ollama, ChromaDB) is the default and only currently supported path.
+* Deterministic policy owns the release decision; AI output can be recorded as disagreeing with it, but never overrides it.
+* Specialist routing is deterministic file-path matching, not a model deciding what matters.
+* Repository context is retrieved through RAG, not assumed or hardcoded per repository.
+* Context shown to each AI stage is explicitly bounded, and the report states when bounding occurred rather than hiding it.
+* AI failures are isolated from the deterministic release decision; when AI analysis is unavailable, the deterministic engine can still produce the release assessment.
+* Local execution (Ollama, ChromaDB) is the default and only currently supported path.
 
 ---
 
 ## Limitations
 
-- File-to-domain classification is regex/path-based, not static analysis — unconventional repository layouts can be misclassified.
-- Only Ollama is currently supported as an inference backend; there is no hosted-provider (API-key) integration in the codebase today.
-- CPU-only local Ollama inference can be slow, and large PRs can exceed a practical inference budget — this is a real constraint in the GitHub Actions environment specifically, since it runs on CPU-only, GitHub-hosted runners.
-- Specialist context is bounded per PR; a specialist may not see every file in its domain on a very large PR (the deterministic score always does).
-- RAG retrieval is limited to what a repository actually documents and can miss relevant context that exists but isn't written down.
-- AI findings are probabilistic and validated on a best-effort basis (`finding_validation.py`); the groundedness judge is a qualitative verdict, not a calibrated statistical score.
-- GitHub Actions currently executes the full analysis inside the workflow itself; there is no separately hosted PR Sentinel service.
-- The dashboard requires the FastAPI backend (and, for a live analysis, Ollama) running locally — there is no hosted dashboard deployment.
-- This is a review aid: it does not merge, deploy, canary, or roll back anything itself.
+* File-to-domain classification is regex/path-based, not static analysis — unconventional repository layouts can be misclassified.
+* Only Ollama is currently supported as an inference backend; there is no hosted-provider (API-key) integration in the codebase today.
+* CPU-only local Ollama inference can be slow, and large PRs can exceed a practical inference budget — this is a real constraint in the GitHub Actions environment specifically, since it runs on CPU-only, GitHub-hosted runners.
+* Specialist context is bounded per PR; a specialist may not see every file in its domain on a very large PR (the deterministic score always does).
+* RAG retrieval is limited to what a repository actually documents and can miss relevant context that exists but isn't written down. The current index is built from the repository's default branch and reused for that repository/default-branch collection.
+* AI findings are probabilistic and validated on a best-effort basis (`finding_validation.py`); the groundedness judge is a qualitative verdict, not a calibrated statistical score.
+* GitHub Actions currently executes the full analysis inside the workflow itself; there is no separately hosted PR Sentinel service.
+* The dashboard requires the FastAPI backend (and, for a live analysis, Ollama) running locally — there is no hosted dashboard deployment.
+* This is a review aid: it does not merge, deploy, canary, or roll back anything itself.
 
 ---
 
 ## Roadmap
 
-- Support for at least one hosted, API-key-based LLM provider as an alternative to Ollama.
-- Persisted, cross-run RAG index invalidation when repository documentation changes (currently indexed once per repo/branch and reused).
-- Configurable per-specialist model selection (e.g. a stronger model for the coordinator, a smaller one for routine specialists).
+* Support for at least one hosted, API-key-based LLM provider as an alternative to Ollama.
+* Persisted, cross-run RAG index invalidation when repository documentation changes (currently indexed once per repository/default branch and reused).
+* Configurable per-specialist model selection (e.g. a stronger model for the coordinator, a smaller one for routine specialists).
 
 ---
 
