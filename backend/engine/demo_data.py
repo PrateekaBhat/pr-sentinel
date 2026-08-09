@@ -325,6 +325,7 @@ DEMOS: dict[str, AnalyzeResponse] = {
         report=RiskReport(
             decision="NEEDS_REVIEW",
             release_risk=RiskLevel.MEDIUM,
+            risk_score=45,
             confidence=84,
             deployment_strategy="Blue/Green",
             risk_breakdown={"Database": 35, "Tests": 15},
@@ -599,6 +600,11 @@ DEMOS: dict[str, AnalyzeResponse] = {
             risk_score=0,
             confidence=88,
             deployment_strategy="Standard",
+            repository_metadata=RepositoryMetadata(
+                default_branch="main",
+                technologies=["TypeScript", "Python"],
+                files_changed_count=10,
+            ),
             summary="Large refactor — low release risk, high review complexity.",
             executive_summary=(
                 "Release Risk LOW / Review Complexity HIGH. "
@@ -678,6 +684,11 @@ DEMOS: dict[str, AnalyzeResponse] = {
             risk_score=65,
             confidence=72,
             deployment_strategy="Manual Approval",
+            repository_metadata=RepositoryMetadata(
+                default_branch="main",
+                technologies=["Python"],
+                files_changed_count=4,
+            ),
             summary="Deterministic override: LLM LOW vs policy HIGH.",
             executive_summary=(
                 "Deterministic policy classified HIGH release risk (auth + deleted tests). "

@@ -176,10 +176,10 @@ _SEVERITY_BONUS = {RiskLevel.HIGH: 25, RiskLevel.MEDIUM: 10, RiskLevel.LOW: 0}
 def _confidence_label(score: int) -> str:
     """Evidence Confidence tier — not a calibrated probability."""
     if score >= 75:
-        return "HIGH"
+        return "High"
     if score >= 50:
-        return "MEDIUM"
-    return "LOW"
+        return "Medium"
+    return "Low"
 
 
 def _snippet_for(f: ChangedFile, max_lines: int = 6, max_chars: int = 320) -> str | None:

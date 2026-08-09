@@ -108,11 +108,23 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           body: ${{ steps.report.outputs.report_body || 'No report generated (analysis step failed or produced an empty report).' }}
 
-      - name: Fail if blocked
-        if: ${{ steps.analyze.outputs.exit_code == '1' }}
+      - name: Enforce analysis result
+        if: always()
         run: |
-          echo "PR Sentinel returned BLOCK; failing workflow."
-          exit 1
+          exit_code="${{ steps.analyze.outputs.exit_code }}"
+          case "${exit_code}" in
+            0)
+              echo "Analysis completed successfully; deterministic policy allowed the PR to proceed."
+              ;;
+            1)
+              echo "PR Sentinel returned BLOCK; failing workflow intentionally."
+              exit 1
+              ;;
+            *)
+              echo "PR Sentinel analysis failed unexpectedly (exit code ${exit_code}); failing workflow."
+              exit 1
+              ;;
+          esac
 
       - name: Stop Ollama
         if: always()

@@ -143,7 +143,7 @@ export default function App() {
 
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
               <Card title="Overall risk" eyebrow="Sentinel assessment" className="flex flex-col items-center justify-center lg:col-span-1">
-                <RiskGauge risk={result.ai.overall_risk} confidence={result.report.confidence} />
+                <RiskGauge risk={result.ai.overall_risk} evidenceConfidence={result.report.confidence_explanation?.level ?? "MEDIUM"} />
                 <p className="mt-3 text-center text-sm text-fog">Risk score: {result.report.risk_score}/100</p>
               </Card>
 

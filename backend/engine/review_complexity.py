@@ -118,7 +118,7 @@ def calculate_review_complexity(
 
     score = min(100, score)
 
-    if score >= 55:
+    if score >= 50:
         level = RiskLevel.HIGH
     elif score >= 25:
         level = RiskLevel.MEDIUM

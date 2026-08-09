@@ -102,6 +102,29 @@ python -m pytest engine/tests/test_risk_engine.py engine/tests/test_category_cla
 
 ---
 
+## 🛡️ Failure Handling
+
+The deterministic policy engine is the single source of truth for the release decision, so the pipeline degrades gracefully when the AI layer has problems:
+
+- **LLM unavailable** (Ollama down/unreachable): the pipeline falls back to deterministic-only analysis. The report/CLI/API response is still produced, `ai_enabled` is `false`, and a policy note states the deterministic engine made the call.
+- **A specialist agent fails**: that agent is marked skipped/errored in `agent_statuses`; the rest of the pipeline (other specialists, coordinator, deterministic policy) continues.
+- **The groundedness judge fails or flags unsupported claims**: this affects explanation confidence only — it never changes `release_risk` or the ALLOW/NEEDS_REVIEW/BLOCK decision.
+- **The analysis itself crashes** (bad input, unexpected exception): `backend/cli.py` exits with code `2`, which the GitHub Actions workflow treats as a hard CI failure — distinct from a deliberate `BLOCK` (exit `1`), which also fails CI but for a different, expected reason.
+
+## 🐕 Dogfooding
+
+PR Sentinel was run against its own pull requests as part of development. That exercise surfaced several real problems that are now fixed: demo fixtures that no longer matched the current Pydantic models, CI failure semantics that could mask a genuine crash as a passing workflow, and evidence-grounding gaps where the coordinator's narrative could drift from what the specialists and heuristics actually reported. The tests and prompt constraints in this repo exist largely because of what dogfooding turned up.
+
+## ⚠️ Limitations
+
+- File-path-based category classification is heuristic, not a static analyzer — it can miscategorize unconventional repository layouts.
+- Explanation quality depends on the local Ollama model in use; smaller CI-friendly models (e.g. `llama3.2`) trade depth for speed.
+- Repository RAG is only as good as the repository's own documentation — undocumented conventions won't be surfaced.
+- "Evidence Confidence" is a qualitative tier (High/Medium/Low), not a calibrated statistical probability.
+- The suggested rollout strategy (Standard/Canary/Blue-Green/Manual Approval) is advisory guidance for reviewers, not an automated deployment controller.
+
+---
+
 ## 🎯 Interview Talking Points & Design Decisions
 
 - **Why deterministic rules + LLM synthesis?** Asking an LLM to evaluate code risk without deterministic grounding leads to hallucinated scores. Deterministic rules establish the baseline; the LLM adds human-readable production context and rollout recommendations.
