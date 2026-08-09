@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     max_patch_lines: int = 30
     max_patch_chars: int = 600
 
+    # The judge pass is a quality check on top of the coordinator's AI synthesis — it
+    # never controls the release decision (deterministic policy always does). On
+    # resource-constrained runners (e.g. GitHub-hosted CPU-only), it's a purely
+    # optional extra Ollama call and can be disabled to reduce total analysis time.
+    enable_judge: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

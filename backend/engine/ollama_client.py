@@ -46,8 +46,9 @@ async def chat_json(system: str, user: str, timeout: float = 300.0) -> dict:
         ) from exc
     except httpx.TimeoutException as exc:
         raise OllamaError(
-            "Ollama timed out. Large diffs on CPU-only machines can be slow — "
-            "try a smaller/faster model (e.g. `llama3.2`) or a smaller PR."
+            f"Ollama timed out after {timeout:.0f}s. Local CPU inference may exceed the "
+            "configured analysis budget for this PR. The deterministic policy result "
+            "remains authoritative."
         ) from exc
 
     if resp.status_code == 404:
