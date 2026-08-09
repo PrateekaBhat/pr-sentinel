@@ -221,9 +221,16 @@ class AgentDecision(BaseModel):
 
 class JudgeVerdict(BaseModel):
     """Lightweight LLM-as-judge pass over the coordinator's output, checking that its
-    claims trace back to evidence the agents/heuristics actually produced."""
+    claims trace back to evidence the agents/heuristics actually produced.
 
-    grounded: bool
+    `grounded` is tri-state:
+      - True  -> AI synthesis was produced and the judge found it grounded (PASSED)
+      - False -> AI synthesis was produced and the judge found unsupported claims (FAILED)
+      - None  -> there was no AI synthesis to evaluate at all (NOT_RUN) -- this is
+                 distinct from a failed check and must never be rendered as PASSED.
+    """
+
+    grounded: bool | None
     issues: list[str] = Field(default_factory=list)
     notes: str = ""
 

@@ -313,7 +313,15 @@ async def judge_node(state: AgentState) -> dict:
     it just means no groundedness verdict is attached to the response."""
     coordinator_result = state.get("coordinator_result")
     if coordinator_result is None:
-        return {"judge_result": JudgeVerdict(grounded=True, notes="Coordinator produced no output to judge.")}
+        # No AI synthesis was produced (the coordinator failed/timed out), so there is
+        # nothing for the judge to evaluate. This must NOT be reported as "grounded" —
+        # grounded=None means "not run", distinct from a passed or failed check.
+        return {
+            "judge_result": JudgeVerdict(
+                grounded=None,
+                notes="No AI synthesis was produced, so groundedness was not evaluated.",
+            )
+        }
 
     evidence = _build_coordinator_prompt(state)
     report_json = json.dumps(coordinator_result.model_dump(), default=str)[:4000]

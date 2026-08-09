@@ -361,6 +361,18 @@ async def analyze_pr(owner: str, repo: str, number: int, token: str = "") -> Ana
         ai_result = analyze_with_heuristics_only(pr, heuristic_result, reason=ai_error)
 
     total_duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
+
+    if not ai_enabled and (judge_result is None or judge_result.grounded is not None):
+        # Belt-and-suspenders: whichever path led here (coordinator failure inside the
+        # graph, an OllamaError before/around the graph, or any other unexpected
+        # exception), there was no AI synthesis for a judge to evaluate. Guarantee a
+        # single, consistent NOT_RUN verdict rather than relying on every call site to
+        # get this right independently.
+        judge_result = JudgeVerdict(
+            grounded=None,
+            notes="No AI synthesis was produced, so groundedness was not evaluated.",
+        )
+
     report = _build_report(
         pr, heuristic_result, ai_result, rag_context, state,
         repo_loaded_ms, repo_context_ms, ai_enabled, judge_result,

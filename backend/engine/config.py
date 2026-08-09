@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     """Application configuration, populated from environment variables / .env."""
 
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.1"
+    ollama_model: str = "llama3.2"
     ollama_embed_model: str = "nomic-embed-text"
     github_token: str = ""
     cors_origins: str = "http://localhost:5173"

@@ -253,15 +253,26 @@ def render_markdown(response: AnalyzeResponse) -> str:
 
     if response.judge:
         grounded = response.judge.grounded
+        if grounded is None:
+            evidence_quality = "N/A"
+            groundedness_label = "NOT_RUN"
+        else:
+            evidence_quality = "HIGH" if grounded else "REVIEW"
+            groundedness_label = "PASSED" if grounded else "FAILED"
         lines.extend([
             "### Groundedness Check",
             "",
-            f"**Evidence Quality:** {'HIGH' if grounded else 'REVIEW'}",
-            f"**Groundedness:** {'PASSED' if grounded else 'FAILED'}",
+            f"**Evidence Quality:** {evidence_quality}",
+            f"**Groundedness:** {groundedness_label}",
             "",
             "The release decision remains governed by deterministic policy.",
             "",
         ])
+        if grounded is None:
+            lines.append(
+                f"_{response.judge.notes or 'Groundedness was not evaluated because there was no AI-generated synthesis to evaluate.'}_"
+            )
+            lines.append("")
         if response.judge.issues:
             for issue in response.judge.issues:
                 lines.append(f"- {issue}")
