@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-from .. import agent_routing
+from .. import agent_routing, finding_validation
 from ..models import (
     AgentFinding,
     AIAnalysis,
@@ -99,13 +99,32 @@ async def run_agent(domain: str, state: AgentState) -> dict:
         system = AGENT_SYSTEM_PROMPTS[domain]
         user = f"## Files in scope\n{_files_prompt(files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
         data = await chat_json(system, user, timeout=120.0)
-        findings = [clean_finding_text(str(x)) for x in (data.get("findings") or [])][:4]
-        findings = [f for f in findings if f]
+        raw_findings = (data.get("findings") or [])[:4]
+        # Clean placeholder/template artifacts before structural validation so a
+        # stripped placeholder doesn't itself trigger a truncation false-positive.
+        cleaned_raw = []
+        for raw in raw_findings:
+            if isinstance(raw, dict):
+                cleaned_raw.append(
+                    {k: (clean_finding_text(v) if isinstance(v, str) else v) for k, v in raw.items()}
+                )
+            else:
+                cleaned_raw.append(clean_finding_text(str(raw)))
+        structured, needs_verification, rejected_count = finding_validation.normalize_findings(cleaned_raw)
+        # `findings` (plain strings) stays populated with validated, complete finding
+        # titles only — never a raw, possibly-truncated model string. This is what
+        # every downstream consumer (coordinator prompt, report renderer, executive
+        # summary reconciliation) reads, so a malformed finding can never reach the
+        # user-facing report through this path.
+        findings = [f.title for f in structured]
         risk_note = clean_finding_text(str(data.get("risk_note", "")))
         confidence = int(data.get("confidence", 60))
     except OllamaError as exc:
         logger.warning("%s agent failed: %s", domain, exc)
         findings = []
+        structured = []
+        needs_verification = []
+        rejected_count = 0
         risk_note = f"Agent call failed ({exc}); files were not analyzed by AI for this domain."
         confidence = 0
     duration_ms = int((time.perf_counter_ns() - start) / 1_000_000)
@@ -117,6 +136,9 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             applicable=True,
             files_reviewed=[f.filename for f in files],
             findings=findings,
+            structured_findings=structured,
+            needs_verification=needs_verification,
+            rejected_count=rejected_count,
             risk_note=risk_note,
             confidence=confidence,
         ),
@@ -154,11 +176,22 @@ def _build_coordinator_prompt(state: AgentState) -> str:
         if not finding.applicable:
             agent_lines.append(f"- {finding.label}: not applicable ({finding.risk_note})")
             continue
-        findings_text = "; ".join(finding.findings) if finding.findings else "no concerns raised"
+        if finding.structured_findings:
+            detail_lines = []
+            for sf in finding.structured_findings:
+                detail_lines.append(
+                    f"    * [{sf.severity}/{sf.confidence}] {sf.title} — evidence: {sf.evidence}"
+                )
+            findings_text = "no concerns raised" if not detail_lines else "\n" + "\n".join(detail_lines)
+        else:
+            findings_text = "no concerns raised"
         agent_lines.append(
             f"- {finding.label} (reviewed {len(finding.files_reviewed)} file(s)): "
             f"{findings_text}. Risk note: {finding.risk_note}"
         )
+        if finding.needs_verification:
+            low_conf = "; ".join(sf.title for sf in finding.needs_verification)
+            agent_lines.append(f"    (also reported, LOW confidence, needs verification: {low_conf})")
 
     heuristic_lines = [
         f"- {f.label}: {'TRIGGERED' if f.triggered else 'not triggered'} ({f.reason})"

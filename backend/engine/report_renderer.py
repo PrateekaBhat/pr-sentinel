@@ -216,11 +216,33 @@ def render_markdown(response: AnalyzeResponse) -> str:
         lines.append("")
 
     if report.agent_decisions:
-        lines.extend(["### Agent Findings", ""])
+        lines.extend([
+            "### AI Review Findings",
+            "",
+            "_Engineering observations from specialist AI agents — distinct from the "
+            "deterministic policy findings above. These can be uncertain and do not "
+            "control the release decision; see Groundedness Check below._",
+            "",
+        ])
         for d in report.agent_decisions:
             if d.decision.startswith("SKIPPED"):
                 continue
-            lines.append(f"- **{d.label}:** {d.decision} — {d.reasoning[:200]}")
+            # `d.reasoning` is built from validated, complete finding titles (see
+            # finding_validation.py) — never sliced mid-sentence, so this can never
+            # render a truncated fragment like "...different return type than".
+            lines.append(f"- **{d.label}:** {d.decision} — {d.reasoning}")
+        lines.append("")
+
+    if report.needs_verification:
+        lines.extend([
+            "### Needs Verification (low-confidence AI observations)",
+            "",
+            "_These are speculative or depend on code the specialist agents weren't shown. "
+            "They are excluded from \"Concerns raised\" and do NOT affect the release decision._",
+            "",
+        ])
+        for item in report.needs_verification[:8]:
+            lines.append(f"- {item}")
         lines.append("")
 
     if rag.scanned and rag.retrieved:

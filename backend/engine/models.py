@@ -165,6 +165,22 @@ class RAGContext(BaseModel):
     indexed_doc_paths: list[str] = Field(default_factory=list)
 
 
+class Finding(BaseModel):
+    """A single, structured specialist finding. Every actionable finding must be able
+    to stand alone: what's wrong, where, what evidence supports it, why it matters, and
+    what to do about it. This schema exists specifically so that malformed or truncated
+    model output (e.g. a sentence fragment cut off mid-clause) can be detected and
+    excluded deterministically instead of being rendered as a finished engineering claim."""
+
+    title: str  # one complete, self-contained sentence describing the finding
+    evidence: str  # what was actually seen in the shown diff/patch that supports this
+    impact: str = ""  # what could go wrong if unaddressed
+    recommendation: str = ""  # a concrete next step
+    file: Optional[str] = None
+    severity: str = "P3"  # P0 | P1 | P2 | P3
+    confidence: str = "MEDIUM"  # HIGH | MEDIUM | LOW
+
+
 class AgentFinding(BaseModel):
     """One specialist agent's output. Agents that found no relevant files skip the
     LLM call entirely and report applicable=False — this is what makes routing real
@@ -174,7 +190,10 @@ class AgentFinding(BaseModel):
     label: str
     applicable: bool
     files_reviewed: list[str] = Field(default_factory=list)
-    findings: list[str] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)  # titles of validated HIGH/MEDIUM findings
+    structured_findings: list[Finding] = Field(default_factory=list)  # full HIGH/MEDIUM findings
+    needs_verification: list[Finding] = Field(default_factory=list)  # LOW-confidence, excluded from concerns
+    rejected_count: int = 0  # findings the validator discarded as incomplete/malformed
     risk_note: str = ""
     confidence: int = 60  # 0-100, how confident this agent is in its own findings
 
@@ -410,6 +429,7 @@ class RiskReport(BaseModel):
     suggested_reviewers: list[SuggestedReviewer] = Field(default_factory=list)
     positive_signals: list[PositiveSignal] = Field(default_factory=list)
     uncertainties: list[UncertaintyItem] = Field(default_factory=list)
+    needs_verification: list[str] = Field(default_factory=list)  # LOW-confidence AI observations
 
 
 class AIAnalysis(BaseModel):

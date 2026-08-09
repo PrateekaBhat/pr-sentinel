@@ -258,6 +258,10 @@ def _build_report(
         )
 
     agent_decisions = build_agent_decisions(state)
+    needs_verification: list[str] = []
+    for f in ai.agent_findings:
+        for lv in f.needs_verification:
+            needs_verification.append(f"{f.label}: {lv.title}")
     # Belt-and-suspenders: the coordinator already reconciles the executive summary
     # against agent findings before the judge sees it (agents/nodes.py), so this call
     # is normally a no-op. It stays here as a safety net for the ai_enabled=False path
@@ -296,6 +300,7 @@ def _build_report(
         suggested_reviewers=suggested_reviewers,
         positive_signals=positive_signals,
         uncertainties=uncertainties,
+        needs_verification=needs_verification,
         execution_metrics=ExecutionMetrics(
             generated_at=datetime.now(timezone.utc).isoformat(),
             total_duration_ms=total_duration_ms,
