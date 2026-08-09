@@ -117,7 +117,9 @@ What talks to what:
 
 This mapping is the **only** thing that determines `decision`. The CLI's exit code and the GitHub Actions pass/fail status are both derived from this field, never from anything the AI layer produces.
 
-A separate, independently deterministic score — **review complexity** (`engine/review_complexity.py`) — estimates how much human review effort a PR requires (lines changed, files touched, subsystem spread, backend/frontend crossover, dependency churn), on the premise that review burden and release risk are different questions: a large documentation refactor can be high-complexity but low-risk. A **production readiness score** (`engine/metrics.py`) is likewise computed deterministically from already-computed numbers, starting at 100 and applying arithmetic deductions for concrete readiness gaps such as risk, below-target confidence, missing tests, deployment complexity, documentation gaps, secrets, and dependency churn — it is not a model judgment.
+A separate, independently deterministic score — **review complexity** (`engine/review_complexity.py`) — estimates how much human review effort a PR requires (lines changed, files touched, subsystem spread, backend/frontend crossover, dependency churn), on the premise that review burden and release risk are different questions: a large documentation refactor can be high-complexity but low-risk.
+
+A **production readiness score** (`engine/metrics.py`) is likewise computed deterministically from already-computed numbers, starting at 100 and applying arithmetic deductions for concrete readiness gaps such as risk, below-target confidence, missing tests, deployment complexity, documentation gaps, secrets, and dependency churn — it is not a model judgment.
 
 `audit_llm_disagreement()` (`engine/policy.py`) separately compares the coordinator's own `overall_risk` read against the deterministic band and records the divergence on the report (`llm_disagreement`, with a direction: optimistic or pessimistic) purely for visibility — it never changes the release risk or decision.
 
@@ -179,7 +181,7 @@ LangGraph orchestrates role-specific LLM reviewers behind deterministic file/dom
 
 If a PR touches no files matching a domain, that specialist is skipped — no LLM call is made, and the report marks it `Skipped` rather than returning an empty result. Files shown to each specialist are ranked and capped (see [Context bounding](#context-bounding-and-large-prs)), and each specialist's output is validated against the evidence it was actually given before being included in the report.
 
-The **coordinator** receives every specialist's findings, the deterministic heuristic factors, and the retrieved RAG context, and produces the narrative, rollout strategy, and risk-factor list. If it fails, its error is recorded and the specialists' already-computed findings are still included in the report. A **judge** then re-checks the coordinator's narrative against the same evidence and returns a groundedness verdict — a quality check on the explanation, not a second vote on the release decision.
+The **coordinator** receives every specialist's findings, the deterministic heuristic factors, and the retrieved RAG context, and produces the narrative, rollout strategy, and risk-factor list. If it fails, its error is recorded and the specialists' already-computed findings are still included in the report. A judge then re-checks the coordinator's narrative against the same evidence and returns a groundedness verdict — a quality check on the explanation, not a second vote on the release decision.
 
 ### Implementation details: ranking, validation, and the judge's conflict rule
 
@@ -413,11 +415,7 @@ All settings have defaults; environment variables are optional.
 
 ## Testing
 
-`backend/engine/tests/` contains 109 tests across 16 files.
-
-Deterministic components — risk scoring (`test_risk_engine.py`, `test_policy.py`), file/domain classification (`test_category_classifier.py`), specialist context selection and bounding (`test_context_selection.py`), agent-output validation (`test_finding_validation.py`), report rendering (`test_report_renderer.py`), review complexity, the API contract (`test_api_contract.py`), fallback behavior when AI is unavailable (`test_fallback_and_config.py`), and end-to-end policy scenarios (`test_golden_architecture.py`) — are unit-tested directly, with no model call required.
-
-This matters for this architecture specifically: the code that owns the release decision is fully testable without Ollama running.
+`backend/engine/tests/` contains 109 tests across 16 files. Deterministic components — risk scoring (`test_risk_engine.py`, `test_policy.py`), file/domain classification (`test_category_classifier.py`), specialist context selection and bounding (`test_context_selection.py`), agent-output validation (`test_finding_validation.py`), report rendering (`test_report_renderer.py`), review complexity, the API contract (`test_api_contract.py`), fallback behavior when AI is unavailable (`test_fallback_and_config.py`), and end-to-end policy scenarios (`test_golden_architecture.py`) — are unit-tested directly, with no model call required. This matters for this architecture specifically: the code that owns the release decision is fully testable without Ollama running.
 
 ```bash
 cd backend
@@ -471,7 +469,9 @@ pr-sentinel/
 * Only Ollama is currently supported as an inference backend; there is no hosted-provider (API-key) integration in the codebase today.
 * CPU-only local Ollama inference can be slow, and large PRs can exceed a practical inference budget — this is a real constraint in the GitHub Actions environment specifically, since it runs on CPU-only, GitHub-hosted runners.
 * Specialist context is bounded per PR; a specialist may not see every file in its domain on a very large PR (the deterministic score always does).
-* RAG retrieval is limited to what a repository actually documents and can miss relevant context that exists but isn't written down. The current index is built from the repository's default branch and reused for that repository/default-branch collection.
+* RAG retrieval is limited to what a repository actually documents and can miss relevant context that exists but isn't written down.
+* The current `no_tests` heuristic is intentionally conservative: it adds a small risk signal whenever a PR contains non-test files without touching tests. That means documentation-only PRs such as a `README.md` change can currently receive the `No test files touched` signal even though they do not modify executable code. This is a known heuristic limitation, not an AI decision.
+* Documentation can still be operationally significant — for example, specifications, API documentation, architecture decisions, security guidance, or deployment documentation may affect engineering behavior without changing executable code. The current heuristic does not yet distinguish those cases from ordinary non-test changes.
 * AI findings are probabilistic and validated on a best-effort basis (`finding_validation.py`); the groundedness judge is a qualitative verdict, not a calibrated statistical score.
 * GitHub Actions currently executes the full analysis inside the workflow itself; there is no separately hosted PR Sentinel service.
 * The dashboard requires the FastAPI backend (and, for a live analysis, Ollama) running locally — there is no hosted dashboard deployment.
@@ -484,6 +484,7 @@ pr-sentinel/
 * Support for at least one hosted, API-key-based LLM provider as an alternative to Ollama.
 * Persisted, cross-run RAG index invalidation when repository documentation changes (currently indexed once per repository/default branch and reused).
 * Configurable per-specialist model selection (e.g. a stronger model for the coordinator, a smaller one for routine specialists).
+* Refine test-related risk heuristics so documentation-only and other non-executable changes are distinguished from executable code changes.
 
 ---
 
