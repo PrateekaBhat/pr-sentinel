@@ -111,11 +111,13 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             else:
                 cleaned_raw.append(clean_finding_text(str(raw)))
         structured, needs_verification, rejected_count = finding_validation.normalize_findings(cleaned_raw)
-        # `findings` (plain strings) stays populated with validated, complete finding
-        # titles only — never a raw, possibly-truncated model string. This is what
-        # every downstream consumer (coordinator prompt, report renderer, executive
-        # summary reconciliation) reads, so a malformed finding can never reach the
-        # user-facing report through this path.
+        # `structured_findings` (built above) is the authoritative, validated source.
+        # `findings` is populated here ONLY as a derived compatibility projection —
+        # titles of the already-validated structured findings — and must never be
+        # populated from raw model output directly. Downstream code (coordinator
+        # prompt, report renderer, executive-summary reconciliation) reads from
+        # `structured_findings`; this projection exists solely for callers/serializers
+        # that still expect a flat string list.
         findings = [f.title for f in structured]
         risk_note = clean_finding_text(str(data.get("risk_note", "")))
         confidence = int(data.get("confidence", 60))

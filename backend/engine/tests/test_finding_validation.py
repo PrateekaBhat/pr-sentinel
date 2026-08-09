@@ -232,3 +232,106 @@ def test_report_renders_deterministic_override_explanation():
 
 
 # --- TEST 10: existing report rendering tests still pass — see test_report_renderer.py
+
+
+# --- Authoritative-source regression tests (structured_findings bypass protection) ----
+
+def _finding_with(structured, needs_verification=None, findings=None, applicable=True, label="API Compatibility"):
+    return AgentFinding(
+        agent="api",
+        label=label,
+        applicable=applicable,
+        files_reviewed=["backend/app/main.py"],
+        findings=findings if findings is not None else [sf.title for sf in structured],
+        structured_findings=structured,
+        needs_verification=needs_verification or [],
+        confidence=70,
+    )
+
+
+def test_malformed_finding_cannot_bypass_validation_via_legacy_findings_field():
+    """A mix of one valid + one malformed raw finding: only the valid one should ever
+    reach structured_findings, and the malformed text must never reappear anywhere
+    downstream — even if something were to (incorrectly) read the legacy `findings`
+    list, that list is itself derived only from validated titles."""
+    raw = [
+        {
+            "title": "API return type changed for fetchHistory",
+            "evidence": "Return annotation changed from list[dict] to AIAnalysis.",
+            "severity": "P2",
+            "confidence": "HIGH",
+        },
+        {"title": "function exists with different return type than"},  # malformed
+    ]
+    structured, needs_verification, rejected = finding_validation.normalize_findings(raw)
+
+    assert len(structured) == 1
+    assert structured[0].title == "API return type changed for fetchHistory"
+    assert needs_verification == []
+    assert rejected == 1
+
+    finding = _finding_with(structured)
+    # The compatibility projection must exactly mirror the validated titles — the
+    # malformed text is nowhere in it.
+    assert finding.findings == ["API return type changed for fetchHistory"]
+    assert "function exists with different return type than" not in finding.findings
+    assert "function exists with different return type than" not in " ".join(
+        sf.title for sf in finding.structured_findings
+    )
+
+    # Reconciliation and rendering both key off structured_findings, so counts must
+    # reflect the validated set (1), not the raw model output (2).
+    decisions = build_agent_decisions(
+        {
+            "api_finding": finding,
+            "api_status": {"agent": "api", "label": "API Compatibility", "status": "Completed", "files_reviewed": 1, "duration_ms": 5},
+        }
+    )
+    assert decisions[0].decision == "Concerns raised (1)"
+    assert "function exists with different return type than" not in decisions[0].reasoning
+
+
+def test_all_findings_rejected_yields_zero_actionable_findings_downstream():
+    raw = [
+        {"title": "function exists with different return type than"},
+        {"title": "Tests are insufficient"},  # no evidence
+    ]
+    structured, needs_verification, rejected = finding_validation.normalize_findings(raw)
+    assert structured == []
+    assert needs_verification == []
+    assert rejected == 2
+
+    finding = _finding_with(structured)
+    assert finding.findings == []
+    assert finding.applicable is True  # still ran, just found nothing that survived validation
+
+    decisions = build_agent_decisions(
+        {
+            "api_finding": finding,
+            "api_status": {"agent": "api", "label": "API Compatibility", "status": "Completed", "files_reviewed": 1, "duration_ms": 5},
+        }
+    )
+    assert decisions[0].decision == "No concerns raised"
+
+
+def test_findings_field_is_always_a_projection_of_structured_findings():
+    """Guards the invariant itself: whatever structured_findings contains, the legacy
+    `findings` list (as produced by the specialist-agent construction path) must be
+    exactly its titles, in order — never populated from anything else."""
+    raw = [
+        {
+            "title": "Migration lacks a reversible down step",
+            "evidence": "0042_add_column.sql has no corresponding down migration.",
+            "severity": "P1",
+            "confidence": "MEDIUM",
+        },
+        {
+            "title": "Config file adds a new required environment variable",
+            "evidence": "settings.yml now requires OLLAMA_HOST with no default.",
+            "severity": "P3",
+            "confidence": "HIGH",
+        },
+    ]
+    structured, _needs_verification, _rejected = finding_validation.normalize_findings(raw)
+    finding = _finding_with(structured)
+    assert finding.findings == [sf.title for sf in finding.structured_findings]

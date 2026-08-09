@@ -376,8 +376,8 @@ def build_category_breakdown(
             # Evidence explanation: prefer LLM reasoning → agent finding → deterministic label.
             if fr and fr.reason:
                 explanation = fr.reason
-            elif agent_note and agent_note.findings:
-                explanation = agent_note.findings[0]
+            elif agent_note and agent_note.structured_findings:
+                explanation = agent_note.structured_findings[0].title
             else:
                 explanation = _explain_file_for_category(f, category)
 
@@ -651,7 +651,11 @@ def reconcile_executive_summary(summary: str, agent_findings: list[AgentFinding]
     """
     text = summary or ""
 
-    with_concerns = [f for f in agent_findings if f.applicable and f.findings]
+    # `structured_findings` is the authoritative, validated representation of what a
+    # specialist actually found — reconciliation is deliberately checked against it
+    # rather than the legacy `findings` string list, so a finding the validation layer
+    # rejected can never be reintroduced here just because it once existed in raw form.
+    with_concerns = [f for f in agent_findings if f.applicable and f.structured_findings]
     skipped_labels = [f.label for f in agent_findings if not f.applicable]
 
     def _split_sentences(t: str) -> list[str]:
@@ -708,10 +712,11 @@ def reconcile_executive_summary(summary: str, agent_findings: list[AgentFinding]
 
     addendum_parts = []
     for f in missing:
-        cleaned_findings = [clean_finding_text(x) for x in f.findings[:2]]
-        cleaned_findings = [x for x in cleaned_findings if x]
-        detail = "; ".join(cleaned_findings) if cleaned_findings else (f.risk_note or "see agent findings")
-        addendum_parts.append(f"{f.label} raised {len(f.findings)} concern(s): {detail}.")
+        # Titles on structured_findings are already validated/cleaned — no need to
+        # re-run clean_finding_text, and no unvalidated text can reach this addendum.
+        titles = [sf.title for sf in f.structured_findings[:2] if sf.title]
+        detail = "; ".join(titles) if titles else (f.risk_note or "see agent findings")
+        addendum_parts.append(f"{f.label} raised {len(f.structured_findings)} concern(s): {detail}.")
 
     if text and not text.endswith((".", "!", "?")):
         text += "."
@@ -729,9 +734,11 @@ def build_agent_decisions(state: dict[str, Any]) -> list[AgentDecision]:
             decision = "SKIPPED — no files in domain"
             reasoning = f"Trigger: {_DOMAIN_SKIP_TRIGGERS.get(domain, 'no matching files')}. LLM call: not made."
             confidence = 100
-        elif finding.findings:
-            decision = f"Concerns raised ({len(finding.findings)})"
-            reasoning = " ".join(finding.findings[:2])
+        elif finding.structured_findings:
+            # structured_findings is the authoritative, validated source — counts and
+            # rendered reasoning are derived from it, never from the raw/legacy list.
+            decision = f"Concerns raised ({len(finding.structured_findings)})"
+            reasoning = " ".join(sf.title for sf in finding.structured_findings[:2])
             confidence = finding.confidence
         else:
             decision = "No concerns raised"

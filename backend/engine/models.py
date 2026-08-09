@@ -190,8 +190,16 @@ class AgentFinding(BaseModel):
     label: str
     applicable: bool
     files_reviewed: list[str] = Field(default_factory=list)
-    findings: list[str] = Field(default_factory=list)  # titles of validated HIGH/MEDIUM findings
-    structured_findings: list[Finding] = Field(default_factory=list)  # full HIGH/MEDIUM findings
+    # `structured_findings` is the single authoritative representation of validated,
+    # actionable (HIGH/MEDIUM confidence) specialist findings. `findings` below is kept
+    # ONLY as a backward-compatible string projection for callers/serializers that
+    # still expect a flat list of strings (e.g. older report consumers) — it is always
+    # derived 1:1 from `structured_findings[*].title` at construction time in
+    # agents/nodes.py and MUST NOT be populated independently or read as an
+    # authoritative source. All production logic (reconciliation, report rendering,
+    # counts, severity/confidence handling) must read from `structured_findings`.
+    findings: list[str] = Field(default_factory=list)  # compatibility projection — see above
+    structured_findings: list[Finding] = Field(default_factory=list)  # authoritative
     needs_verification: list[Finding] = Field(default_factory=list)  # LOW-confidence, excluded from concerns
     rejected_count: int = 0  # findings the validator discarded as incomplete/malformed
     risk_note: str = ""
