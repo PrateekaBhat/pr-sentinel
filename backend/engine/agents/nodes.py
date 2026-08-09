@@ -36,8 +36,12 @@ MAX_PATCH_LINES = _settings.max_patch_lines
 MAX_FILES_PER_AGENT = _settings.max_files_per_agent
 
 
-def _files_prompt(files) -> str:
-    total_files = len(files)
+def _files_prompt(files, total_available: int | None = None) -> str:
+    """`files` is the already-ranked-and-capped set of files to actually show. Pass
+    `total_available` (the count before capping) when it differs from `len(files)`,
+    so the "N more not shown" note stays accurate even though `files` itself is
+    pre-capped by the caller."""
+    total_files = total_available if total_available is not None else len(files)
     shown_files = files[:MAX_FILES_PER_AGENT]
     parts = [
         f"{total_files} file(s) are in this agent's scope; {len(shown_files)} are shown below."
@@ -110,7 +114,7 @@ async def run_agent(domain: str, state: AgentState) -> dict:
     start = time.perf_counter_ns()
     try:
         system = AGENT_SYSTEM_PROMPTS[domain]
-        user = f"## Files in scope\n{_files_prompt(ranked_files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
+        user = f"## Files in scope\n{_files_prompt(selected_files, total_available=available_count)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
         data = await chat_json(system, user, timeout=120.0)
         raw_findings = (data.get("findings") or [])[:4]
         # Clean placeholder/template artifacts before structural validation so a
@@ -325,7 +329,9 @@ async def coordinator_node(state: AgentState) -> dict:
 
 async def judge_node(state: AgentState) -> dict:
     """Non-blocking self-evaluation pass. A judge failure never breaks the pipeline —
-    it just means no groundedness verdict is attached to the response."""
+    it just means no groundedness verdict is attached to the response. The judge never
+    controls the release decision (deterministic policy always does), so it can be
+    disabled via Settings.enable_judge to save one Ollama call on constrained runners."""
     coordinator_result = state.get("coordinator_result")
     if coordinator_result is None:
         # No AI synthesis was produced (the coordinator failed/timed out), so there is
@@ -335,6 +341,14 @@ async def judge_node(state: AgentState) -> dict:
             "judge_result": JudgeVerdict(
                 grounded=None,
                 notes="No AI synthesis was produced, so groundedness was not evaluated.",
+            )
+        }
+
+    if not get_settings().enable_judge:
+        return {
+            "judge_result": JudgeVerdict(
+                grounded=None,
+                notes="Judge pass skipped (disabled via configuration).",
             )
         }
 

@@ -171,3 +171,68 @@ def test_ollama_timeout_fallback_still_produces_no_fabricated_findings(monkeypat
     assert finding.structured_findings == []
     assert finding.confidence == 0
     assert "Agent call failed" in finding.risk_note
+
+
+# --- 7. _files_prompt reports true availability even when passed a pre-capped list ----
+
+def test_files_prompt_reports_not_shown_count_when_total_available_given():
+    from engine.agents.nodes import MAX_FILES_PER_AGENT, _files_prompt
+
+    files = [_file(f"src/file_{i}.py") for i in range(MAX_FILES_PER_AGENT + 3)]
+    selected = files[:MAX_FILES_PER_AGENT]
+    prompt = _files_prompt(selected, total_available=len(files))
+    assert f"{len(files)} file(s) are in this agent's scope" in prompt
+    assert f"{MAX_FILES_PER_AGENT} are shown below" in prompt
+    assert "3 more file(s) in scope that are NOT shown at all" in prompt
+
+
+def test_files_prompt_defaults_total_to_len_when_not_given():
+    from engine.agents.nodes import _files_prompt
+
+    files = [_file("src/only_file.py")]
+    prompt = _files_prompt(files)
+    assert "1 file(s) are in this agent's scope; 1 are shown below" in prompt
+
+
+# --- 8. run_agent passes the capped, ranked file list plus the true available count ---
+
+def test_run_agent_prompt_reflects_true_available_count_not_just_selected(monkeypatch):
+    from engine.agents import nodes
+
+    captured = {}
+
+    async def _capture(system, user, timeout=120.0):
+        captured["user"] = user
+        return {"findings": [], "risk_note": "", "confidence": 50}
+
+    monkeypatch.setattr(nodes, "chat_json", _capture)
+
+    files = [_file(f"backend/api/routes_{i}.py") for i in range(nodes.MAX_FILES_PER_AGENT + 2)]
+    pr = _pr(files)
+    asyncio.run(nodes.run_agent("api", {"pr": pr}))
+    assert f"{len(files)} file(s) are in this agent's scope" in captured["user"]
+    assert "2 more file(s) in scope that are NOT shown at all" in captured["user"]
+
+
+# --- 9. Judge pass can be disabled via configuration without affecting the decision ---
+
+def test_judge_can_be_disabled_via_settings(monkeypatch):
+    from engine.agents import nodes
+
+    class _FakeSettings:
+        enable_judge = False
+
+    monkeypatch.setattr(nodes, "get_settings", lambda: _FakeSettings())
+
+    result = asyncio.run(nodes.judge_node({"coordinator_result": object()}))
+    verdict = result["judge_result"]
+    assert verdict.grounded is None
+    assert "disabled" in verdict.notes.lower()
+
+
+def test_judge_enabled_by_default():
+    from engine.config import Settings
+
+    settings = Settings(_env_file=None)
+    assert settings.enable_judge is True
+
