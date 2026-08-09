@@ -47,7 +47,9 @@ def _write_error_comment(comment_path: str, exc: BaseException) -> None:
         "generated. Check the workflow logs for the \"Analyze pull request\" step "
         "for the full traceback.\n"
     )
-    Path(comment_path).write_text(text, encoding="utf-8")
+    path = Path(comment_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 async def _run_analyze(args: argparse.Namespace) -> int:
@@ -69,11 +71,15 @@ async def _run_analyze(args: argparse.Namespace) -> int:
     if args.output == "-":
         print(report_json)
     else:
-        Path(args.output).write_text(report_json, encoding="utf-8")
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report_json, encoding="utf-8")
 
     if args.comment:
         comment_text = render_comment(response)
-        Path(args.comment).write_text(comment_text, encoding="utf-8")
+        comment_path = Path(args.comment)
+        comment_path.parent.mkdir(parents=True, exist_ok=True)
+        comment_path.write_text(comment_text, encoding="utf-8")
 
     return 1 if response.report.decision == "BLOCK" else 0
 
