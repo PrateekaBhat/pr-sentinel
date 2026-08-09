@@ -589,11 +589,11 @@ def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list
             # counts for this run. Demo-reconstructed states (see enrich.py) may not
             # have the newer fields, so fall back to what we can infer.
             if isinstance(status, dict):
-                files_selected = status.get("files_reviewed", len(finding.files_reviewed))
+                files_selected = status.get("files_reviewed", len(getattr(finding, "files_reviewed", []) or []))
                 files_available = status.get("files_available", len(file_names))
                 context_bounded = status.get("context_bounded", files_available > files_selected)
             else:
-                files_selected = len(finding.files_reviewed)
+                files_selected = len(getattr(finding, "files_reviewed", []) or [])
                 files_available = len(file_names)
                 context_bounded = files_available > files_selected
             entries.append(
@@ -605,7 +605,7 @@ def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list
                     files_count=files_selected,
                     duration_ms=duration,
                     llm_call_made=True,
-                    files=finding.files_reviewed[:5],
+                    files=(getattr(finding, "files_reviewed", None) or file_names)[:5],
                     files_available=files_available,
                     files_selected=files_selected,
                     context_bounded=context_bounded,
