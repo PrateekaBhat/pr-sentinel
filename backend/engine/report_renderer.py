@@ -210,8 +210,13 @@ def render_markdown(response: AnalyzeResponse) -> str:
         for entry in report.specialist_routing:
             dur = _format_duration(entry.duration_ms) if entry.duration_ms else "—"
             llm = "yes" if entry.llm_call_made else "no"
+            files_col = str(entry.files_count)
+            if entry.llm_call_made and entry.files_available:
+                files_col = f"{entry.files_selected}/{entry.files_available}" + (
+                    " (bounded)" if entry.context_bounded else ""
+                )
             lines.append(
-                f"| {entry.label} | **{entry.status}** | {entry.trigger} | {entry.files_count} | {dur} (LLM: {llm}) |"
+                f"| {entry.label} | **{entry.status}** | {entry.trigger} | {files_col} | {dur} (LLM: {llm}) |"
             )
         lines.append("")
 

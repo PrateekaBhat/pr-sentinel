@@ -585,16 +585,30 @@ def build_specialist_routing(state: dict[str, Any], pr: PullRequestData) -> list
 
         if finding and finding.applicable:
             duration = status["duration_ms"] if isinstance(status, dict) else (status.duration_ms if status else 0)
+            # `status` (set in agents/nodes.py) carries the real available/selected
+            # counts for this run. Demo-reconstructed states (see enrich.py) may not
+            # have the newer fields, so fall back to what we can infer.
+            if isinstance(status, dict):
+                files_selected = status.get("files_reviewed", len(finding.files_reviewed))
+                files_available = status.get("files_available", len(file_names))
+                context_bounded = status.get("context_bounded", files_available > files_selected)
+            else:
+                files_selected = len(finding.files_reviewed)
+                files_available = len(file_names)
+                context_bounded = files_available > files_selected
             entries.append(
                 SpecialistRoutingEntry(
                     domain=domain,
                     label=label,
                     status="EXECUTED",
                     trigger=_DOMAIN_EXECUTE_TRIGGERS.get(domain, f"{domain} domain files detected"),
-                    files_count=len(file_names),
+                    files_count=files_selected,
                     duration_ms=duration,
                     llm_call_made=True,
-                    files=file_names[:5],
+                    files=finding.files_reviewed[:5],
+                    files_available=files_available,
+                    files_selected=files_selected,
+                    context_bounded=context_bounded,
                 )
             )
         else:

@@ -62,6 +62,11 @@ class SpecialistRoutingEntry(BaseModel):
     duration_ms: int = 0
     llm_call_made: bool = False
     files: list[str] = Field(default_factory=list)
+    # Context-selection metadata: how many domain-matched files existed vs. how many
+    # were actually sent to the LLM, and whether the context was therefore bounded.
+    files_available: int = 0
+    files_selected: int = 0
+    context_bounded: bool = False
 
 
 class ChangedFile(BaseModel):

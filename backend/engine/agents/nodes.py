@@ -6,6 +6,7 @@ import logging
 import time
 
 from .. import agent_routing, finding_validation
+from ..config import get_settings
 from ..models import (
     AgentFinding,
     AIAnalysis,
@@ -26,9 +27,13 @@ from .state import AgentState
 
 logger = logging.getLogger("pr_sentinel.agents")
 
-MAX_PATCH_CHARS = 600
-MAX_PATCH_LINES = 30
-MAX_FILES_PER_AGENT = 4
+# Sourced from Settings (backend/engine/config.py) so these are configurable via env
+# vars (MAX_PATCH_CHARS / MAX_PATCH_LINES / MAX_FILES_PER_AGENT) without changing the
+# previous effective defaults (600 / 30 / 4).
+_settings = get_settings()
+MAX_PATCH_CHARS = _settings.max_patch_chars
+MAX_PATCH_LINES = _settings.max_patch_lines
+MAX_FILES_PER_AGENT = _settings.max_files_per_agent
 
 
 def _files_prompt(files) -> str:
@@ -94,10 +99,18 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             },
         }
 
+    # Rank the domain-matched files so the most useful evidence is selected first,
+    # then cap to MAX_FILES_PER_AGENT — this is what's actually sent to the LLM.
+    # `files_reviewed` below must only ever list files that were truly shown.
+    ranked_files = agent_routing.rank_files_for_domain(files, domain)
+    available_count = len(ranked_files)
+    selected_files = ranked_files[:MAX_FILES_PER_AGENT]
+    context_bounded = available_count > len(selected_files)
+
     start = time.perf_counter_ns()
     try:
         system = AGENT_SYSTEM_PROMPTS[domain]
-        user = f"## Files in scope\n{_files_prompt(files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
+        user = f"## Files in scope\n{_files_prompt(ranked_files)}\n{AGENT_RESPONSE_INSTRUCTIONS}"
         data = await chat_json(system, user, timeout=120.0)
         raw_findings = (data.get("findings") or [])[:4]
         # Clean placeholder/template artifacts before structural validation so a
@@ -136,7 +149,7 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             agent=domain,
             label=label,
             applicable=True,
-            files_reviewed=[f.filename for f in files],
+            files_reviewed=[f.filename for f in selected_files],
             findings=findings,
             structured_findings=structured,
             needs_verification=needs_verification,
@@ -148,8 +161,10 @@ async def run_agent(domain: str, state: AgentState) -> dict:
             "agent": domain,
             "label": label,
             "status": "Completed",
-            "files_reviewed": len(files),
+            "files_reviewed": len(selected_files),
             "duration_ms": duration_ms,
+            "files_available": available_count,
+            "context_bounded": context_bounded,
         },
     }
 
