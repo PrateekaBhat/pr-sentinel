@@ -488,6 +488,13 @@ pr-sentinel/
 
 ---
 
+## Dashboard Demo
+
+A short walkthrough of the PR Sentinel dashboard, showing the analysis report, deterministic release decision, risk breakdown, specialist findings, repository context, and engineering metrics.
+https://github.com/user-attachments/assets/72c1b0fa-650d-478e-ae76-326db40bef9c
+
+---
+
 ## License
 
 No license file is currently included in this repository.
