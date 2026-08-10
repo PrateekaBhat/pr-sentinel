@@ -506,6 +506,8 @@ https://github.com/user-attachments/assets/b1790587-002d-4583-b21e-c1c0c3a42ee5
 
 ---
 
-## License
+## License & Copyright
 
-No license file is currently included in this repository.
+© 2026 Prateeka Bhat. All rights reserved.
+
+This repository is provided strictly for educational and viewing purposes under a custom proprietary license. For full terms, please see the [LICENSE](./LICENSE) file.
